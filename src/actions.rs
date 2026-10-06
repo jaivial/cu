@@ -236,6 +236,12 @@ struct Page {
     connection: Option<CdpConnection>,
     /// Main frame id: navigation events for sub-frames are not ours.
     frame: String,
+    /// Every frame of the page, main document first, so an action on an
+    /// iframe ref knows where that frame sits.
+    frames: Vec<server::Frame>,
+    /// Whether `DOM.enable` was sent: resolving a frame's owner element
+    /// needs it, and paying for it on every batch would tax the common case.
+    dom_enabled: bool,
     /// Set when a command left the connection mid-frame; it is then dropped
     /// instead of pooled.
     poisoned: bool,
@@ -251,16 +257,17 @@ impl Page {
             connection.call("Page.enable", "{}")?;
         }
         let tree = connection.call("Page.getFrameTree", "{}")?;
-        // {"id":N,"result":{"frameTree":{"frame":{"id":"...",...}}}}: the
-        // reply's own numeric "id" comes first, so look inside "frame".
-        let frame = tree
-            .find("\"frame\"")
-            .and_then(|at| json_string_value(&tree[at..], "id"))
+        let frames = server::flatten_frame_tree(&tree);
+        let frame = frames
+            .first()
+            .map(|f| f.id.clone())
             .ok_or("page has no main frame")?;
         Ok(Self {
             tab: tab.clone(),
             connection: Some(connection),
             frame,
+            frames,
+            dom_enabled: false,
             poisoned: false,
         })
     }
@@ -286,7 +293,7 @@ impl Page {
         let navigated = match action {
             Action::Click { reference } => {
                 let (x, y) = self.locate(reference, true)?;
-                let mut watch = NavWatch::new(&self.frame);
+                let mut watch = NavWatch::new(&self.watch_frame(reference));
                 for kind in ["mousePressed", "mouseReleased"] {
                     self.input(
                         "Input.dispatchMouseEvent",
@@ -308,7 +315,7 @@ impl Page {
                 submit,
             } => {
                 self.focus(reference, *clear)?;
-                let mut watch = NavWatch::new(&self.frame);
+                let mut watch = NavWatch::new(&self.watch_frame(reference));
                 self.input(
                     "Input.insertText",
                     &format!("{{\"text\":{}}}", json_string(text)),
@@ -331,11 +338,10 @@ impl Page {
                 navigated
             }
             Action::Select { reference, value } => {
-                self.registry(&format!(
-                    "select({},{})",
-                    json_string(reference),
-                    json_string(value)
-                ))?;
+                self.registry_for(
+                    reference,
+                    &format!("select({},{})", json_string(reference), json_string(value)),
+                )?;
                 false
             }
             Action::Navigate { url } => {
@@ -365,21 +371,71 @@ impl Page {
         })
     }
 
-    /// Call a registry helper, or explain that the page has no refs yet.
-    fn registry(&mut self, call: &str) -> Result<String, String> {
-        self.eval(&format!(
-            "{REGISTRY}?{REGISTRY}.{call}:JSON.stringify({{error:'this page has no refs yet; take a snapshot first'}})"
-        ))
+    /// Call a registry helper in the frame that owns `reference`, or explain
+    /// that the page has no refs yet.
+    fn registry_for(&mut self, reference: &str, call: &str) -> Result<String, String> {
+        let context = self.enter(reference)?;
+        self.registry_in(context, call)
+    }
+
+    fn registry_in(&mut self, context: Option<i64>, call: &str) -> Result<String, String> {
+        self.eval_in(
+            context,
+            &format!(
+                "{REGISTRY}?{REGISTRY}.{call}:JSON.stringify({{error:'this page has no refs yet; take a snapshot first'}})"
+            ),
+        )
+    }
+
+    /// The isolated world of the frame that owns `reference`, or `None` for
+    /// the main document (its default world is where the registry of a
+    /// single-frame page lives). Isolated worlds are created with the fixed
+    /// name `cu`, so the walk's registry is the one found here later.
+    fn enter(&mut self, reference: &str) -> Result<Option<i64>, String> {
+        match self.subframe_of(reference) {
+            None => Ok(None),
+            Some(frame) => self.world(&frame).map(Some),
+        }
+    }
+
+    /// The iframe `reference` lives in, if it is not the main document.
+    fn subframe_of(&mut self, reference: &str) -> Option<String> {
+        server::frame_for_ref(&self.tab, reference).filter(|f| *f != self.frame)
+    }
+
+    fn world(&mut self, frame_id: &str) -> Result<i64, String> {
+        let reply = self.conn().call(
+            "Page.createIsolatedWorld",
+            &format!(
+                "{{\"frameId\":{},\"worldName\":\"cu\"}}",
+                json_string(frame_id)
+            ),
+        )?;
+        json_value(&reply, "executionContextId")
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| "the frame is gone; take a new snapshot".to_string())
     }
 
     /// Run a script in the page and return the string it produced. A script
     /// that reports `{"error":...}` becomes an `Err` with that message.
     fn eval(&mut self, expression: &str) -> Result<String, String> {
+        self.eval_in(None, expression)
+    }
+
+    /// [`eval`](Self::eval) in an execution context: `Some(context)` for an
+    /// iframe's isolated world, `None` for the page's default world.
+    fn eval_in(&mut self, context: Option<i64>, expression: &str) -> Result<String, String> {
+        // Trailing comma on the fragment: the format below separates the
+        // expression and this fragment with one comma and has none after it.
+        let context = context
+            .map(|id| format!("\"contextId\":{id},"))
+            .unwrap_or_default();
         let reply = self.conn().call(
             "Runtime.evaluate",
             &format!(
-                "{{\"expression\":{},\"returnByValue\":true}}",
-                json_string(expression)
+                "{{\"expression\":{},{}\"returnByValue\":true}}",
+                json_string(expression),
+                context
             ),
         )?;
         if reply.contains("\"exceptionDetails\"") {
@@ -393,18 +449,124 @@ impl Page {
         }
     }
 
-    /// Centre of the element behind `reference`, scrolled into view.
+    /// Centre of the element behind `reference`, scrolled into view, in the
+    /// coordinates the mouse events are dispatched in.
     fn locate(&mut self, reference: &str, hit_test: bool) -> Result<(f64, f64), String> {
-        let value = self.registry(&format!("locate({},{hit_test})", json_string(reference)))?;
+        let subframe = self.subframe_of(reference);
+        let context = match &subframe {
+            None => None,
+            Some(frame) => Some(self.world(frame)?),
+        };
+        let value = self.registry_in(
+            context,
+            &format!("locate({},{hit_test})", json_string(reference)),
+        )?;
         let x = json_value(&value, "x").and_then(|v| v.parse().ok());
         let y = json_value(&value, "y").and_then(|v| v.parse().ok());
-        x.zip(y)
-            .ok_or_else(|| format!("could not locate {reference}"))
+        let (mut x, mut y) = x
+            .zip(y)
+            .ok_or_else(|| format!("could not locate {reference}"))?;
+        if let Some(frame) = subframe {
+            // The frame-local point is in the iframe's own viewport; shift it
+            // into the main document's, scrolling every iframe element into
+            // view on the way up.
+            let (dx, dy) = self.frame_offset(&frame)?;
+            x += dx;
+            y += dy;
+            // The top document decides what is really at that point: an
+            // overlay above the iframe would swallow the click.
+            let at = self.eval(&format!(
+                "(function(){{var e=document.elementFromPoint({x},{y});return e?e.tagName:''}})()"
+            ))?;
+            match at.as_str() {
+                "IFRAME" | "FRAME" => {}
+                "" => return Err(format!("{reference} is not visible in the top document")),
+                other => {
+                    return Err(format!(
+                        "{reference} is covered by {}",
+                        other.to_lowercase()
+                    ));
+                }
+            }
+        }
+        Ok((x, y))
+    }
+
+    /// Main-document coordinates of `frame`'s top-left corner: the sum of the
+    /// owning iframe elements' rects from the top down, each scrolled into
+    /// view before its rect is read, so a scroll can never invalidate a rect
+    /// already taken.
+    fn frame_offset(&mut self, frame_id: &str) -> Result<(f64, f64), String> {
+        let mut chain = vec![frame_id.to_string()];
+        let mut current = frame_id.to_string();
+        loop {
+            let parent = self
+                .frames
+                .iter()
+                .find(|f| f.id == current)
+                .and_then(|f| f.parent.clone())
+                .ok_or_else(|| {
+                    "that frame is not part of this page any more; take a new snapshot".to_string()
+                })?;
+            if parent == self.frame {
+                break;
+            }
+            chain.push(parent.clone());
+            current = parent;
+        }
+        if !self.dom_enabled {
+            self.conn().call("DOM.enable", "{}")?;
+            self.dom_enabled = true;
+        }
+        let mut offset = (0.0f64, 0.0f64);
+        for child in chain.iter().rev() {
+            let owner = self.conn().call(
+                "DOM.getFrameOwner",
+                &format!("{{\"frameId\":{}}}", json_string(child)),
+            )?;
+            let backend = json_value(&owner, "backendNodeId")
+                .ok_or_else(|| "iframe element not found; take a new snapshot".to_string())?;
+            let resolved = self.conn().call(
+                "DOM.resolveNode",
+                &format!("{{\"backendNodeId\":{backend}}}"),
+            )?;
+            let object = json_string_value(&resolved, "objectId")
+                .ok_or_else(|| "iframe element is gone; take a new snapshot".to_string())?;
+            let rect = self.conn().call(
+                "Runtime.callFunctionOn",
+                &format!(
+                    "{{\"objectId\":{},\"functionDeclaration\":{},\"returnByValue\":true}}",
+                    json_string(&object),
+                    json_string(SCROLL_AND_RECT)
+                ),
+            )?;
+            let value = evaluated_string(&rect)
+                .ok_or_else(|| "iframe position unknown; take a new snapshot".to_string())?;
+            let dx: f64 = json_value(&value, "x")
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| "could not locate the iframe".to_string())?;
+            let dy: f64 = json_value(&value, "y")
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| "could not locate the iframe".to_string())?;
+            offset.0 += dx;
+            offset.1 += dy;
+        }
+        Ok(offset)
+    }
+
+    /// The frame a ref-based action's navigation watch should follow: the
+    /// frame the ref lives in, because a form inside an iframe navigates the
+    /// iframe, not the page.
+    fn watch_frame(&self, reference: &str) -> String {
+        server::frame_for_ref(&self.tab, reference).unwrap_or_else(|| self.frame.clone())
     }
 
     fn focus(&mut self, reference: &str, clear: bool) -> Result<(), String> {
-        self.registry(&format!("focus({},{clear})", json_string(reference)))
-            .map(|_| ())
+        self.registry_for(
+            reference,
+            &format!("focus({},{clear})", json_string(reference)),
+        )
+        .map(|_| ())
     }
 
     fn key(&mut self, key: &str, watch: &mut NavWatch) -> Result<(), String> {
@@ -497,10 +659,18 @@ impl Page {
         Ok(watch.committed || watch.within)
     }
 
+    /// The closing snapshot of a batch: the frame tree the batch opened
+    /// with, walked so iframe contents and their refs are included.
     fn snapshot(&mut self) -> Result<String, String> {
-        let value = self.eval(&server::snapshot::script())?;
-        server::snapshot::saw_refs_up_to(&value);
-        Ok(server::parse_snapshot(&value)?.render())
+        let tab = self.tab.clone();
+        let frames = std::mem::take(&mut self.frames);
+        let walked = server::walk_frames(&tab, frames.clone(), |method, params| {
+            self.conn().call(method, params)
+        });
+        self.frames = frames;
+        let (text, pairs) = walked?;
+        server::note_ref_frames(&tab, &pairs);
+        Ok(text)
     }
 }
 
@@ -574,6 +744,10 @@ impl NavWatch {
         }
     }
 }
+
+/// Scroll an iframe's owner element into view and report its top-left
+/// corner, run on the element object itself so it works in any world.
+const SCROLL_AND_RECT: &str = "function(){this.scrollIntoView({block:'center',inline:'center',behavior:'instant'});const r=this.getBoundingClientRect();return JSON.stringify({x:r.left,y:r.top});}";
 
 /// A no-op evaluate, used as a barrier. Its reply comes after every event the
 /// renderer emitted while handling the input before it, including the
