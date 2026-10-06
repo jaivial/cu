@@ -666,7 +666,7 @@ pub fn route(
             );
         }
         if !context.is_empty() {
-            match context_tab(state.cdp_port, &context) {
+            match context_tab(state.cdp_port, &context, &state.data_dir) {
                 Ok(tab) => tab,
                 Err(e) => {
                     return (
@@ -1164,35 +1164,12 @@ where
 /// Finished downloads in `dir`, newest first, as the `/v1/downloads` body.
 ///
 /// A file Chromium is still writing carries the `.crdownload` suffix, so an
-/// entry here is complete and safe for the agent to read.
+/// entry here is complete and safe for the agent to read. A file that belongs
+/// to a named context also carries its `"context"`, because that context
+/// downloads into a subdirectory of its own.
 pub fn downloads_json(dir: &Path) -> String {
     let mut files: Vec<(SystemTime, String)> = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(meta) = fs::metadata(&path) else {
-                continue;
-            };
-            if !meta.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if name.ends_with(".crdownload") {
-                continue;
-            }
-            let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
-            files.push((
-                mtime,
-                format!(
-                    "{{\"name\":{},\"bytes\":{}}}",
-                    json_string(name),
-                    meta.len()
-                ),
-            ));
-        }
-    }
+    collect_downloads(dir, None, &mut files, 0);
     files.sort_by(|a, b| b.0.cmp(&a.0));
     format!(
         "{{\"downloads\":[{}]}}",
@@ -1202,6 +1179,68 @@ pub fn downloads_json(dir: &Path) -> String {
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+/// One level of the download tree, newest file first.
+///
+/// A named context downloads into its own subdirectory, so the listing walks
+/// those too and each entry says which context it came from -- two contexts
+/// downloading `report.pdf` are two different files, and an agent has to be
+/// able to tell them apart. `context` is `None` for the browser-wide
+/// directory. The depth guard keeps a stray nested directory from turning one
+/// listing into a filesystem crawl.
+fn collect_downloads(
+    dir: &Path,
+    context: Option<&str>,
+    files: &mut Vec<(SystemTime, String)>,
+    depth: usize,
+) {
+    const MAX_DEPTH: usize = 2;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            // One more level is a context's directory; deeper is not ours.
+            if depth < MAX_DEPTH {
+                let name = path.file_name().and_then(|n| n.to_str());
+                if let Some(name) = name {
+                    collect_downloads(&path, Some(name), files, depth + 1);
+                }
+            }
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".crdownload") {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+        files.push((
+            mtime,
+            match context {
+                Some(context) => format!(
+                    "{{\"name\":{},\"bytes\":{},\"context\":{}}}",
+                    json_string(name),
+                    meta.len(),
+                    json_string(context)
+                ),
+                None => format!(
+                    "{{\"name\":{},\"bytes\":{}}}",
+                    json_string(name),
+                    meta.len()
+                ),
+            },
+        ));
+    }
 }
 
 pub fn login_page() -> String {
@@ -1802,6 +1841,9 @@ impl Tab {
 struct Context {
     browser_context: String,
     target: String,
+    /// Where this context's downloads are directed, once `cu` has told the
+    /// browser. `None` until then, and left `None` if the browser refused.
+    downloads: Option<PathBuf>,
 }
 
 /// Named contexts per browser.
@@ -1867,7 +1909,7 @@ fn page_target_ids_and_sockets(discovery: &str, cdp_port: u16) -> Vec<(String, S
 }
 
 /// The tab of context `name`, created on first use.
-pub fn context_tab(cdp_port: u16, name: &str) -> Result<Tab, String> {
+pub fn context_tab(cdp_port: u16, name: &str, data: &Path) -> Result<Tab, String> {
     if !valid_name(name) {
         return Err("invalid context name".into());
     }
@@ -1901,16 +1943,64 @@ pub fn context_tab(cdp_port: u16, name: &str) -> Result<Tab, String> {
         return Err("Chromium did not open a tab in the new context".into());
     };
     all.insert(
-        key,
+        key.clone(),
         Context {
             browser_context,
             target: target.clone(),
+            downloads: None,
         },
     );
+    // Drop the map lock before the CDP round trip below: it is a browser-level
+    // command, and holding the lock would serialise every other context.
+    drop(all);
+    if let Err(error) = direct_context_downloads(cdp_port, &key, data) {
+        // Not fatal: the context still works, and its downloads fall back to
+        // the browser-wide directory, which `GET /v1/downloads` still lists.
+        eprintln!("cu: downloads for context {name} stay browser-wide: {error}");
+    }
     Ok(Tab {
         cdp_port,
         target: Some(target),
     })
+}
+
+/// Point a named context's downloads at `<data>/downloads/<name>`.
+///
+/// Without a `browserContextId`, `Browser.setDownloadBehavior` only governs
+/// the default context, so a download started from `?context=NAME` landed in
+/// the browser-wide directory and was indistinguishable from the persistent
+/// profile's own files. A context that has its own behaviour gets its own
+/// directory, and the browser-wide listing picks the subdirectories up, so
+/// `GET /v1/downloads` reports them under the context's name.
+fn direct_context_downloads(cdp_port: u16, key: &(u16, String), data: &Path) -> Result<(), String> {
+    let dir = context_download_dir(data, &key.1);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let browser_context = {
+        let all = contexts().lock().unwrap_or_else(|e| e.into_inner());
+        all.get(key).map(|c| c.browser_context.clone())
+    };
+    let Some(browser_context) = browser_context else {
+        return Err("the context went away".into());
+    };
+    cdp_browser_command(
+        cdp_port,
+        "Browser.setDownloadBehavior",
+        &format!(
+            "{{\"behavior\":\"allow\",\"downloadPath\":{},\"eventsEnabled\":true,\"browserContextId\":{}}}",
+            json_string(&dir.to_string_lossy()),
+            json_string(&browser_context)
+        ),
+    )?;
+    let mut all = contexts().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(context) = all.get_mut(key) {
+        context.downloads = Some(dir);
+    }
+    Ok(())
+}
+
+/// Where the downloads of context `name` are kept.
+fn context_download_dir(data: &Path, name: &str) -> PathBuf {
+    data.join("downloads").join(name)
 }
 
 /// A tab another tab named by id (`?tab=ID`), validated against discovery so

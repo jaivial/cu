@@ -26,7 +26,10 @@
   folder, through one persistent browser-level session (Chromium 145 honours
   a custom path only while such a session is attached). `GET /v1/downloads`
   (`cu downloads`) lists finished files, and the click that started a
-  download reports `"download":"name"` with `navigated:false`.
+  download reports `"download":"name"` with `navigated:false`. A download
+  started from `?context=NAME` goes to `<data>/downloads/NAME`, because the
+  browser-wide behaviour governs the default context only; `GET /v1/downloads`
+  labels those entries with their `"context"`.
 - Iframes are part of the snapshot and of the actions: every frame of the
   page is walked (subframes in their own isolated world), rendered under
   `- frame: <url>`, and a ref resolves to its frame, so click, type and

@@ -26,6 +26,9 @@ CLOSED_MARKER = os.environ.get("FAKE_CHROMIUM_CLOSED")
 INPUT_LOG = []
 # Tabs opened in browser contexts: target id -> context id.
 CONTEXT_TABS = {}
+# Every Browser.setDownloadBehavior call, as the params it arrived with, so a
+# test can see whether the daemon gave a named context a directory of its own.
+DOWNLOAD_BEHAVIOUR = []
 # Big enough to force the 64-bit websocket length form that a real screenshot
 # uses, so the frame reader cannot get away with the 16-bit one alone.
 PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"fake-png-bytes" * 8000).decode()
@@ -71,6 +74,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_discovery()
         elif self.path == "/input-log":
             self.send_json(INPUT_LOG)
+        elif self.path == "/download-behaviour":
+            self.send_json(DOWNLOAD_BEHAVIOUR)
         elif self.path == "/json/version":
             self.send_json(
                 {
@@ -217,6 +222,9 @@ class Handler(BaseHTTPRequestHandler):
                 }
             FRAMES_ON["on"] = "frames" in url
             return {"id": 1, "result": {"frameId": "f", "url": "https://example.test"}}
+        if method == "Browser.setDownloadBehavior":
+            DOWNLOAD_BEHAVIOUR.append(params or {})
+            return {"result": {}}
         if method == "Target.createBrowserContext":
             return {"result": {"browserContextId": "CTX%d" % (len(CONTEXT_TABS) + 1)}}
         if method == "Target.createTarget":
