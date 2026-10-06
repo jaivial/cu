@@ -64,7 +64,7 @@ export const sweep = [
 // The 50-way headline, same run.
 export const sweepHeadline = [
   { k: '50/50', d: 'tests en verde a 50 vías' },
-  { k: '2,1 s', d: 'de pared para los dos lotes de 50' },
+  { k: '2,1 s', d: 'de pared para una oleada de 50' },
   { k: '~18 MB', d: 'por pestaña abierta en Chrome' },
   { k: '0,35', d: 'de 12 cores de CPU de Chrome (máx.)' },
 ];

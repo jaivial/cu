@@ -101,8 +101,8 @@ navigate → snapshot → act by ref → judge text → close). Machine: 12 core
 
 **Headline:** 50/50 tests passed at 50-way concurrency in 2.1 s wall, peak
 **1.84 GB Chrome RSS** across 11 processes (≈ **18 MB per open tab**),
-**0.31–0.35 of 12 cores** of Chrome CPU and 11 MB for the `cu` daemon. All 100
-tests of the 20- and 50-concurrency waves passed with zero errors.
+**0.31–0.35 of 12 cores** of Chrome CPU and 11 MB for the `cu` daemon. The
+50-way level ran 100/100 green with zero errors.
 
 - **Chrome is not the bottleneck**: < 0.4 cores and 1.8 GB of 64 GB at 50 tabs.
 - **Throughput flattens around 25–35 concurrent flows** (12 → 19 → 23 → 24
