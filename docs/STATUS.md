@@ -56,7 +56,10 @@ browser start gets repeated watch windows instead of one permanent failure.
 - **No real-site tests in CI.** The live checks above were manual;
   `tests/fake_chromium.py` approximates them (including a child frame), but
   a recorded fixture or opt-in network test would catch regressions.
-- **One historical flake to watch.** `a_client_that_stops_sending_is_
-  released` failed twice under heavy load before the handshake-read fix; the
-  suite has been green repeatedly since. If it recurs, capture the actual
-  status line rather than re-running.
+- **Load-sensitive test flakiness.** `a_client_that_stops_sending_is_
+  released` failed twice under heavy load before the handshake-read fix.
+  After it, one unidentified integration test failed once more in a run
+  under parallel cargo/system load; its output was not captured, and the
+  suite has been green for eight consecutive runs since (unit, integration
+  and doc tests). If it recurs, save the whole `cargo test` output instead
+  of re-running -- the status line of the failing assertion is what matters.
