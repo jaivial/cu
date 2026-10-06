@@ -164,6 +164,12 @@ pub fn key_event(key: &str) -> Option<(&'static str, &'static str, u32, &'static
 /// What one action did, as reported back to the agent.
 pub struct Outcome {
     pub navigated: bool,
+    /// Set when the action started a download instead of changing the page:
+    /// the suggested file name the browser reported.
+    pub download: Option<String>,
+    /// Set when the action opened a new window or tab (`Page.windowOpen`),
+    /// so the agent knows to look at `GET /v1/tabs`.
+    pub popup: bool,
     pub ms: u128,
 }
 
@@ -178,11 +184,22 @@ pub fn run_batch(tab: &Tab, batch: &Batch) -> Result<String, String> {
     for (i, action) in batch.actions.iter().enumerate() {
         let t = Instant::now();
         match page.run(action) {
-            Ok(outcome) => results.push(format!(
-                "{{\"ok\":true,\"navigated\":{},\"ms\":{}}}",
-                outcome.navigated,
-                t.elapsed().as_millis().max(outcome.ms)
-            )),
+            Ok(outcome) => {
+                let mut line = format!(
+                    "{{\"ok\":true,\"navigated\":{},\"ms\":{}",
+                    outcome.navigated,
+                    t.elapsed().as_millis().max(outcome.ms)
+                );
+                // A download or a popup changes what the agent should do
+                // next, so both are named rather than left to be inferred.
+                if let Some(name) = &outcome.download {
+                    line.push_str(&format!(",\"download\":{}", json_string(name)));
+                }
+                if outcome.popup {
+                    line.push_str(",\"popup\":true");
+                }
+                results.push(line + "}");
+            }
             Err(error) => {
                 results.push(format!(
                     "{{\"ok\":false,\"error\":{}}}",
@@ -265,6 +282,7 @@ impl Page {
 
     fn run(&mut self, action: &Action) -> Result<Outcome, String> {
         let started = Instant::now();
+        let (mut download, mut popup) = (None, false);
         let navigated = match action {
             Action::Click { reference } => {
                 let (x, y) = self.locate(reference, true)?;
@@ -278,7 +296,10 @@ impl Page {
                         &mut watch,
                     )?;
                 }
-                self.settle(&mut watch)?
+                let navigated = self.settle(&mut watch)?;
+                download = watch.download.take();
+                popup = watch.popup;
+                navigated
             }
             Action::Type {
                 reference,
@@ -296,12 +317,18 @@ impl Page {
                 if *submit {
                     self.key("Enter", &mut watch)?;
                 }
-                self.settle(&mut watch)?
+                let navigated = self.settle(&mut watch)?;
+                download = watch.download.take();
+                popup = watch.popup;
+                navigated
             }
             Action::Press { key } => {
                 let mut watch = NavWatch::new(&self.frame);
                 self.key(key, &mut watch)?;
-                self.settle(&mut watch)?
+                let navigated = self.settle(&mut watch)?;
+                download = watch.download.take();
+                popup = watch.popup;
+                navigated
             }
             Action::Select { reference, value } => {
                 self.registry(&format!(
@@ -332,6 +359,8 @@ impl Page {
         };
         Ok(Outcome {
             navigated,
+            download,
+            popup,
             ms: started.elapsed().as_millis(),
         })
     }
@@ -421,12 +450,19 @@ impl Page {
     }
 
     /// If the action started a navigation, wait until the new page is usable.
-    /// Returns whether it navigated.
+    /// Returns whether the page really navigated.
     ///
     /// A link click usually announces its navigation before Chromium answers
     /// the input event; a form submit may announce it just after, so one
     /// barrier round trip (~0.3 ms) is made first. A handler that navigates
     /// from a timer is not waited for; the next snapshot shows where it went.
+    ///
+    /// "Navigated" means the main frame *committed* a navigation
+    /// (`Page.frameNavigated`) or moved within the document (a hash change).
+    /// A download and an aborted navigation both schedule and start loading
+    /// and then stop without committing, so the page the agent is looking at
+    /// has not changed and `navigated` must say false -- for a download the
+    /// file name is reported instead.
     fn settle(&mut self, watch: &mut NavWatch) -> Result<bool, String> {
         if !watch.started {
             let _ = self
@@ -450,7 +486,15 @@ impl Page {
                 self.connection = Some(fresh);
             }
         }
-        Ok(true)
+        if !watch.committed {
+            // Chromium fires `Page.downloadWillBegin` just after the frame
+            // stops for a download, and a window may already be opening; one
+            // more observed round trip picks those up before deciding.
+            let _ = self
+                .conn()
+                .call_observed("Runtime.evaluate", BARRIER, &mut |event| watch.see(event));
+        }
+        Ok(watch.committed || watch.within)
     }
 
     fn snapshot(&mut self) -> Result<String, String> {
@@ -466,6 +510,14 @@ struct NavWatch {
     frame: String,
     started: bool,
     done: bool,
+    /// The frame committed a real navigation (`Page.frameNavigated`).
+    committed: bool,
+    /// The frame moved within the same document (hash change).
+    within: bool,
+    /// A download began in this frame; the suggested file name.
+    download: Option<String>,
+    /// A new window or tab was opened from this page.
+    popup: bool,
 }
 
 impl NavWatch {
@@ -474,6 +526,10 @@ impl NavWatch {
             frame: frame.to_string(),
             started: false,
             done: false,
+            committed: false,
+            within: false,
+            download: None,
+            popup: false,
         }
     }
 
@@ -497,7 +553,21 @@ impl NavWatch {
             "Page.navigatedWithinDocument" if main => {
                 self.started = true;
                 self.done = true;
+                self.within = true;
             }
+            // The commit is what makes a navigation real: a download or a
+            // stopped load fires the events above and never this one.
+            // `Page.frameNavigated` carries the frame id as `params.frame.id`,
+            // which is the first `id` in the message.
+            "Page.frameNavigated" => {
+                if json_string_value(event, "id").as_deref() == Some(self.frame.as_str()) {
+                    self.committed = true;
+                }
+            }
+            "Page.downloadWillBegin" if main => {
+                self.download = json_string_value(event, "suggestedFilename");
+            }
+            "Page.windowOpen" if main => self.popup = true,
             "Page.domContentEventFired" if self.started => self.done = true,
             "Page.frameStoppedLoading" if main && self.started => self.done = true,
             _ => {}
@@ -665,6 +735,44 @@ mod tests {
         assert!(watch.started && !watch.done);
         watch.see(r#"{"method":"Page.domContentEventFired","params":{"timestamp":1}}"#);
         assert!(watch.done);
+    }
+
+    #[test]
+    fn a_download_is_not_a_navigation_and_keeps_its_name() {
+        let mut watch = NavWatch::new("MAIN");
+        watch.see(r#"{"method":"Page.frameRequestedNavigation","params":{"frameId":"MAIN","disposition":"currentTab"}}"#);
+        watch.see(r#"{"method":"Page.frameStartedLoading","params":{"frameId":"MAIN"}}"#);
+        watch.see(r#"{"method":"Page.frameStoppedLoading","params":{"frameId":"MAIN"}}"#);
+        watch.see(
+            r#"{"method":"Page.downloadWillBegin","params":{"frameId":"MAIN","suggestedFilename":"report.pdf"}}"#,
+        );
+        assert!(watch.started && watch.done);
+        // No commit happened: the page the agent sees did not change.
+        assert!(!watch.committed);
+        assert_eq!(watch.download.as_deref(), Some("report.pdf"));
+        assert!(
+            !watch.committed || watch.within,
+            "must not report navigation"
+        );
+    }
+
+    #[test]
+    fn a_committing_navigation_is_recognised_by_its_frame_id() {
+        let mut watch = NavWatch::new("MAIN");
+        watch
+            .see(r#"{"method":"Page.frameNavigated","params":{"frame":{"id":"OTHER","url":"x"}}}"#);
+        assert!(!watch.committed, "another frame committing is not ours");
+        watch.see(r#"{"method":"Page.frameNavigated","params":{"frame":{"id":"MAIN","url":"x"}}}"#);
+        assert!(watch.committed);
+    }
+
+    #[test]
+    fn opening_a_window_is_reported_as_a_popup() {
+        let mut watch = NavWatch::new("MAIN");
+        watch.see(
+            r#"{"method":"Page.windowOpen","params":{"url":"https://x.test/","windowName":"_blank"}}"#,
+        );
+        assert!(watch.popup && !watch.started, "a popup is not a navigation");
     }
 
     #[test]

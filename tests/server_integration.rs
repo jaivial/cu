@@ -551,6 +551,23 @@ fn a_snapshot_is_compact_and_carries_refs() {
 }
 
 #[test]
+fn downloads_are_listed_from_the_session_directory() {
+    let server = TestServer::start("downloads", false);
+    // Listing files needs no browser: the files outlive the session.
+    assert_eq!(body_of(&server.get("/v1/downloads")), "{\"downloads\":[]}");
+    let dir = server.data_dir.join("downloads");
+    std::fs::create_dir_all(&dir).expect("downloads dir");
+    std::fs::write(dir.join("report.pdf"), b"1234").expect("file");
+    // A file Chromium is still writing must not appear as finished.
+    std::fs::write(dir.join("half.zip.crdownload"), b"1").expect("partial");
+    let response = server.get("/v1/downloads");
+    let body = body_of(&response);
+    assert!(body.contains("\"name\":\"report.pdf\""), "got {body}");
+    assert!(body.contains("\"bytes\":4"), "got {body}");
+    assert!(!body.contains("crdownload"), "partial listed: {body}");
+}
+
+#[test]
 fn a_snapshot_needs_the_browser() {
     let server = TestServer::start("snapshot-no-browser", false);
     let response = server.get("/v1/snapshot");
@@ -702,6 +719,74 @@ fn a_named_context_gets_its_own_tab_in_the_same_browser() {
     let closed = server.fragmented(&request);
     assert_eq!(body_of(&closed), r#"{"closed":true}"#);
     assert_eq!(body_of(&server.get("/v1/contexts")), r#"{"contexts":[]}"#);
+}
+
+#[test]
+fn tabs_are_listed_with_a_default_and_named_actions_work() {
+    let server = TestServer::start("tabs", true);
+    let response = server.get("/v1/tabs");
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&response);
+    // The one page target, marked as the tab the default resolves to.
+    assert!(body.contains("\"id\":\"PAGE1\""), "got {body}");
+    assert!(body.contains("\"default\":true"), "got {body}");
+
+    // Acting with ?tab= runs against that tab...
+    let response = server.post(
+        "/v1/navigate?tab=PAGE1",
+        r#"{"url":"https://example.test"}"#,
+    );
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    // ...and a stale id is an error an agent can act on, not a CDP failure.
+    let response = server.post("/v1/navigate?tab=GONE", r#"{"url":"https://example.test"}"#);
+    assert_eq!(status_code(&response), "400", "got {}", body_of(&response));
+    assert!(
+        body_of(&response).contains("no such tab"),
+        "got {}",
+        body_of(&response)
+    );
+    // Naming both ways of picking a page is an error, not a silent preference.
+    let response = server.post("/v1/navigate?context=alice&tab=PAGE1", r#"{"url":"x"}"#);
+    assert_eq!(status_code(&response), "400", "got {}", body_of(&response));
+    assert!(
+        body_of(&response).contains("not both"),
+        "got {}",
+        body_of(&response)
+    );
+}
+
+#[test]
+fn the_last_tab_cannot_be_closed_but_another_can() {
+    let server = TestServer::start("tabs-close", true);
+    // One page only: closing it would exit Chromium.
+    let request = format!(
+        "DELETE /v1/tabs/PAGE1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n",
+        server.token
+    );
+    let response = server.fragmented(&request);
+    assert_eq!(status_code(&response), "400", "got {}", body_of(&response));
+    assert!(
+        body_of(&response).contains("last tab"),
+        "got {}",
+        body_of(&response)
+    );
+
+    // With a second tab open (a popup in the real browser, a context tab
+    // here), the default can be closed and the next action re-pins.
+    server.post(
+        "/v1/navigate?context=alice",
+        r#"{"url":"https://example.test"}"#,
+    );
+    let response = server.fragmented(&request);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    assert_eq!(body_of(&response), "{\"closed\":true}");
+    // And a tab that was never there is refused.
+    let request = format!(
+        "DELETE /v1/tabs/NOPE HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n",
+        server.token
+    );
+    let response = server.fragmented(&request);
+    assert_eq!(status_code(&response), "400", "got {}", body_of(&response));
 }
 
 #[test]

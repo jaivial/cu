@@ -12,26 +12,60 @@ const DEFAULT_PORT: u16 = 8787;
 const DEFAULT_CDP_PORT: u16 = 9222;
 
 fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    // `--tab ID` runs any page command in another tab (a popup a click
+    // opened, found with `cu tabs`); it is lifted out before dispatch.
+    let mut tab: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--tab" {
+            if i + 1 >= args.len() {
+                eprintln!("cu: --tab needs a tab id (see `cu tabs`)");
+                std::process::exit(1);
+            }
+            tab = Some(args.remove(i + 1));
+            args.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    // Append `tab=` to a page command's path, keeping any query it has.
+    let on_tab = |path: &str| match &tab {
+        None => path.to_string(),
+        Some(id) if path.contains('?') => format!("{path}&tab={id}"),
+        Some(id) => format!("{path}?tab={id}"),
+    };
     let result = match args.first().map(String::as_str) {
         Some("start") => start(&args[1..]),
         Some("status") => request("GET", "/v1/status", None).map(|s| println!("{s}")),
         Some("navigate") => match args.get(1) {
             Some(url) => request(
                 "POST",
-                "/v1/navigate",
+                &on_tab("/v1/navigate"),
                 Some(&format!("{{\"url\":\"{}\"}}", server::json_escape(url))),
             )
             .map(|s| println!("{s}")),
-            None => Err("usage: cu navigate <url>".into()),
+            None => Err("usage: cu navigate <url> [--tab ID]".into()),
         },
-        Some("shot") => request("GET", "/v1/screenshot?format=jpeg", None)
+        Some("shot") => request("GET", &on_tab("/v1/screenshot?format=jpeg"), None)
             .and_then(|s| write_screenshot(&s, args.get(1).map(String::as_str))),
-        Some("snapshot") => request("GET", "/v1/snapshot", None).map(|s| println!("{s}")),
+        Some("snapshot") => request("GET", &on_tab("/v1/snapshot"), None).map(|s| println!("{s}")),
+        Some("downloads") => request("GET", "/v1/downloads", None).map(|s| println!("{s}")),
+        Some("tabs") => match args.get(1).map(String::as_str) {
+            None => request("GET", "/v1/tabs", None).map(|s| println!("{s}")),
+            Some("close") => match args.get(2) {
+                Some(id) => request("DELETE", &format!("/v1/tabs/{id}"), Some("{}"))
+                    .map(|s| println!("{s}")),
+                None => Err("usage: cu tabs close ID".into()),
+            },
+            Some(other) => Err(format!(
+                "unknown tabs command {other}; usage: cu tabs [close ID]"
+            )),
+        },
         Some("click") => match args.get(1) {
             Some(r) => request(
                 "POST",
-                "/v1/click",
+                &on_tab("/v1/click"),
                 Some(&format!("{{\"ref\":{}}}", server::json_string(r))),
             )
             .map(|s| println!("{s}")),
@@ -40,7 +74,7 @@ fn main() {
         Some("type") => match (args.get(1), args.get(2)) {
             (Some(r), Some(text)) => request(
                 "POST",
-                "/v1/type",
+                &on_tab("/v1/type"),
                 Some(&format!(
                     "{{\"ref\":{},\"text\":{},\"submit\":{}}}",
                     server::json_string(r),
@@ -66,7 +100,7 @@ fn main() {
             actions.and_then(|actions| {
                 request(
                     "POST",
-                    "/v1/act",
+                    &on_tab("/v1/act"),
                     Some(&format!("{{\"actions\":{}}}", actions.trim())),
                 )
                 .map(|s| println!("{s}"))
@@ -91,7 +125,7 @@ fn main() {
 }
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR]\n  cu status\n  cu navigate URL\n  cu shot [FILE]\n  cu snapshot\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME"
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR]\n  cu status\n  cu navigate URL\n  cu shot [FILE]\n  cu snapshot\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
     );
 }
 
@@ -124,6 +158,10 @@ fn start(args: &[String]) -> Result<(), String> {
     }
     fs::create_dir_all(data.join("profiles/default")).map_err(|e| e.to_string())?;
     fs::create_dir_all(data.join("sessions")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(data.join("downloads")).map_err(|e| e.to_string())?;
+    // Chromium refuses a relative download directory, so the path handed to
+    // the browser must be absolute whatever way `cu` was started.
+    let data = fs::canonicalize(&data).unwrap_or(data);
     let token = server::random_token();
     fs::write(
         data.join("server.json"),

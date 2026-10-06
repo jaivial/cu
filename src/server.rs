@@ -205,12 +205,62 @@ pub fn spawn_browser_thread(
             // the pid that shutdown closes.
             BROWSER_PID.store(child.id(), Ordering::SeqCst);
             match wait_for_browser(cdp_port, BROWSER_START_TIMEOUT, Some(&mut child)) {
-                Ok(()) => browser.mark_ready(),
+                Ok(()) => {
+                    // Downloads land in the session's own directory (see
+                    // `spawn_browser_control`), before readiness so the first
+                    // click is already covered.
+                    spawn_browser_control(cdp_port, &data);
+                    browser.mark_ready()
+                }
                 Err(e) => browser.mark_failed(e),
             }
         }
         Err(e) => browser.mark_failed(e),
     })
+}
+
+/// One browser-level DevTools connection held for the daemon's whole life.
+///
+/// It exists for downloads. `Browser.setDownloadBehavior` with a custom
+/// directory is only honoured while a session with `eventsEnabled` stays
+/// attached (Chromium 145: set from a socket that then closes, and the
+/// browser keeps its own default -- the user's real Downloads folder, where
+/// an agent can neither see nor manage the files). The daemon therefore
+/// connects once, enables the download events and drains them forever; the
+/// page sessions still see `Page.downloadWillBegin` too, which is what turns
+/// a click into a `"download"` result.
+fn spawn_browser_control(cdp_port: u16, data: &Path) {
+    let download_path = data.join("downloads").to_string_lossy().into_owned();
+    thread::spawn(move || {
+        let Some(connection) = browser_control_connection(cdp_port) else {
+            return;
+        };
+        let mut connection = connection;
+        if let Err(error) = connection.call(
+            "Browser.setDownloadBehavior",
+            &format!(
+                "{{\"behavior\":\"allow\",\"downloadPath\":{},\"eventsEnabled\":true}}",
+                json_string(&download_path)
+            ),
+        ) {
+            // Not fatal: downloads fall back to the browser's own default
+            // directory, which the agent then cannot see.
+            eprintln!("cu: could not redirect downloads: {error}");
+            return;
+        }
+        // Drain browser events (download progress, target changes) so the
+        // socket buffer never fills up. A blocking read with no timeout: the
+        // session must outlive hours between downloads.
+        let _ = connection.stream.set_read_timeout(None);
+        while connection.next_message(MAX_CDP_MESSAGE).is_ok() {}
+    });
+}
+
+/// A browser-level websocket from the discovery document.
+fn browser_control_connection(cdp_port: u16) -> Option<CdpConnection> {
+    let version = http_get(&format!("127.0.0.1:{cdp_port}"), "/json/version").ok()?;
+    let ws = json_string_value(&version, "webSocketDebuggerUrl")?;
+    CdpConnection::connect(&ws).ok()
 }
 
 /// Pid of the browser this daemon launched, 0 while there is none.
@@ -561,7 +611,9 @@ pub fn route(
             | ("POST", "/v1/click")
             | ("POST", "/v1/type")
             | ("GET", "/v1/contexts")
-    ) || (method == "DELETE" && path.starts_with("/v1/contexts/"));
+            | ("GET", "/v1/tabs")
+    ) || (method == "DELETE"
+        && (path.starts_with("/v1/contexts/") || path.starts_with("/v1/tabs/")));
     if needs_browser {
         if let Err(error) = wait_until_ready(state) {
             return (
@@ -572,11 +624,22 @@ pub fn route(
         }
     }
     // `?context=NAME` runs a page action in an isolated browser context of
-    // the same browser instead of the persistent profile's tab.
-    let tab = if needs_browser && !path.starts_with("/v1/contexts") {
-        match form_value(query(full_path), "context").as_str() {
-            "" => Tab::default_for(state.cdp_port),
-            name => match context_tab(state.cdp_port, name) {
+    // the same browser; `?tab=ID` runs it in another real tab (a popup, a
+    // window a click opened). They are two ways of picking a page, so giving
+    // both is an error rather than a silent preference.
+    let tab = if needs_browser && !path.starts_with("/v1/contexts") && !path.starts_with("/v1/tabs")
+    {
+        let context = form_value(query(full_path), "context");
+        let wanted = form_value(query(full_path), "tab");
+        if !context.is_empty() && !wanted.is_empty() {
+            return (
+                "400 Bad Request",
+                "application/json",
+                "{\"error\":\"give either ?context= or ?tab=, not both\"}".into(),
+            );
+        }
+        if !context.is_empty() {
+            match context_tab(state.cdp_port, &context) {
                 Ok(tab) => tab,
                 Err(e) => {
                     return (
@@ -585,12 +648,43 @@ pub fn route(
                         format!("{{\"error\":{}}}", json_string(&e)),
                     );
                 }
-            },
+            }
+        } else if !wanted.is_empty() {
+            match named_tab(state.cdp_port, &wanted) {
+                Ok(tab) => tab,
+                Err(e) => {
+                    return (
+                        "400 Bad Request",
+                        "application/json",
+                        format!("{{\"error\":{}}}", json_string(&e)),
+                    );
+                }
+            }
+        } else {
+            Tab::default_for(state.cdp_port)
         }
     } else {
         Tab::default_for(state.cdp_port)
     };
     match (method, path) {
+        ("GET", "/v1/tabs") => match tabs_json(state.cdp_port) {
+            Ok(body) => ("200 OK", "application/json", body),
+            Err(e) => (
+                "502 Bad Gateway",
+                "application/json",
+                format!("{{\"error\":{}}}", json_string(&e)),
+            ),
+        },
+        ("DELETE", p) if p.starts_with("/v1/tabs/") => {
+            match close_tab(state.cdp_port, &p["/v1/tabs/".len()..]) {
+                Ok(()) => ("200 OK", "application/json", "{\"closed\":true}".into()),
+                Err(e) => (
+                    "400 Bad Request",
+                    "application/json",
+                    format!("{{\"error\":{}}}", json_string(&e)),
+                ),
+            }
+        }
         ("GET", "/v1/contexts") => (
             "200 OK",
             "application/json",
@@ -621,6 +715,13 @@ pub fn route(
             "200 OK",
             "application/json",
             "{\"running\":true,\"browser\":\"chromium\"}".into(),
+        ),
+        // Pure file listing: works whether or not the browser is up, because
+        // the files outlive the session that downloaded them.
+        ("GET", "/v1/downloads") => (
+            "200 OK",
+            "application/json",
+            downloads_json(&state.data_dir.join("downloads")),
         ),
         ("POST", "/v1/navigate") => {
             let url = json_value(body, "url").unwrap_or_default();
@@ -780,6 +881,124 @@ fn act(
             Err(e) => error("502 Bad Gateway", &e),
         },
     }
+}
+
+/// Every open page tab, default first, as the `/v1/tabs` body.
+pub fn tabs_json(cdp_port: u16) -> Result<String, String> {
+    let discovery = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")?;
+    let pages = page_target_ids_and_sockets(&discovery, cdp_port);
+    let pinned = pinned_target(cdp_port);
+    let default_id = pinned
+        .filter(|p| pages.iter().any(|(id, _)| id == p))
+        .or_else(|| pages.first().map(|(id, _)| id.clone()));
+    let listed: Vec<String> = json_objects(&discovery)
+        .into_iter()
+        .filter(|o| json_string_value(o, "type").as_deref() == Some("page"))
+        .filter_map(|o| {
+            let id = json_string_value(&o, "id")?;
+            Some(format!(
+                "{{\"id\":{},\"url\":{},\"title\":{},\"default\":{}}}",
+                json_string(&id),
+                json_string(&json_string_value(&o, "url").unwrap_or_default()),
+                json_string(&json_string_value(&o, "title").unwrap_or_default()),
+                default_id.as_deref() == Some(id.as_str())
+            ))
+        })
+        .collect();
+    Ok(format!("{{\"tabs\":[{}]}}", listed.join(",")))
+}
+
+/// Close a tab by id. The last page is refused: Chromium exits with it.
+pub fn close_tab(cdp_port: u16, id: &str) -> Result<(), String> {
+    let discovery = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")?;
+    // Every page target counts here, context tabs included: any of them keeps
+    // Chromium alive, and a context's tab may be closed directly (the context
+    // then reports its tab as gone).
+    let pages: Vec<String> = json_objects(&discovery)
+        .into_iter()
+        .filter(|o| json_string_value(o, "type").as_deref() == Some("page"))
+        .filter_map(|o| json_string_value(&o, "id"))
+        .collect();
+    if !pages.iter().any(|page| page == id) {
+        return Err("no such tab; see GET /v1/tabs".into());
+    }
+    if pages.len() <= 1 {
+        return Err(
+            "refusing to close the last tab; stopping cu closes the browser instead".into(),
+        );
+    }
+    let reply = cdp_browser_command(
+        cdp_port,
+        "Target.closeTarget",
+        &format!("{{\"targetId\":{}}}", json_string(id)),
+    )?;
+    if json_value(&reply, "success").as_deref() == Some("false") {
+        return Err("Chromium refused to close that tab".into());
+    }
+    // The reply arrives before the target leaves `/json`; wait a beat so the
+    // `GET /v1/tabs` that follows a close agrees with it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let discovery = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")?;
+        let gone = json_objects(&discovery)
+            .into_iter()
+            .all(|o| json_string_value(&o, "id").as_deref() != Some(id));
+        if gone {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    // The pool of a closed tab is dead weight, and if it was the default the
+    // next action must pick a live page instead of a vanished id.
+    forget_tab(&Tab {
+        cdp_port,
+        target: Some(id.to_string()),
+    });
+    unpin_target(cdp_port, id);
+    Ok(())
+}
+
+/// Finished downloads in `dir`, newest first, as the `/v1/downloads` body.
+///
+/// A file Chromium is still writing carries the `.crdownload` suffix, so an
+/// entry here is complete and safe for the agent to read.
+pub fn downloads_json(dir: &Path) -> String {
+    let mut files: Vec<(SystemTime, String)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.ends_with(".crdownload") {
+                continue;
+            }
+            let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+            files.push((
+                mtime,
+                format!(
+                    "{{\"name\":{},\"bytes\":{}}}",
+                    json_string(name),
+                    meta.len()
+                ),
+            ));
+        }
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    format!(
+        "{{\"downloads\":[{}]}}",
+        files
+            .iter()
+            .map(|(_, item)| item.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 pub fn login_page() -> String {
@@ -1200,6 +1419,58 @@ fn contexts() -> &'static Mutex<HashMap<(u16, String), Context>> {
     CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The id of the page target the default tab resolves to, per DevTools port.
+fn pinned_target(cdp_port: u16) -> Option<String> {
+    pinned_targets()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cdp_port)
+        .cloned()
+}
+
+/// Remember which page target the default tab is, so popups and `/json`
+/// ordering cannot move it under the agent's feet.
+fn pin_target(cdp_port: u16, id: &str) {
+    pinned_targets()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(cdp_port, id.to_string());
+}
+
+/// Forget the pinned default (after it was closed); the next action that
+/// needs the default picks a live page and pins that one.
+fn unpin_target(cdp_port: u16, id: &str) {
+    let mut pinned = pinned_targets().lock().unwrap_or_else(|e| e.into_inner());
+    if pinned.get(&cdp_port).is_some_and(|p| p == id) {
+        pinned.remove(&cdp_port);
+    }
+}
+
+fn pinned_targets() -> &'static Mutex<HashMap<u16, String>> {
+    static PINNED: OnceLock<Mutex<HashMap<u16, String>>> = OnceLock::new();
+    PINNED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `(id, websocket url)` of every real page target the default tab may use:
+/// pages that do not belong to a named context.
+fn page_target_ids_and_sockets(discovery: &str, cdp_port: u16) -> Vec<(String, String)> {
+    let taken = context_targets(cdp_port);
+    json_objects(discovery)
+        .into_iter()
+        .filter(|o| json_string_value(o, "type").as_deref() == Some("page"))
+        .filter(|o| json_string_value(o, "id").is_none_or(|id| !taken.contains(&id)))
+        .filter_map(|o| {
+            match (
+                json_string_value(&o, "id"),
+                json_string_value(&o, "webSocketDebuggerUrl"),
+            ) {
+                (Some(id), Some(ws)) => Some((id, ws)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 /// The tab of context `name`, created on first use.
 pub fn context_tab(cdp_port: u16, name: &str) -> Result<Tab, String> {
     if !valid_name(name) {
@@ -1244,6 +1515,23 @@ pub fn context_tab(cdp_port: u16, name: &str) -> Result<Tab, String> {
     Ok(Tab {
         cdp_port,
         target: Some(target),
+    })
+}
+
+/// A tab another tab named by id (`?tab=ID`), validated against discovery so
+/// a stale id is an error an agent can act on rather than a CDP failure.
+pub fn named_tab(cdp_port: u16, id: &str) -> Result<Tab, String> {
+    let discovery = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")?;
+    let known = json_objects(&discovery).into_iter().any(|o| {
+        json_string_value(&o, "type").as_deref() == Some("page")
+            && json_string_value(&o, "id").as_deref() == Some(id)
+    });
+    if !known {
+        return Err("no such tab; see GET /v1/tabs".into());
+    }
+    Ok(Tab {
+        cdp_port,
+        target: Some(id.to_string()),
     })
 }
 
@@ -1318,15 +1606,21 @@ impl CdpConnection {
                 .into_iter()
                 .find(|o| json_string_value(o, "id").as_deref() == Some(id))
                 .and_then(|o| json_string_value(&o, "webSocketDebuggerUrl"))
-                .ok_or("the context's tab is gone; close the context and open it again")?,
+                .ok_or("no DevTools target with that id any more (see GET /v1/tabs)")?,
             None => {
-                let taken = context_targets(tab.cdp_port);
-                json_objects(&discovery)
-                    .into_iter()
-                    .filter(|o| json_string_value(o, "type").as_deref() == Some("page"))
-                    .filter(|o| json_string_value(o, "id").is_none_or(|id| !taken.contains(&id)))
-                    .find_map(|o| json_string_value(&o, "webSocketDebuggerUrl"))
-                    .ok_or("Chromium did not expose a page target")?
+                let pages = page_target_ids_and_sockets(&discovery, tab.cdp_port);
+                // Pin the default tab. `/json` lists a freshly opened popup
+                // ahead of the tab the agent is working in, so without a pin
+                // the next connection made with an empty pool would silently
+                // drive a different page.
+                let pinned = pinned_target(tab.cdp_port);
+                let chosen = pinned
+                    .as_ref()
+                    .and_then(|p| pages.iter().find(|(id, _)| id == p))
+                    .or_else(|| pages.first())
+                    .ok_or("Chromium did not expose a page target")?;
+                pin_target(tab.cdp_port, &chosen.0);
+                chosen.1.clone()
             }
         };
         Self::connect(&ws)
@@ -1344,9 +1638,25 @@ impl CdpConnection {
         let key = base64_encode(b"cu-cdp-clientkey");
         write!(stream, "GET /{path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
             .map_err(|e| e.to_string())?;
-        let mut handshake = [0; 2048];
-        let n = stream.read(&mut handshake).map_err(|e| e.to_string())?;
-        if !String::from_utf8_lossy(&handshake[..n]).starts_with("HTTP/1.1 101") {
+        // Read until the blank line that ends the response head. A single
+        // `read()` can return the status line alone when the machine is
+        // loaded, which used to be reported as a rejected handshake.
+        let mut handshake: Vec<u8> = Vec::with_capacity(256);
+        let mut buf = [0; 512];
+        loop {
+            if head_end(&handshake).is_some() {
+                break;
+            }
+            if handshake.len() > 8192 {
+                return Err("oversized CDP websocket handshake".into());
+            }
+            match stream.read(&mut buf) {
+                Ok(0) => return Err("Chromium closed during the CDP websocket handshake".into()),
+                Ok(n) => handshake.extend_from_slice(&buf[..n]),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        if !handshake.starts_with(b"HTTP/1.1 101") {
             return Err("Chromium rejected CDP websocket handshake".into());
         }
         Ok(Self { stream, next_id: 1 })
