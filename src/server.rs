@@ -1519,3 +1519,48 @@ pub mod snapshot {
 })()
 "#;
 }
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    /// The pool is the only shared mutable state on the hot path, so its
+    /// borrow/put accounting has to hold up under a burst.
+    #[test]
+    fn a_pooled_connection_is_reused_and_capped() {
+        let port = free_loopback_port();
+        let pool = cdp_pool(port);
+        // Nothing is cached yet, and the pool is per browser.
+        assert!(
+            pool.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .idle
+                .is_empty()
+        );
+        assert!(
+            cdp_pool(port + 1)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .idle
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn client_frames_are_masked_and_sized() {
+        let small = encode_client_frame(b"hi");
+        assert_eq!(small[0], 0x81);
+        assert_eq!(small[1] & 0x80, 0x80, "client frames must be masked");
+        assert_eq!((small[1] & 0x7f) as usize, 2);
+        let big = encode_client_frame(&vec![b'x'; 70_000]);
+        assert_eq!(big[1] & 0x7f, 127, "70k needs the 64-bit length form");
+    }
+
+    fn free_loopback_port() -> u16 {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port()
+    }
+}

@@ -220,7 +220,12 @@ def main():
             bench("shot(png)", args.iters,
                   lambda: cu.call("GET", "/v1/screenshot?format=png")),
         ]
-        results["snapshot_supported"] = has_snapshot(cu)
+        # Compaction: what the LLM is sent instead of the DOM it would have to
+        # read. The bulk page has 180 interactive nodes.
+        body = cu.call("GET", "/v1/snapshot").decode()
+        results["snapshot_bytes"] = len(body)
+        results["page_bytes"] = len(PAGE)
+        results["compaction"] = round(len(body) / len(PAGE), 3)
         if results["snapshot_supported"]:
             results["actions"].insert(
                 1, bench("snapshot", args.iters, lambda: cu.call("GET", "/v1/snapshot")))
