@@ -1444,9 +1444,25 @@ impl CdpConnection {
         let key = base64_encode(b"cu-cdp-clientkey");
         write!(stream, "GET /{path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
             .map_err(|e| e.to_string())?;
-        let mut handshake = [0; 2048];
-        let n = stream.read(&mut handshake).map_err(|e| e.to_string())?;
-        if !String::from_utf8_lossy(&handshake[..n]).starts_with("HTTP/1.1 101") {
+        // Read until the blank line that ends the response head. A single
+        // `read()` can return the status line alone when the machine is
+        // loaded, which used to be reported as a rejected handshake.
+        let mut handshake: Vec<u8> = Vec::with_capacity(256);
+        let mut buf = [0; 512];
+        loop {
+            if head_end(&handshake).is_some() {
+                break;
+            }
+            if handshake.len() > 8192 {
+                return Err("oversized CDP websocket handshake".into());
+            }
+            match stream.read(&mut buf) {
+                Ok(0) => return Err("Chromium closed during the CDP websocket handshake".into()),
+                Ok(n) => handshake.extend_from_slice(&buf[..n]),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        if !handshake.starts_with(b"HTTP/1.1 101") {
             return Err("Chromium rejected CDP websocket handshake".into());
         }
         Ok(Self { stream, next_id: 1 })
