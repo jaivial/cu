@@ -112,10 +112,15 @@ impl TestServer {
         }
         // The harness starts its own (fake) browser, so the readiness signal
         // is set here instead of by a launch thread.
-        let browser_state = BrowserState::new();
-        if with_browser {
-            browser_state.mark_ready();
-        }
+        let browser_state = if with_browser {
+            let state = BrowserState::new();
+            state.mark_ready();
+            state
+        } else {
+            // No browser was started, so the readiness signal must say that
+            // instead of leaving every page action waiting for a timeout.
+            BrowserState::absent("no browser was started for this server")
+        };
         let state = Arc::new(AppState {
             data_dir: data_dir.clone(),
             token: token.clone(),

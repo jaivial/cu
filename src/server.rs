@@ -53,6 +53,13 @@ impl BrowserState {
         Arc::new(Self::default())
     }
 
+    /// A daemon that is not going to have a browser at all (tests, or a
+    /// browser that was never asked for). Waiting for one would be wrong, so
+    /// this is recorded as a failure rather than left pending.
+    pub fn absent(reason: impl Into<String>) -> Arc<Self> {
+        Self::failed(reason)
+    }
+
     /// A browser that is already known to be unavailable.
     pub fn failed(error: impl Into<String>) -> Arc<Self> {
         let state = Self::default();
