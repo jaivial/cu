@@ -4,6 +4,19 @@
 
 ### Added
 
+- Actions by snapshot ref: `POST /v1/click`, `POST /v1/type` and the batch
+  `POST /v1/act` (`cu click`, `cu type`, `cu act`; `Client::click`,
+  `Client::act`). A batch runs on one DevTools connection and ends with a
+  snapshot. Refs stay with their element across snapshots and actions, and an
+  old ref misses instead of hitting another element. Ten clicks in one batch
+  take ~25 ms.
+- Snapshots list the visible headings and name a `select` by its chosen option.
+- `?context=NAME`: isolated browser contexts inside the one browser (~19 MB and
+  ~35 ms each, against ~176 MB and 0.5-1 s for a second browser).
+  `GET /v1/contexts`, `DELETE /v1/contexts/NAME`.
+- `bench/compare.py`: cu against agent-browser and Playwright MCP on the same
+  tasks, with snapshot token counts. Results in `docs/BENCHMARKS.md`.
+
 - Speed for agents, measured in `docs/BENCHMARKS.md`. Cold start went from
   431 ms to 6 ms (71x), and the new compact snapshot answers in about 2 ms.
 - `GET /v1/snapshot` and `cu snapshot`: the page as one short line per
@@ -26,6 +39,13 @@
 
 ### Changed
 
+- Navigate awaits `DOMContentLoaded` in the page in one round trip instead of
+  polling `readyState` every 25 ms; navigate p95 went from ~59 ms to ~50 ms and
+  median from ~45 ms to ~26 ms, interleaved against the previous binary.
+- Chromium is launched with light flags (no background networking, updates,
+  sync, extensions, crash upload, audio or GPU raster): ~30% less browser CPU
+  on the same workload, one process fewer.
+
 - DevTools connections are pooled and kept warm. Every action used to pay a
   `/json` discovery request, a TCP connect and a websocket handshake before it
   could send anything; a pool of eight connections now serves a burst without
@@ -35,6 +55,11 @@
   start-up sleep is gone: a browser that dies is reported on the first poll.
 
 ### Fixed
+
+- Stopping `cu` closes its browser (`Browser.close`, then SIGTERM). Every
+  daemon used to leave its whole Chromium tree running.
+- CDP replies are matched on their top-level `id`; a nested frame `id` (as in
+  `Page.getFrameTree`) could be taken for it.
 
 - `launch_browser` hard-coded the DevTools port, so a daemon started with
   `CU_CDP_PORT` launched a browser nobody could reach and `cu navigate` failed

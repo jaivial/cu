@@ -37,7 +37,38 @@ bounded to three seconds, and reports what it spent in `settled_ms`. A page
 that keeps a stream open for ever -- SSE, websocket, long poll -- therefore
 costs at most three seconds instead of hanging the action.
 
-Latency for every one of these is tracked in [BENCHMARKS.md](BENCHMARKS.md).
+### Acting on refs
+
+`POST /v1/click {"ref":"e3"}` and `POST /v1/type {"ref":"e2","text":"hi","submit":true}`
+act on an element from the last snapshot (`cu click e3`, `cu type e2 hi --submit`).
+`POST /v1/act` runs a batch on one connection and ends with a fresh snapshot,
+so a whole form is one call:
+
+```json
+{"actions":[
+  {"do":"type","ref":"e2","text":"Ada"},
+  {"do":"select","ref":"e4","value":"Medium"},
+  {"do":"click","ref":"e5"}
+]}
+```
+
+Actions are `click`, `type` (`text`, `clear` default true, `submit`), `press`
+(`key`: Enter, Tab, Escape, arrows, ...), `select` (`value` or label),
+`navigate` (`url`) and `wait` (`ms`). `"snapshot":false` skips the closing
+snapshot. The reply reports `ok`, per-action `navigated` and `ms`, and on a
+failure the index that `failed` and why -- a stale ref says to take a new
+snapshot, a covered element names what covers it. Refs stay with their element
+across snapshots and actions.
+
+### Contexts
+
+Add `?context=NAME` to navigate, snapshot, screenshot or act to work in an
+isolated browser context of the same browser (own cookies and storage),
+created on first use. `GET /v1/contexts` lists them and `DELETE
+/v1/contexts/NAME` closes one. Stopping `cu` closes its browser.
+
+Latency for every one of these is tracked in [BENCHMARKS.md](BENCHMARKS.md),
+including a comparison with agent-browser and Playwright MCP.
 
 The browser executable defaults to `chromium`; set `CU_BROWSER` to an alternate binary. Browsers are launched headless, which is what an agent usually wants; set `CU_HEADLESS=0` to attach a display instead. `CU_DATA_DIR` changes the default data directory and `CU_CDP_PORT` the DevTools port (default `9222`). Do not expose this server beyond localhost without adding TLS and an access-control layer.
 
