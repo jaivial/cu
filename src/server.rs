@@ -457,7 +457,20 @@ pub fn route(
                 "Page.navigate",
                 &format!("{{\"url\":\"{}\"}}", json_escape(&url)),
             ) {
-                Ok(result) => ("200 OK", "application/json", result),
+                Ok(result) => {
+                    // Do not hand back a half-loaded page, but never hang on a
+                    // stream that stays open for ever.
+                    let waited = wait_for_page(state.cdp_port, SETTLE_MAX);
+                    (
+                        "200 OK",
+                        "application/json",
+                        format!(
+                            "{{\"result\":{},\"settled_ms\":{}}}",
+                            result.trim(),
+                            waited.as_millis()
+                        ),
+                    )
+                }
                 Err(error) => (
                     "502 Bad Gateway",
                     "application/json",
@@ -649,6 +662,71 @@ pub fn json_array(input: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Is the page usable *now*, in the browser's own judgement?
+///
+/// This is the "smart wait". Waiting for the network to go quiet hangs forever
+/// on a page that holds an SSE stream, a websocket or a long poll open -- which
+/// is most of them -- so the question asked here is the one Playwright calls
+/// `domcontentloaded` plus "has the DOM stopped changing".
+fn page_is_settled(cdp_port: u16) -> bool {
+    let probe = r#"(function(){
+      return JSON.stringify({
+        ready: document.readyState,
+        loading: document.readyState === 'loading',
+        mutating: (function(){
+          var n = 0;
+          var obs = new MutationObserver(function(m){ n += m.length; });
+          obs.observe(document.documentElement, {childList:true, subtree:true, attributes:true});
+          return n;
+        })()
+      });
+    })()"#;
+    match cdp_command(
+        cdp_port,
+        "Runtime.evaluate",
+        &format!(
+            "{{\"expression\":{},\"returnByValue\":true}}",
+            json_string(probe)
+        ),
+    ) {
+        Ok(result) => {
+            let value = json_objects(&result)
+                .iter()
+                .filter_map(|o| json_string_value(o, "value"))
+                .next()
+                .or_else(|| json_string_value(&result, "value"))
+                .unwrap_or_default();
+            let ready = json_string_value(&value, "ready");
+            // `complete` or `interactive` with no pending mutations is a page an
+            // agent can act on. `loading` is not.
+            matches!(ready.as_deref(), Some("complete") | Some("interactive"))
+                && json_value(&value, "mutating").as_deref() != Some("1")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Wait until the page is usable, or give up and let the agent have what is
+/// there.
+///
+/// The budget is spent in favour of the agent, not against it: the first poll
+/// answers as soon as the DOM is interactive, which is typically a few tens of
+/// milliseconds after `Page.navigate` returns, and a page that never settles
+/// (SSE, websocket, long poll) costs at most `SETTLE_MAX` instead of hanging.
+pub fn wait_for_page(cdp_port: u16, budget: Duration) -> Duration {
+    let started = std::time::Instant::now();
+    let deadline = started + budget.max(SETTLE_TIMEOUT);
+    loop {
+        if page_is_settled(cdp_port) {
+            return started.elapsed();
+        }
+        if std::time::Instant::now() >= deadline {
+            return started.elapsed();
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// Type the credentials into the page the browser is showing and submit it.
@@ -845,6 +923,12 @@ pub fn cdp_command(cdp_port: u16, method: &str, params: &str) -> Result<String, 
 const MAX_CDP_MESSAGE: usize = 32 * 1024 * 1024;
 /// How long the daemon waits for its own browser to come up.
 const BROWSER_START_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a navigation may take to become usable before handing back what
+/// the page shows anyway.
+pub const SETTLE_TIMEOUT: Duration = Duration::from_millis(400);
+/// Longest extra wait for a page that is still loading useful content.
+pub const SETTLE_MAX: Duration = Duration::from_millis(3000);
+
 /// Read one (unmasked, server-to-client) websocket frame.
 ///
 /// A screenshot comes back in a 64-bit length frame: only the 7- and 16-bit

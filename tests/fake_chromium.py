@@ -153,6 +153,18 @@ class Handler(BaseHTTPRequestHandler):
             return {"id": 1, "result": {"data": PNG}}
         if method == "Runtime.evaluate":
             expr = (params or {}).get("expression", "")
+            if "document.readyState" in expr:
+                # The smart wait asks whether the page is usable; answer that it
+                # is, so navigate is not held for the whole settle budget.
+                return {
+                    "id": 1,
+                    "result": {
+                        "result": {
+                            "type": "string",
+                            "value": '{"ready":"complete","mutating":0}',
+                        }
+                    },
+                }
             if "cuAgentSnapshot" in expr:
                 return {
                     "id": 1,

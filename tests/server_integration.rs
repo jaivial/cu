@@ -524,3 +524,18 @@ fn a_snapshot_needs_the_browser() {
     assert_eq!(status_code(&response), "503");
     assert!(body_of(&response).contains("error"));
 }
+
+#[test]
+fn navigate_reports_how_long_the_page_took_to_settle() {
+    let server = TestServer::start("settle", true);
+    let response = server.post("/v1/navigate", "{\"url\":\"https://example.test\"}");
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&response);
+    // The smart wait reports what it spent instead of hiding it.
+    assert!(body.contains("settled_ms"), "no settle timing in {body}");
+    // And it comes back promptly: `Page.navigate` plus one settled probe.
+    assert!(
+        body.contains("\"url\":\"https://example.test\""),
+        "navigate result lost: {body}"
+    );
+}
