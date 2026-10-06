@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cu::server::{self, AppState};
+use cu::server::{self, AppState, BrowserState};
 
 /// Writes `data` to `addr` in chunks with a pause in between, so the request
 /// arrives in several TCP segments, then reads the whole response.
@@ -86,7 +86,10 @@ struct TestServer {
     addr: String,
     token: String,
     data_dir: PathBuf,
+    /// The fake browser process, killed when the test ends.
     browser: Option<Child>,
+    /// Readiness signal handed to the server under test.
+    browser_state: Arc<BrowserState>,
 }
 
 impl TestServer {
@@ -107,10 +110,17 @@ impl TestServer {
         if with_browser {
             wait_for_port(cdp_port);
         }
+        // The harness starts its own (fake) browser, so the readiness signal
+        // is set here instead of by a launch thread.
+        let browser_state = BrowserState::new();
+        if with_browser {
+            browser_state.mark_ready();
+        }
         let state = Arc::new(AppState {
             data_dir: data_dir.clone(),
             token: token.clone(),
             cdp_port,
+            browser: Arc::clone(&browser_state),
         });
         std::thread::spawn(move || server::serve(state, listener));
         Self {
@@ -118,6 +128,7 @@ impl TestServer {
             token,
             data_dir,
             browser,
+            browser_state,
         }
     }
 
@@ -131,6 +142,12 @@ impl TestServer {
             Duration::from_millis(10),
         )
         .expect("fragmented request should get a response")
+    }
+
+    /// Pretends the browser is up for a test that exercises the HTTP layer
+    /// rather than the page, so a route falls through to its real CDP error.
+    fn mark_browser_ready(&self) {
+        self.browser_state.mark_ready();
     }
 
     /// A JSON POST in four fragments, returning the response body.
@@ -236,6 +253,9 @@ fn status_answers_a_one_byte_at_a_time_request() {
 #[test]
 fn a_fragmented_body_is_reassembled_before_routing() {
     let server = TestServer::start("body", false);
+    // The point is request reassembly, not the browser, so let the route reach
+    // its CDP call and fail there instead of at the readiness gate.
+    server.mark_browser_ready();
     // The URL is spread across the last fragments, so the server must have read
     // the whole body before it could parse it.
     let body = format!("{{\"url\":\"https://example.test/{}\"}}", "x".repeat(300));

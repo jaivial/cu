@@ -5,7 +5,6 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use cu::server::{self, AppState};
 
@@ -88,13 +87,18 @@ fn start(args: &[String]) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| e.to_string())?;
     let cdp_port = cdp_port_from_env().unwrap_or(DEFAULT_CDP_PORT);
-    let _browser = server::launch_browser(&data, cdp_port)?;
-    server::wait_for_cdp(cdp_port, Duration::from_secs(15))?;
+    // Listen and publish the token before the browser is up: `cu start` then
+    // returns in single-digit milliseconds instead of blocking ~0.5 s on
+    // Chromium, and the browser warms up while the agent reads its first tool
+    // result. Actions that need the browser wait on the readiness signal.
+    let browser = server::BrowserState::new();
+    server::spawn_browser_thread(data.clone(), cdp_port, Arc::clone(&browser));
     eprintln!("cu listening on http://127.0.0.1:{port}; browser DevTools on 127.0.0.1:{cdp_port}");
     let state = Arc::new(AppState {
         data_dir: data,
         token,
         cdp_port,
+        browser,
     });
     server::serve(state, listener);
     Ok(())

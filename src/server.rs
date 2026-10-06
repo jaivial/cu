@@ -5,8 +5,9 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
@@ -15,6 +16,101 @@ pub struct AppState {
     pub token: String,
     /// Port Chromium listens on for the DevTools protocol (default 9222).
     pub cdp_port: u16,
+    /// Readiness of the persistent browser, shared with the launch thread.
+    pub browser: Arc<BrowserState>,
+}
+
+/// Whether the persistent browser is up, or why it never came up.
+///
+/// The daemon listens before the browser is ready: a cold `cu start` used to
+/// block for the whole Chromium start-up (~0.5 s) before an agent could get so
+/// much as a `status` back. With the signal, start returns at once and the
+/// first action that needs the browser waits for it, and only for as long as
+/// it is actually missing.
+pub struct BrowserState {
+    inner: Mutex<BrowserStateInner>,
+    signal: Condvar,
+}
+
+#[derive(Default)]
+struct BrowserStateInner {
+    ready: bool,
+    error: Option<String>,
+}
+
+impl Default for BrowserState {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(BrowserStateInner::default()),
+            signal: Condvar::new(),
+        }
+    }
+}
+
+impl BrowserState {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// A browser that is already known to be unavailable.
+    pub fn failed(error: impl Into<String>) -> Arc<Self> {
+        let state = Self::default();
+        state.mark_failed(error.into());
+        Arc::new(state)
+    }
+
+    /// Mark the browser as answering DevTools.
+    pub fn mark_ready(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.ready = true;
+        self.signal.notify_all();
+    }
+
+    /// Record that the browser will never come up, and why.
+    pub fn mark_failed(&self, error: String) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.error.get_or_insert(error);
+        self.signal.notify_all();
+    }
+
+    /// Is the browser answering DevTools yet?
+    pub fn is_ready(&self) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).ready
+    }
+
+    /// Why the browser is not available, if that is already known.
+    pub fn failure(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .error
+            .clone()
+    }
+
+    /// Wait until the browser is usable, or fail with the reason it is not.
+    pub fn wait(&self, timeout: Duration) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if inner.ready {
+                return Ok(());
+            }
+            if let Some(error) = &inner.error {
+                return Err(error.clone());
+            }
+            if started.elapsed() >= timeout {
+                return Err(format!(
+                    "Chromium DevTools never answered within {} ms",
+                    timeout.as_millis()
+                ));
+            }
+            let (guard, _wait) = self
+                .signal
+                .wait_timeout(inner, Duration::from_millis(2))
+                .unwrap_or_else(|e| e.into_inner());
+            inner = guard;
+        }
+    }
 }
 
 /// Accept loop. Binds to loopback only and serves one thread per connection.
@@ -35,16 +131,66 @@ pub fn serve(state: Arc<AppState>, listener: TcpListener) {
 /// `cu navigate` used to race the browser start-up and lose, returning
 /// "connection refused" for a browser that was in fact coming up.
 pub fn wait_for_cdp(cdp_port: u16, timeout: Duration) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if http_get(&format!("127.0.0.1:{cdp_port}"), "/json/version").is_ok() {
+    wait_for_browser(cdp_port, timeout, None)
+}
+
+/// Wait for DevTools to answer, and fail as soon as the browser is known dead.
+///
+/// This is what makes a cold `cu start` fast: instead of a fixed start-up
+/// sleep followed by a coarse 50 ms poll, the endpoint is probed every 2 ms
+/// (a loopback connect is a few microseconds) and the child is checked on
+/// every miss, so a browser that died is reported in the same round rather
+/// than after a timeout.
+pub fn wait_for_browser(
+    cdp_port: u16,
+    timeout: Duration,
+    mut child: Option<&mut Child>,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let address = format!("127.0.0.1:{cdp_port}");
+    loop {
+        if http_get(&address, "/json/version").is_ok() {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(50));
+        // `as_deref_mut` reborrows instead of moving the child out of the
+        // option, so the check can run on every poll.
+        if let Some(child) = child.as_deref_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return Err(format!(
+                        "Chromium exited immediately ({status}); set CU_BROWSER to a working binary"
+                    ));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(format!("could not check on Chromium: {e}")),
+            }
+        }
+        if started.elapsed() >= timeout {
+            return Err(format!("Chromium DevTools never answered on {address}"));
+        }
+        thread::sleep(CDP_POLL_INTERVAL);
     }
-    Err(format!(
-        "Chromium DevTools never answered on 127.0.0.1:{cdp_port}"
-    ))
+}
+
+/// Launch the persistent browser in the background and signal when it is up.
+///
+/// `cu start` returns before Chromium is ready, so an agent gets its prompt
+/// back immediately and the browser warms up while it is deciding what to do.
+pub fn spawn_browser_thread(
+    data: PathBuf,
+    cdp_port: u16,
+    browser: Arc<BrowserState>,
+) -> JoinHandle<()> {
+    thread::spawn(move || match launch_browser(&data, cdp_port) {
+        Ok(mut child) => {
+            let _ = child.stdin.take();
+            match wait_for_browser(cdp_port, BROWSER_START_TIMEOUT, Some(&mut child)) {
+                Ok(()) => browser.mark_ready(),
+                Err(e) => browser.mark_failed(e),
+            }
+        }
+        Err(e) => browser.mark_failed(e),
+    })
 }
 
 /// Remove the per-process locks a killed browser left in a profile.
@@ -108,25 +254,19 @@ pub fn launch_browser(data: &Path, cdp_port: u16) -> Result<Child, String> {
     }
     // Chromium writes its startup diagnostics (including "no display") to
     // stderr; keep it so a browser that dies at once can be diagnosed.
-    let mut child = command
+    let child = command
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("could not start Chromium (set CU_BROWSER): {e}"))?;
-    // A browser that exits immediately (no display, bad binary) must be
-    // reported instead of leaving a daemon that answers status but can never
-    // navigate.
-    thread::sleep(Duration::from_millis(300));
-    if let Some(status) = child
-        .try_wait()
-        .map_err(|e| format!("could not check on Chromium: {e}"))?
-    {
-        return Err(format!(
-            "Chromium exited immediately ({status}); set CU_BROWSER to a working binary"
-        ));
-    }
+    // A browser that exits immediately (no display, bad binary) is reported by
+    // `wait_for_browser` on the first poll instead of after a fixed sleep here,
+    // which used to cost every start 300 ms whether or not it was needed.
     Ok(child)
 }
 
+/// How often DevTools is probed while a browser is coming up. A loopback
+/// connect is a few microseconds, so this is pure responsiveness, not load.
+const CDP_POLL_INTERVAL: Duration = Duration::from_millis(2);
 /// How long to wait for a DevTools HTTP response before using what arrived.
 const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum accepted request head and body. Guards against unbounded buffering.
@@ -260,12 +400,43 @@ fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+/// Wait for the browser the route is about to use.
+///
+/// The daemon listens before Chromium is up, so the first action after a cold
+/// `cu start` waits here for the launch to finish -- and only for as long as
+/// the browser is really missing, because the launch thread signals the moment
+/// DevTools answers.
+fn wait_until_ready(state: &AppState) -> Result<(), String> {
+    state.browser.wait(BROWSER_START_TIMEOUT)
+}
+
 pub fn route(
     method: &str,
     path: &str,
     body: &str,
     state: &AppState,
 ) -> (&'static str, &'static str, String) {
+    // Only the routes that drive the page wait for the browser: `status`, the
+    // login form and the 401/404 paths answer instantly whatever Chromium is
+    // doing, which is what makes `cu start` return at once.
+    // Session save/load is a profile copy, not a page action: it must work
+    // while the browser is down, so it is deliberately not gated.
+    let needs_browser = matches!(
+        (method, path),
+        ("POST", "/v1/navigate")
+            | ("GET", "/v1/screenshot")
+            | ("GET", "/v1/snapshot")
+            | ("POST", "/v1/navigate-and-snapshot")
+    );
+    if needs_browser {
+        if let Err(error) = wait_until_ready(state) {
+            return (
+                "503 Service Unavailable",
+                "application/json",
+                format!("{{\"error\":\"{}\"}}", json_escape(&error)),
+            );
+        }
+    }
     match (method, path) {
         ("GET", "/v1/status") => (
             "200 OK",
@@ -571,6 +742,8 @@ pub fn cdp_command(cdp_port: u16, method: &str, params: &str) -> Result<String, 
 /// stalled on its first navigate.
 /// Largest CDP payload accepted, including base64 screenshots.
 const MAX_CDP_MESSAGE: usize = 32 * 1024 * 1024;
+/// How long the daemon waits for its own browser to come up.
+const BROWSER_START_TIMEOUT: Duration = Duration::from_secs(30);
 /// Read one (unmasked, server-to-client) websocket frame.
 ///
 /// A screenshot comes back in a 64-bit length frame: only the 7- and 16-bit
@@ -884,6 +1057,7 @@ mod tests {
             data_dir: std::env::temp_dir().join("cu-login-test"),
             token: "t".into(),
             cdp_port: 1,
+            browser: BrowserState::new(),
         };
         let page = login_submit("username=&password=", &state);
         assert!(!page.contains("Login received"));
@@ -896,6 +1070,7 @@ mod tests {
             data_dir: std::env::temp_dir().join("cu-login-test"),
             token: "t".into(),
             cdp_port: 1,
+            browser: BrowserState::new(),
         };
         // The browser is unreachable on port 1, so nothing is typed; the point
         // is that no password ever comes back in the page.
