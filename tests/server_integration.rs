@@ -236,7 +236,7 @@ fn status_answers_a_request_sent_in_fragments() {
     assert_eq!(status_code(&response), "200");
     assert_eq!(
         body_of(&response),
-        "{\"running\":true,\"browser\":\"chromium\"}"
+        "{\"running\":true,\"browser\":\"chromium\",\"leases\":0}"
     );
 }
 

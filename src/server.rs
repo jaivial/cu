@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -124,6 +124,7 @@ impl BrowserState {
 
 /// Accept loop. Binds to loopback only and serves one thread per connection.
 pub fn serve(state: Arc<AppState>, listener: TcpListener) {
+    spawn_reaper();
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -637,6 +638,8 @@ pub fn route(
             | ("POST", "/v1/click")
             | ("POST", "/v1/type")
             | ("GET", "/v1/contexts")
+            | ("POST", "/v1/tabs")
+            | ("POST", "/v1/contexts")
             | ("GET", "/v1/tabs")
             | ("GET", "/v1/text")
     ) || (method == "DELETE"
@@ -738,10 +741,111 @@ pub fn route(
                 ),
             }
         }
+        // One tab per test in the one browser, with a lease so the tab is
+        // closed when the test ends -- or, if it never ends (the agent died,
+        // the run was cut off), when the lease expires. Same for contexts.
+        ("POST", "/v1/tabs") => {
+            let url = json_value(body, "url").unwrap_or_default();
+            let label = json_value(body, "label").unwrap_or_default();
+            let lease = match json_value(body, "lease") {
+                None => DEFAULT_LEASE_SECS,
+                Some(v) => v.parse::<u64>().unwrap_or(DEFAULT_LEASE_SECS),
+            };
+            match open_page_tab(state.cdp_port, &url) {
+                Ok(id) => {
+                    let lease = set_lease(state.cdp_port, LeaseKind::Tab, &id, &label, lease);
+                    (
+                        "200 OK",
+                        "application/json",
+                        format!(
+                            "{{\"tab\":{},\"url\":{},\"label\":{},\"lease\":{}}}",
+                            json_string(&id),
+                            json_string(&url),
+                            json_string(&label),
+                            lease
+                        ),
+                    )
+                }
+                Err(e) => (
+                    "502 Bad Gateway",
+                    "application/json",
+                    format!("{{\"error\":{}}}", json_string(&e)),
+                ),
+            }
+        }
+        ("POST", "/v1/contexts") => {
+            let name = json_value(body, "name").unwrap_or_default();
+            let label = json_value(body, "label").unwrap_or_default();
+            let lease = match json_value(body, "lease") {
+                None => DEFAULT_LEASE_SECS,
+                Some(v) => v.parse::<u64>().unwrap_or(DEFAULT_LEASE_SECS),
+            };
+            if !valid_name(&name) {
+                return (
+                    "400 Bad Request",
+                    "application/json",
+                    "{\"error\":\"name is required (letters, digits, _ - )\"}".into(),
+                );
+            }
+            match context_tab(state.cdp_port, &name) {
+                Ok(tab) => {
+                    let lease = set_lease(state.cdp_port, LeaseKind::Context, &name, &label, lease);
+                    let id = tab.target.unwrap_or_default();
+                    (
+                        "200 OK",
+                        "application/json",
+                        format!(
+                            "{{\"context\":{},\"tab\":{},\"label\":{},\"lease\":{}}}",
+                            json_string(&name),
+                            json_string(&id),
+                            json_string(&label),
+                            lease
+                        ),
+                    )
+                }
+                Err(e) => (
+                    "502 Bad Gateway",
+                    "application/json",
+                    format!("{{\"error\":{}}}", json_string(&e)),
+                ),
+            }
+        }
+        // Set or extend a lease: `{"key":"tab:ID"|"context:NAME","seconds":N}`.
+        ("POST", "/v1/lease") => {
+            let key = json_value(body, "key").unwrap_or_default();
+            let seconds = json_value(body, "seconds")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_LEASE_SECS);
+            let (kind, name) = match key.split_once(':') {
+                Some(("tab", name)) => (LeaseKind::Tab, name),
+                Some(("context", name)) => (LeaseKind::Context, name),
+                _ => {
+                    return (
+                        "400 Bad Request",
+                        "application/json",
+                        "{\"error\":\"key must be tab:ID or context:NAME\"}".into(),
+                    )
+                }
+            };
+            let lease = set_lease(state.cdp_port, kind, name, "", seconds);
+            (
+                "200 OK",
+                "application/json",
+                format!(
+                    "{{\"key\":{},\"lease\":{}}}",
+                    json_string(&key),
+                    lease
+                ),
+            )
+        }
+        ("GET", "/v1/leases") => ("200 OK", "application/json", leases_json(state.cdp_port)),
         ("GET", "/v1/status") => (
             "200 OK",
             "application/json",
-            "{\"running\":true,\"browser\":\"chromium\"}".into(),
+            format!(
+                "{{\"running\":true,\"browser\":\"chromium\",\"leases\":{}}}",
+                lease_count(state.cdp_port)
+            ),
         ),
         // Visible text of the page, for the reading a snapshot deliberately
         // does not do: prose, API responses, error messages. One evaluate,
@@ -1022,12 +1126,16 @@ pub fn close_tab(cdp_port: u16, id: &str) -> Result<(), String> {
         target: Some(id.to_string()),
     });
     unpin_target(cdp_port, id);
+    drop_lease(cdp_port, LeaseKind::Tab, id);
     Ok(())
 }
 
 /// Characters `GET /v1/text` returns before truncating: enough for an API
 /// response or several screens of prose, small enough that one reply stays
 /// a tool-sized payload.
+/// Default lifetime of a leased tab/context, long enough for a test to
+/// finish and short enough that a dead agent's tab does not linger.
+pub const DEFAULT_LEASE_SECS: u64 = 600;
 const TEXT_LIMIT: usize = 16_000;
 
 /// Visible text of the main document. `innerText` is what the user would
@@ -1672,6 +1780,153 @@ impl Tab {
     }
 }
 
+/// Cleanup deadline for a tab or context a test leased.
+///
+/// The resource model is one browser always open and one tab (or context) per
+/// test: the tab is closed when the test ends -- and when the test never ends,
+/// because the agent died or the run was cut off, the lease expires and the
+/// reaper closes it. Nothing accumulates.
+struct Lease {
+    kind: LeaseKind,
+    label: String,
+    deadline: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LeaseKind {
+    Tab,
+    Context,
+}
+
+impl LeaseKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            LeaseKind::Tab => "tab",
+            LeaseKind::Context => "context",
+        }
+    }
+}
+
+/// Leases per browser, keyed like `tab:<id>` / `context:<name>`.
+fn leases() -> &'static Mutex<HashMap<(u16, String), Lease>> {
+    static LEASES: OnceLock<Mutex<HashMap<(u16, String), Lease>>> = OnceLock::new();
+    LEASES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Lease key of a tab id or context name.
+fn lease_key(kind: LeaseKind, name: &str) -> String {
+    format!("{}:{name}", kind.as_str())
+}
+
+/// Set (or extend) the lease of `key`; `seconds == 0` removes it (no cleanup).
+pub fn set_lease(cdp_port: u16, kind: LeaseKind, name: &str, label: &str, seconds: u64) -> u64 {
+    let key = (cdp_port, lease_key(kind, name));
+    let mut all = leases().lock().unwrap_or_else(|e| e.into_inner());
+    if seconds == 0 {
+        all.remove(&key);
+        return 0;
+    }
+    all.insert(
+        key,
+        Lease {
+            kind,
+            label: label.to_string(),
+            deadline: Instant::now() + Duration::from_secs(seconds),
+        },
+    );
+    seconds
+}
+
+/// Drop the lease of a resource that is being closed on purpose.
+fn drop_lease(cdp_port: u16, kind: LeaseKind, name: &str) {
+    leases()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(cdp_port, lease_key(kind, name)));
+}
+
+/// Remaining seconds of every lease on this browser, soonest first.
+pub fn leases_json(cdp_port: u16) -> String {
+    let now = Instant::now();
+    let mut listed: Vec<String> = leases()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|((port, _), _)| *port == cdp_port)
+        .map(|((_, key), lease)| {
+            let remaining = lease.deadline.saturating_duration_since(now).as_secs();
+            format!(
+                "{{\"key\":{},\"kind\":{},\"label\":{},\"remaining_s\":{}}}",
+                json_string(key),
+                json_string(lease.kind.as_str()),
+                json_string(&lease.label),
+                remaining
+            )
+        })
+        .collect();
+    listed.sort();
+    format!("{{\"leases\":[{}]}}", listed.join(","))
+}
+
+fn lease_count(cdp_port: u16) -> usize {
+    leases()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .filter(|(port, _)| *port == cdp_port)
+        .count()
+}
+
+/// Open a new page tab in the one browser; the id addresses it with `?tab=`.
+pub fn open_page_tab(cdp_port: u16, url: &str) -> Result<String, String> {
+    let url = if url.is_empty() { "about:blank" } else { url };
+    let reply = cdp_browser_command(
+        cdp_port,
+        "Target.createTarget",
+        &format!("{{\"url\":{}}}", json_string(url)),
+    )?;
+    json_string_value(&reply, "targetId")
+        .ok_or_else(|| "Chromium did not open a tab".to_string())
+}
+
+/// Close every tab and context whose lease ran out.
+///
+/// This is what makes cleanup survive the agent: the deadline lives in the
+/// daemon, so a test that fails, is cut off or whose process dies still has
+/// its tab closed a few seconds later.
+fn reap_expired() {
+    let now = Instant::now();
+    let expired: Vec<(u16, String, LeaseKind)> = leases()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(_, lease)| lease.deadline <= now)
+        .map(|((port, key), lease)| (*port, key.clone(), lease.kind))
+        .collect();
+    for (cdp_port, key, kind) in expired {
+        // The tab may already be gone (a test that closed it and crashed
+        // before dropping the lease); a failed close is still cleaned up.
+        let name = key.split_once(':').map(|(_, n)| n).unwrap_or(&key);
+        match kind {
+            LeaseKind::Tab => {
+                let _ = close_tab(cdp_port, name);
+            }
+            LeaseKind::Context => {
+                let _ = close_context(cdp_port, name);
+            }
+        }
+        drop_lease(cdp_port, kind, name);
+    }
+}
+
+/// Reaper thread: the lease clock keeps ticking whatever the agent does.
+fn spawn_reaper() {
+    thread::spawn(|| loop {
+        thread::sleep(Duration::from_secs(2));
+        reap_expired();
+    });
+}
+
 /// A browser context: an isolated cookie jar and cache inside the one browser.
 struct Context {
     browser_context: String,
@@ -1813,6 +2068,7 @@ pub fn close_context(cdp_port: u16, name: &str) -> Result<bool, String> {
     let Some(context) = removed else {
         return Ok(false);
     };
+    drop_lease(cdp_port, LeaseKind::Context, name);
     forget_tab(&Tab {
         cdp_port,
         target: Some(context.target),
@@ -2975,5 +3231,51 @@ mod frame_tests {
             "{text}"
         );
         assert!(pairs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+
+    #[test]
+    fn lease_round_trip() {
+        let port = 65501;
+        set_lease(port, LeaseKind::Tab, "t1", "story-42", 600);
+        assert_eq!(lease_count(port), 1);
+        let listed = leases_json(port);
+        assert!(listed.contains("\"key\":\"tab:t1\""));
+        assert!(listed.contains("\"label\":\"story-42\""));
+        assert!(listed.contains("\"kind\":\"tab\""));
+        set_lease(port, LeaseKind::Tab, "t1", "", 0);
+        assert_eq!(lease_count(port), 0);
+    }
+
+    #[test]
+    fn lease_keys_name_the_kind() {
+        assert_eq!(lease_key(LeaseKind::Tab, "t3"), "tab:t3");
+        assert_eq!(lease_key(LeaseKind::Context, "job7"), "context:job7");
+    }
+
+    #[test]
+    fn expired_leases_are_reaped_even_without_an_agent() {
+        let port = 65502;
+        // No browser answers this port: the reap must clean the bookkeeping
+        // anyway (the agent may have died holding a tab that no longer exists).
+        set_lease(port, LeaseKind::Tab, "t-gone", "dead-test", 1);
+        set_lease(port, LeaseKind::Context, "ctx-gone", "dead-test", 1);
+        assert_eq!(lease_count(port), 2);
+        std::thread::sleep(Duration::from_millis(1100));
+        reap_expired();
+        assert_eq!(lease_count(port), 0);
+    }
+
+    #[test]
+    fn far_leases_are_not_reaped() {
+        let port = 65503;
+        set_lease(port, LeaseKind::Tab, "t-live", "running", 600);
+        reap_expired();
+        assert_eq!(lease_count(port), 1);
+        drop_lease(port, LeaseKind::Tab, "t-live");
     }
 }
