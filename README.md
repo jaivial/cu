@@ -258,8 +258,9 @@ the local login form; they are never passed to the model, logged, or returned.
 ```sh
 python3 bench/cu_bench.py --iters 20    # cu before/after, end to end
 python3 bench/compare.py --iters 10     # cu vs agent-browser vs Playwright MCP
-python3 bench/real_flows.py --flows 10  # 1/10/25 real flows against a real app
 ```
 
-All three harnesses are described in [docs/BENCHMARKS.md](docs/BENCHMARKS.md),
-together with the methods, the fair-play notes and every number above.
+Both harnesses are described in [docs/BENCHMARKS.md](docs/BENCHMARKS.md),
+together with the methods, the fair-play notes and every number above. The
+real-site section reports a run whose harness is not published (it drives a
+private app): the method and every number are written out in the section.

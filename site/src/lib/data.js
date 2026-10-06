@@ -68,3 +68,42 @@ export const sweepHeadline = [
   { k: '~18 MB', d: 'por pestaña abierta en Chrome' },
   { k: '0,35', d: 'de 12 cores de CPU de Chrome (máx.)' },
 ];
+
+// Real production site in a dev build (Vite dev server, one request per module,
+// ~6 sockets per origin), over the network. Signed-in session shared by the
+// flows of a level, one leased tab per flow in the one shared Chrome. p50/p95
+// over the flows of each level; shared 12-core box (load1 5-11). Same run for
+// every table below. "answer" is the assistant's streamed chat answer.
+export const realLevels = [
+  { c: 1, ok: 4, of: 5, p50: 22.1, p95: 25.1, ans: 6.9, frac: 31, cores: 0.15, rss: 5.7, cuCores: 0.01 },
+  { c: 10, ok: 18, of: 20, p50: 67.4, p95: 80.1, ans: 6.5, frac: 12, cores: 0.25, rss: 6.3, cuCores: 0.03 },
+  { c: 25, ok: 3, of: 25, p50: 48.2, p95: 74.0, ans: 5.2, frac: 11, cores: 0.28, rss: 6.5, cuCores: 0.03 },
+];
+
+// The 10-flow level, same run: the recommendation for this deployment.
+export const realHeadline = [
+  { k: '18 / 20', d: 'flujos en verde a 10 en paralelo' },
+  { k: '67,4 s', d: 'p50 por flujo, ~6,5 s de respuesta' },
+  { k: '0,25', d: 'de 12 cores de CPU de Chrome (media)' },
+  { k: '3 / 25', d: 'a 25 en paralelo: límite de la app, no de cu' },
+];
+
+// Waiting by text vs networkidle, one instrumented flow (CDP Network events).
+export const realWaits = [
+  { label: 'navigate devuelve', sub: 'asentamiento inteligente del DOM', t: '2,2 s', frac: 2.2 / 11.7 },
+  { label: 'networkidle tras esa navegación', sub: 'dos streams de eventos siempre abiertos', t: 'nunca', frac: null },
+  { label: 'respuesta visible por texto, tras enviar', sub: 'el marcador aparece dos veces', t: '11,7 s', frac: 1, best: true },
+  { label: 'networkidle tras el envío', sub: 'los streams de la app nunca cierran', t: 'nunca', frac: null },
+];
+
+// Blocking images/fonts/media over CDP (cu has no switch yet), level 10.
+export const realBlock = [
+  { label: 'baseline', t: [67.4, 80.1, 6.5], ok: '18 / 20' },
+  { label: 'imágenes/fuentes/media bloqueadas', t: [65.5, 76.2, 4.7], ok: '19 / 20' },
+];
+
+// The same 10 flows through the agent-browser CLI, one browser per session.
+export const realVsAb = [
+  { tool: 'cu', mode: 'un Chrome compartido', ok: '18 / 20', p50: 67.4, p95: 80.1, open: 0.1, ans: 6.5, procs: 27, rss: 6.3 },
+  { tool: 'agent-browser', mode: 'un navegador por sesión', ok: '18 / 20', p50: 58.6, p95: 69.7, open: 12.0, ans: 9.2, procs: 113, rss: 12.8 },
+];
