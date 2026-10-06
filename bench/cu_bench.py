@@ -29,7 +29,7 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-BROWSER = shutil.which("chromium") or shutil.which("chromium-browser") \
+BROWSER = os.environ.get("CU_BROWSER") or shutil.which("chromium") or shutil.which("chromium-browser") \
     or shutil.which("google-chrome-stable") or shutil.which("google-chrome")
 TOKEN = "bench-token"
 
