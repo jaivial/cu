@@ -9,4 +9,11 @@ cargo run -- start
 cargo run -- status
 ```
 
-This repository is local-only for now. Nothing is published.
+The landing page is at <https://jaivial.github.io/cu/>.
+
+## Security
+
+The daemon binds to loopback only. Its bearer token is generated per data
+directory and stored in `.cu/server.json`, which is gitignored and must never be
+committed or published. Credentials are typed into the page by the daemon from
+the local login form; they are never passed to the model, logged, or returned.
