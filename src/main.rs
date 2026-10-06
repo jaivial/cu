@@ -5,10 +5,12 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cu::server::{self, AppState};
 
 const DEFAULT_PORT: u16 = 8787;
+const DEFAULT_CDP_PORT: u16 = 9222;
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -49,6 +51,11 @@ fn print_help() {
     );
 }
 
+/// CDP port requested through the environment, if it parses.
+fn cdp_port_from_env() -> Option<u16> {
+    env::var("CU_CDP_PORT").ok().and_then(|p| p.parse().ok())
+}
+
 fn start(args: &[String]) -> Result<(), String> {
     let mut port = DEFAULT_PORT;
     let mut data = PathBuf::from(env::var_os("CU_DATA_DIR").unwrap_or_else(|| ".cu".into()));
@@ -80,12 +87,10 @@ fn start(args: &[String]) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| e.to_string())?;
-    let _browser = server::launch_browser(&data)?;
-    eprintln!("cu listening on http://127.0.0.1:{port}; profile remains open until server exits");
-    let cdp_port = env::var("CU_CDP_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(9222);
+    let cdp_port = cdp_port_from_env().unwrap_or(DEFAULT_CDP_PORT);
+    let _browser = server::launch_browser(&data, cdp_port)?;
+    server::wait_for_cdp(cdp_port, Duration::from_secs(15))?;
+    eprintln!("cu listening on http://127.0.0.1:{port}; browser DevTools on 127.0.0.1:{cdp_port}");
     let state = Arc::new(AppState {
         data_dir: data,
         token,

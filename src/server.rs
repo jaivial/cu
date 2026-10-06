@@ -30,11 +30,28 @@ pub fn serve(state: Arc<AppState>, listener: TcpListener) {
     }
 }
 
-pub fn launch_browser(data: &Path) -> Result<Child, String> {
+/// Block until Chromium answers its DevTools discovery endpoint.
+///
+/// `cu navigate` used to race the browser start-up and lose, returning
+/// "connection refused" for a browser that was in fact coming up.
+pub fn wait_for_cdp(cdp_port: u16, timeout: Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if http_get(&format!("127.0.0.1:{cdp_port}"), "/json/version").is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!(
+        "Chromium DevTools never answered on 127.0.0.1:{cdp_port}"
+    ))
+}
+
+pub fn launch_browser(data: &Path, cdp_port: u16) -> Result<Child, String> {
     let binary = env::var("CU_BROWSER").unwrap_or_else(|_| "chromium".into());
     Command::new(binary)
+        .arg(format!("--remote-debugging-port={cdp_port}"))
         .args([
-            "--remote-debugging-port=9222",
             "--remote-allow-origins=*",
             "--no-first-run",
             "--no-default-browser-check",
