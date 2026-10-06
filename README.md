@@ -1,8 +1,12 @@
-# cu - computer use for AI agents (Rust)
+# cu — computer use for AI agents
 
-Goals: persistent browser, screenshots, saved login sessions, secure login links (HTML/Svelte forms so passwords never touch the model), CLI for agents, client SDK.
+`cu` runs one persistent Chromium profile behind a loopback-only HTTP server. Agents get a small CLI and Rust SDK for browser work; users enter credentials on a local HTML form so passwords never pass through chat or model-visible arguments.
 
-## Milestone 1
-- cu start: launch a persistent Chromium (never closed) with a saved profile
-- cu shot: screenshot of the current page
-- cu session save/load
+See [docs/README.md](docs/README.md) for the API and [SKILL.md](SKILL.md) for agent usage.
+
+```sh
+cargo run -- start
+cargo run -- status
+```
+
+This repository is local-only for now. Nothing is published.
