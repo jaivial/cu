@@ -117,9 +117,110 @@ the harness timeout); every later level ran with 0 errors. Reported as measured.
 
 ### Against a real production site
 
-**Pending.** A measurement of `cu` against a real production web app
-(signed-in flows over the live site) is running separately; its numbers will
-be added here when the run finishes. Nothing is invented in the meantime.
+Everything above runs against local pages. This section runs the flows a QA
+agent actually runs against **a real production web app in a development build**
+(Vite dev server: one request per module, the browser allows ~6 sockets per
+origin), over the network, with a signed-in session shared by the flows of a
+level and one leased tab per flow in the one shared Chrome. Every number is
+p50/p95 over the flows of its level, measured; the box is a shared 12-core
+machine (load1 5-11 during the runs), so absolute times include that noise.
+
+The flow itself: open a tab on a deep route -> sign in if the app says there is
+no session -> navigate a section and a sub-route -> open the assistant's chat
+drawer, start a new conversation, send a marker and wait until that marker shows
+**twice** in the page text (the echo of the message plus the streamed answer) ->
+close the tab. No timing sleeps: every wait is on text, state or URL.
+
+#### 1, 10 and 25 flows in parallel (shared session)
+
+| flows | ok | total p50 | total p95 | answer p50 | share of flow | Chrome cores (avg) | Chrome RSS | `cu` cores |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 4 / 5 | 22.1 s | 25.1 s | 6.9 s | 31% | 0.15 | 5.7 GB | 0.01 |
+| **10** | **18 / 20** | **67.4 s** | 80.1 s | 6.5 s | 12% | 0.25 | 6.3 GB | 0.03 |
+| 25 | 3 / 25 | 48.2 s | 74.0 s | 5.2 s | 11% | 0.28 | 6.5 GB | 0.03 |
+
+- **Recommended: up to 10 flows per shared Chrome** against this deployment --
+  ~90% success, per-flow p50 ~67 s of which ~6.5 s is the assistant's answer, and
+  Chrome well under a third of a core. Expect p95 ~80 s and one retry when "the
+  app never rendered".
+- **At 25 flows only 3 of 25 finished, and that is the app's limit, not `cu`'s.**
+  The other 22 sat in the empty app shell for 60 s without rendering, reproduced
+  twice: a dev build cold-boots one request per module, so 25 cold boots queue
+  into minutes. The same 25 leased tabs against the local pages above were
+  100/100 green. To go wider: stagger the first navigation (~1-2 s apart), use a
+  production build of the app, or split across browsers/origins.
+- **Chrome is not the bottleneck.** 0.15-0.28 cores of the 12, and the ~6 GB RSS
+  is the *whole* shared browser (other agents' tabs included) -- per-tab cost
+  stays ~18 MB as in the sweep above. The daemon is 0.01-0.03 cores and ~2 MB.
+  The bottleneck is the app server and its per-origin socket budget.
+- **Sign-in is cheap when the bot-check is happy and brutal when it is not.**
+  Cold logins ran 0.75-1.5 s each; under throttling (this box's IP also scrapes
+  Google) the same login took 30-120 s, and parallel cold logins stepped on each
+  other (8 sessions dropped to the login screen mid-flow at the 25 level;
+  agent-browser completed 0/20 in 120 s that way). Stagger real logins; share
+  one session for concurrency runs.
+
+#### The answer is the one phase that does not queue
+
+The page in front of the model degrades with concurrency; the model backend does
+not: ~5-7 s p50 at 1, 10 and 25 flows alike (p95 ~20 s at 10). Its share of the
+flow moves the other way -- 31% with one flow, ~12% at 10-25 -- because
+page-side contention grows while the answer does not. Timeouts of 60-120 s
+cover the p95.
+
+#### Levers, measured at the 10-flow level
+
+Waiting by **text** instead of `networkidle` is not an optimisation, it is the
+only thing that works. The app holds two event streams open for its whole life
+(a live list and a conversations stream), so `networkidle` is never reached:
+
+| wait | measured |
+| --- | ---: |
+| `navigate` returns (smart DOM settle) | 2.2 s |
+| `networkidle` after that navigate | **never** |
+| answer visible by page text, after send | 11.7 s |
+| `networkidle` after the send | **never** |
+
+Blocking images/fonts/media over CDP (`cu` has no switch for it yet) moves
+almost nothing on this app -- the weight is JS modules and the socket queue, not
+media:
+
+| run | ok | total p50 | total p95 | answer p50 |
+| --- | ---: | ---: | ---: | ---: |
+| baseline | 18 / 20 | 67.4 s | 80.1 s | 6.5 s |
+| images/fonts/media blocked | 19 / 20 | 65.5 s | 76.2 s | 4.7 s |
+
+Incremental snapshots do not exist (`/v1/snapshot` is rebuilt whole every call)
+and would not pay on a page like this: a warm snapshot of the rendered view is
+2-4 ms and ~2.2 KB, byte-identical across calls because the refs are stable. A
+delta would save bytes, not time, at this page size.
+
+#### The same flows through agent-browser (10 flows)
+
+| run | ok | total p50 | total p95 | open p50 | answer p50 | browser procs | RSS max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `cu`, one shared Chrome | 18 / 20 | 67.4 s | 80.1 s | 0.1 s | 6.5 s | 27 | 6.3 GB |
+| agent-browser, one browser per session | 18 / 20 | 58.6 s | 69.7 s | 12.0 s | 9.2 s | 113 | 12.8 GB |
+
+Totals are comparable because at 10 flows each tool spends the time somewhere
+else: `cu` queues on the app's per-origin socket budget but its per-step calls
+stay fast (open 0.1 s), while ten agent-browser sessions cold-boot the app with
+no shared cache (open 12 s, 30 s of app boot each) but get ten independent
+socket budgets. Both wait by text; the answer is 6.5 s (`cu`, text poll) vs 9.2 s
+(agent-browser, coarser snapshot poll). Two flows of each run were lost to the
+same app-boot flake. The shape is architectural: one Chrome for every tab (27
+processes at 10 flows) against a full browser per session (113 processes, twice
+the RAM).
+
+#### What these runs say about `cu` itself
+
+- **A page command sent across a client-side navigation can hang for ever.** The
+  daemon waits with no deadline and leaks a thread and a connection each time;
+  the harness retried and finished. A deadline per CDP command belongs in `cu`.
+- **Refs die when the app re-renders between snapshot and click** ("could not
+  locate eN"): re-snapshot and retry; typing in the composer also kills the send
+  button's ref, so send with type + Enter.
+- **`cu act` exits 0 with an `{"ok":false}` body** -- callers must read the body.
 
 ## Agent surface
 
@@ -157,7 +258,8 @@ the local login form; they are never passed to the model, logged, or returned.
 ```sh
 python3 bench/cu_bench.py --iters 20    # cu before/after, end to end
 python3 bench/compare.py --iters 10     # cu vs agent-browser vs Playwright MCP
+python3 bench/real_flows.py --flows 10  # 1/10/25 real flows against a real app
 ```
 
-Both harnesses are described in [docs/BENCHMARKS.md](docs/BENCHMARKS.md),
+All three harnesses are described in [docs/BENCHMARKS.md](docs/BENCHMARKS.md),
 together with the methods, the fair-play notes and every number above.
