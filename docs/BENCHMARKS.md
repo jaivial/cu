@@ -259,3 +259,72 @@ cargo test                                      # correctness, not speed
 
 Nothing is published and nothing leaves the machine: the daemon is loopback-only
 and the benchmark talks to it with the token from the data directory it created.
+
+## 50 parallel tests, one Chrome, one tab each
+
+The resource model Jaime asked for: **one Chrome always open**, every test
+opens its own tab in that Chrome and closes it at the end (a lease closes it
+if the test dies). How much does that cost when 50 tests run at once, and
+where does it saturate on this server (12 cores, 64 GB, already carrying
+other jobs)?
+
+### Method
+
+`bench/parallel_tabs.py` starts one `cu` daemon (one Chromium, headless,
+`/snap/bin/chromium`) and serves a 300-card page with live JS from a local
+threaded HTTP server (no network variance). One **test** is the real agent
+flow over the loopback API: `tab open URL --lease 120` -> `navigate` (waits
+for settle) -> `snapshot` (read refs) -> `act` (type + click by ref) ->
+`text` (judge "ordered 7 items") -> `tab close`. Concurrency is swept with
+distinct tabs per test; `/proc` is sampled twice a second for CPU and RSS.
+Machine had background load ~2.5 of 12 cores throughout ("cargado").
+
+```sh
+python3 bench/parallel_tabs.py --levels 5,10,20,35,50 --waves 2
+```
+
+### Results (one run, 2026-10-06, machine load1 ~2.5-3)
+
+| concurrency | tests | errors | tests/s | flow p50 | flow p95 | Chrome CPU (cores, max) | Chrome RSS (max) | cu RSS (max) | machine busy (max) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 5   | 9*  | 0 | 0.15* | 0.15 s | 0.17 s | 0.05 | 0.8 GB  | 2.1 MB  | 32 % |
+| 10  | 20  | 0 | 12.4  | 0.29 s | 0.30 s | 0.12 | 1.0 GB  | 2.8 MB  | 38 % |
+| 20  | 40  | 0 | 18.9  | 0.52 s | 0.56 s | 0.18 | 1.3 GB  | 4.3 MB  | 55 % |
+| 35  | 70  | 0 | 22.7  | 0.96 s | 1.02 s | 0.33 | 1.5 GB  | 8.1 MB  | 63 % |
+| 50  | 100 | 0 | 24.5  | 1.40 s | 1.50 s | 0.35 | 1.7 GB  | 10.6 MB | 69 % |
+
+**Headline -- 50 tests in parallel, 50 distinct tabs, one Chrome:** 50/50
+passed in 2.1 s wall (per flow: p50 1.52 s, max 1.62 s), peak **1.84 GB
+Chrome RSS** (11 processes: browser + GPU + renderers, Chromium consolidates
+same-site tabs per renderer), **11 MB for the cu daemon**, Chrome CPU
+**0.31 cores** peak, machine busy peaked at 71 %.
+
+\* The 5-concurrency wave hit one cold-start outlier: a single `cu` call hung
+until the 60 s harness timeout (recorded as one missing flow; every later
+level ran 0 errors). Reported as measured.
+
+### What saturates first
+
+- **Not Chrome.** Even at 50 tabs Chromium uses < 0.4 of 12 cores and 1.8 GB
+  of 64 GB. Chrome is the resource being shared, not the bottleneck.
+- **Throughput flattens around 25-35 concurrent flows** (tests/s: 12 -> 19 ->
+  23 -> 24) while **per-flow latency grows ~linearly with concurrency**
+  (p50: 0.29 s -> 1.40 s from 10 to 50). The bottleneck is the serialized
+  part of the path -- six loopback round trips plus one `cu` process spawn
+  per call, on a machine already at ~25 % load -- queuing in the daemon and
+  the page-settle wait, not renderer CPU.
+- **RAM grows roughly 18 MB per open tab** for a JS page of this size
+  (0.8 GB at a few tabs -> 1.8 GB at 50). Trivial against 64 GB; a fleet of
+  heavy media pages would move this number, not the model.
+
+### Recommended concurrency on this server
+
+- **8 concurrent tests by default** (browser-side p95 stays ~0.3 s per call,
+  ~1 GB total, invisible to the other jobs on the box).
+- **12 as the interactive cap** for agent runs: past ~12-20 every browser
+  call starts queueing and an agent's step-by-step loop gets sluggish.
+- **Up to 50 in one batch is survivable** (measured: 100/100 green at 50
+  concurrency): fine for unattended CI-style sweeps where wall time matters
+  more than per-step latency; p95 ~1.5 s per flow then.
+- Leases (default 10 min) make the pile-up self-cleaning: a crashed run's
+  tabs are reaped, so concurrency limits do not have to be perfect.
