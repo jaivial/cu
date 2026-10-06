@@ -37,6 +37,31 @@ fn send_fragmented(
     Ok(response)
 }
 
+/// Like [`send_fragmented`], but closes the write side after sending so a
+/// server waiting for more body is released instead of blocked.
+fn send_fragmented_then_close(
+    addr: &str,
+    data: &[u8],
+    pieces: usize,
+    pause: Duration,
+) -> Result<String, String> {
+    let mut stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
+    let size = (data.len() / pieces).max(1);
+    for chunk in data.chunks(size) {
+        stream
+            .write_all(chunk)
+            .map_err(|e| format!("write failed: {e}"))?;
+        stream.flush().map_err(|e| e.to_string())?;
+        std::thread::sleep(pause);
+    }
+    stream.shutdown(std::net::Shutdown::Write).ok();
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| format!("read failed: {e}"))?;
+    Ok(response)
+}
+
 fn status_code(response: &str) -> String {
     response
         .lines()
@@ -288,4 +313,91 @@ fn the_login_page_is_served_without_a_token() {
     let response = server.fragmented("GET /login HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert_eq!(status_code(&response), "200");
     assert!(body_of(&response).contains("type=password"));
+}
+
+#[test]
+fn a_bare_lf_request_is_still_understood() {
+    let server = TestServer::start("bare-lf", false);
+    let request = format!(
+        "GET /v1/status HTTP/1.1\nHost: localhost\nAuthorization: Bearer {}\nContent-Length: 0\n\n",
+        server.token
+    );
+    let response = send_fragmented(
+        &server.addr,
+        request.as_bytes(),
+        3,
+        Duration::from_millis(5),
+    )
+    .expect("bare-LF request should get a response");
+    assert_eq!(status_code(&response), "200");
+}
+
+#[test]
+fn an_oversized_head_is_refused_not_buffered() {
+    let server = TestServer::start("oversize", false);
+    let request = format!(
+        "GET /v1/status HTTP/1.1\r\nX-Padding: {}\r\n\r\n",
+        "a".repeat(70 * 1024)
+    );
+    // The server stops reading past the limit and closes, so the client may
+    // see a 400 or a failed write. It must never buffer and answer anyway.
+    match send_fragmented(
+        &server.addr,
+        request.as_bytes(),
+        8,
+        Duration::from_millis(1),
+    ) {
+        Ok(response) => assert_eq!(status_code(&response), "400"),
+        Err(error) => assert!(
+            error.contains("write failed") || error.contains("read failed"),
+            "unexpected: {error}"
+        ),
+    }
+}
+
+#[test]
+fn an_immediate_hangup_gets_no_response() {
+    let server = TestServer::start("hangup", false);
+    let stream = TcpStream::connect(&server.addr).expect("connect");
+    drop(stream);
+    // The connection must survive for the next client.
+    let response = server.get("/v1/status");
+    assert_eq!(status_code(&response), "200");
+}
+
+#[test]
+fn a_client_that_stops_sending_is_released() {
+    let server = TestServer::start("short-body", true);
+    // Announce more body than is sent, then close the write side. The server
+    // must answer from what arrived instead of waiting for the rest.
+    let request = format!(
+        "POST /v1/navigate HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 400\r\n\r\n{{\"url\":\"https://example.test\"}}",
+        server.token
+    );
+    let response = send_fragmented_then_close(
+        &server.addr,
+        request.as_bytes(),
+        3,
+        Duration::from_millis(5),
+    )
+    .expect("server should answer rather than wait for the missing body");
+    assert_eq!(status_code(&response), "200");
+    // ...and the listener must still be healthy afterwards.
+    assert_eq!(status_code(&server.get("/v1/status")), "200");
+}
+
+#[test]
+fn a_session_can_be_saved_and_reported() {
+    let server = TestServer::start("session", false);
+    let response = server.post("/v1/session/trip_1", "{}");
+    assert_eq!(status_code(&response), "200");
+    assert_eq!(body_of(&response), "{\"saved\":true}");
+    assert!(server.data_dir.join("sessions/trip_1").is_dir());
+}
+
+#[test]
+fn an_invalid_session_name_is_rejected() {
+    let server = TestServer::start("bad-name", false);
+    let response = server.post("/v1/session/../secrets", "{}");
+    assert_eq!(status_code(&response), "400");
 }

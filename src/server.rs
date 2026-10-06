@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -49,8 +49,24 @@ pub fn launch_browser(data: &Path) -> Result<Child, String> {
         .map_err(|e| format!("could not start Chromium (set CU_BROWSER): {e}"))
 }
 
-/// Maximum accepted request head. Guards against unbounded buffering.
-const MAX_HEAD: usize = 64 * 1024;
+/// Maximum accepted request head and body. Guards against unbounded buffering.
+const MAX_REQUEST: usize = 64 * 1024;
+
+/// How long a client may take to finish sending one request. Without this a
+/// peer that announces more body than it sends would pin a thread forever.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Offset just past the blank line that ends the header block, if it has
+/// arrived yet. Accepts the `\r\n\r\n` the spec requires and tolerates a bare
+/// `\n\n` from a sloppy client.
+fn head_end(buf: &[u8]) -> Option<usize> {
+    let crlf = find(buf, b"\r\n\r\n").map(|p| p + 4);
+    let lf = find(buf, b"\n\n").map(|p| p + 2);
+    match (crlf, lf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
 
 /// Read one request from the connection.
 ///
@@ -62,44 +78,47 @@ const MAX_HEAD: usize = 64 * 1024;
 fn read_request(stream: &mut TcpStream) -> Result<String, String> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0; 2048];
-    loop {
-        if let Some(pos) = find(&buf, b"\r\n\r\n") {
-            let head_end = pos + 4;
-            let head = String::from_utf8_lossy(&buf[..head_end]);
-            let len = header_value(&head, "content-length")
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(0);
-            if len > MAX_HEAD {
-                return Err("request body is too large".into());
-            }
-            while buf.len() < head_end + len {
-                match stream.read(&mut chunk) {
-                    Ok(0) => break, // peer closed; serve whatever we have
-                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                    Err(e) => return Err(e.to_string()),
-                }
-            }
-            return String::from_utf8(buf).map_err(|_| "request is not valid UTF-8".into());
+    let head_end = loop {
+        if let Some(end) = head_end(&buf) {
+            break end;
         }
-        if buf.len() > MAX_HEAD {
+        if buf.len() > MAX_REQUEST {
             return Err("request head is too large".into());
         }
         match stream.read(&mut chunk) {
             Ok(0) => {
-                if buf.is_empty() {
-                    return Err("connection closed before a request was sent".into());
-                }
-                return Err("connection closed mid-request".into());
+                return Err(if buf.is_empty() {
+                    "connection closed before a request was sent".into()
+                } else {
+                    "connection closed mid-request".into()
+                });
             }
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(e) => return Err(e.to_string()),
         }
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]);
+    let len = header_value(&head, "content-length")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    if len > MAX_REQUEST {
+        return Err("request body is too large".into());
     }
+    while buf.len() < head_end + len {
+        match stream.read(&mut chunk) {
+            Ok(0) => break, // peer hung up; serve what did arrive
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    String::from_utf8(buf).map_err(|_| "request is not valid UTF-8".into())
 }
 
-/// Read a full request and answer it. Errors are reported as a 400 response
-/// instead of dropping the connection so clients get a diagnostic.
+/// Read a full request and answer it. A request that cannot be parsed is
+/// answered with a 400 instead of dropping the connection, so the client gets
+/// a diagnostic rather than a silent failure.
 pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
+    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let request = match read_request(&mut stream) {
         Ok(request) => request,
         Err(error) => {
@@ -121,7 +140,13 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
         .find_map(|l| l.strip_prefix("Authorization: Bearer "))
         .map(|v| v.trim() == state.token)
         .unwrap_or(false);
-    let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+    // Split on whichever blank line ended the headers.
+    let sep = if request.contains("\r\n\r\n") {
+        "\r\n\r\n"
+    } else {
+        "\n\n"
+    };
+    let body = request.split(sep).nth(1).unwrap_or("");
     let (status, content_type, response) = if path == "/login" && method == "GET" {
         ("200 OK", "text/html", login_page())
     } else if path == "/login" && method == "POST" {
