@@ -789,7 +789,16 @@ if (!window.__cu) {
       }
       const x = b.left + b.width / 2, y = b.top + b.height / 2;
       if (hit) {
-        const at = document.elementFromPoint(x, y);
+        // `document.elementFromPoint` stops at a shadow host: at the centre of
+        // a control inside a web component it reports the host, which reads as
+        // "covered". Descend into the roots it exposes and compare against the
+        // element that really is painted there.
+        let at = document.elementFromPoint(x, y);
+        while (at && at.shadowRoot) {
+          const inner = at.shadowRoot.elementFromPoint(x, y);
+          if (!inner || inner === at) break;
+          at = inner;
+        }
         if (at && at !== el && !el.contains(at) && !(at.control === el) && !at.contains(el)) {
           const what = at.tagName.toLowerCase() + (at.id ? '#' + at.id : '');
           return err(ref + ' is covered by ' + what);

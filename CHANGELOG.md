@@ -32,6 +32,12 @@
   `- frame: <url>`, and a ref resolves to its frame, so click, type and
   select reach into embedded documents with the iframe's offset applied.
   `[contenteditable]` regions snapshot as textboxes.
+- Open shadow roots are walked too, in the snapshot and in `/v1/text`. A web
+  component renders its controls inside its shadow root, where a document
+  query cannot see them, so a widget-heavy page used to snapshot as a page
+  with nothing on it. Refs work there as well: the hit test descends through
+  the host to the element really painted at that point. A closed shadow root
+  is unreadable from any script and stays unread.
 - `GET /v1/navigate` reports `settled:true|false`: false means the three
   second budget ran out on a page still loading.
 - `GET /v1/text` (`cu text`, `Client::text`): the page's visible text for the

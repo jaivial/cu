@@ -2860,10 +2860,17 @@ pub mod snapshot {
     /// Everything happens in the page, so only the small result crosses CDP --
     /// that is the whole point of a snapshot: one round trip, a few hundred
     /// bytes, instead of a full DOM dump.
+    ///
+    /// The walk descends into open shadow roots, because a web component
+    /// renders its controls there and they are otherwise invisible: a
+    /// widget-heavy page would snapshot as a page with nothing on it. A closed
+    /// root hides its contents from every script and stays unread, which is
+    /// what the page itself sees.
     pub const SNAPSHOT_JS: &str = r#"
 /* cuAgentSnapshot */
 (() => {
   const INTERACTIVE = 'a[href],button,input,select,textarea,[role=button],[role=link],[role=checkbox],[role=tab],[role=menuitem],[contenteditable]:not([contenteditable=false])';
+  const HEADINGS = 'h1,h2,h3,[role=heading]';
   const visible = (el) => {
     const r = el.getBoundingClientRect();
     if (r.width < 2 || r.height < 2) return false;
@@ -2886,28 +2893,42 @@ pub mod snapshot {
     if (img) return img.alt;
     return clean(el.textContent) || clean(el.getAttribute('placeholder')) || clean(el.value) || '';
   };
+  const roleOf = (el) => el.getAttribute('role')
+    || ({A:'link',BUTTON:'button',SELECT:'combobox',TEXTAREA:'textbox'})
+      [el.tagName]
+    || (el.tagName === 'INPUT'
+      ? ({text:'textbox',search:'searchbox',email:'textbox',password:'textbox',
+          number:'spinbutton',checkbox:'checkbox',radio:'radio',file:'button'})[el.type] || 'textbox'
+      : el.isContentEditable ? 'textbox'
+      : 'generic');
   const nodes = [];
-  for (const el of document.querySelectorAll(INTERACTIVE)) {
-    if (!visible(el)) continue;
-    if (el.closest('[aria-hidden=true]')) continue;
-    const role = el.getAttribute('role')
-      || ({A:'link',BUTTON:'button',SELECT:'combobox',TEXTAREA:'textbox'})
-        [el.tagName]
-      || (el.tagName === 'INPUT'
-        ? ({text:'textbox',search:'searchbox',email:'textbox',password:'textbox',
-            number:'spinbutton',checkbox:'checkbox',radio:'radio',file:'button'})[el.type] || 'textbox'
-        : el.isContentEditable ? 'textbox'
-        : 'generic');
-    nodes.push({ ref: window.__cu.ref(el), role, name: name(el).slice(0, 120) });
-    if (nodes.length >= 200) break;
-  }
   const headings = [];
-  for (const h of document.querySelectorAll('h1,h2,h3,[role=heading]')) {
-    if (!visible(h)) continue;
-    const t = clean(h.textContent).slice(0, 120);
-    if (t) headings.push(t);
-    if (headings.length >= 20) break;
-  }
+  // One root at a time: the document, then every open shadow root below it.
+  // `querySelectorAll` does not pierce a shadow root, so each one has to be
+  // asked for its own -- and a host is skipped in its parent's pass, because
+  // the root renders it, not the children it also happens to have.
+  const walk = (root) => {
+    for (const el of root.querySelectorAll(INTERACTIVE)) {
+      if (el.shadowRoot) continue;
+      if (!visible(el)) continue;
+      if (el.closest('[aria-hidden=true]')) continue;
+      nodes.push({ ref: window.__cu.ref(el), role: roleOf(el), name: name(el).slice(0, 120) });
+      if (nodes.length >= 200) return;
+    }
+    for (const el of root.querySelectorAll('*')) if (el.shadowRoot) walk(el.shadowRoot);
+  };
+  walk(document);
+  const outline = (root) => {
+    for (const h of root.querySelectorAll(HEADINGS)) {
+      if (!visible(h)) continue;
+      const t = clean(h.textContent).slice(0, 120);
+      if (t) headings.push(t);
+      if (headings.length >= 20) return true;
+    }
+    for (const el of root.querySelectorAll('*')) if (el.shadowRoot && outline(el.shadowRoot)) return true;
+    return false;
+  };
+  outline(document);
   return JSON.stringify({
     url: location.href,
     title: document.title,
@@ -3006,6 +3027,59 @@ mod frame_tests {
         let tree = r#"{"id":1,"result":{"frameTree":{"frame":{"id":"M","url":"about:blank"}}}}"#;
         assert_eq!(flatten_frame_tree(tree).len(), 1);
         assert_eq!(flatten_frame_tree("not json").len(), 0);
+    }
+
+    #[test]
+    fn the_walk_descends_into_shadow_roots() {
+        let js = snapshot::SNAPSHOT_JS;
+        // A document query cannot see a shadow root, so the walk has to ask
+        // each root for itself and recurse. Without this the controls of a
+        // web component are invisible and the page snapshots as empty.
+        assert!(
+            js.contains("el.shadowRoot"),
+            "the walk must recurse into shadow roots: {js}"
+        );
+        // ...and a host is skipped in its parent's pass, or the same element
+        // would be listed twice.
+        assert!(
+            js.contains("if (el.shadowRoot) continue;"),
+            "a shadow host must not also be listed from its parent: {js}"
+        );
+        // The heading outline gets the same treatment, or a component's
+        // headings never appear.
+        assert!(
+            js.matches("shadowRoot").count() >= 3,
+            "headings must be walked too: {js}"
+        );
+    }
+
+    #[test]
+    fn the_hit_test_sees_past_a_shadow_host() {
+        let js = crate::actions::REGISTRY_JS;
+        // `document.elementFromPoint` reports the host at the centre of a
+        // control inside it, which reads as "covered" and refuses the click.
+        assert!(
+            js.contains("at.shadowRoot.elementFromPoint"),
+            "the hit test must descend into the shadow root: {js}"
+        );
+    }
+
+    #[test]
+    fn the_text_read_reaches_open_shadow_roots_too() {
+        let js = READ_TEXT_JS;
+        assert!(
+            js.contains("el.shadowRoot"),
+            "text must include what a web component renders: {js}"
+        );
+        // Chromium gives a ShadowRoot no innerText, so the words come from
+        // the visible leaves inside it rather than from the root itself.
+        assert!(
+            !js.contains("r.innerText"),
+            "a ShadowRoot has no innerText in Chromium: {js}"
+        );
+        // And a subtree that is not rendered must not leak: innerText
+        // degrades to textContent there.
+        assert!(js.contains("display"), "visibility is not checked: {js}");
     }
 
     #[test]
