@@ -664,3 +664,31 @@ fn a_malformed_batch_is_a_bad_request() {
     assert_eq!(status_code(&response), "400", "got {}", body_of(&response));
     assert!(body_of(&response).contains("snapshot ref"));
 }
+
+#[test]
+fn a_named_context_gets_its_own_tab_in_the_same_browser() {
+    let server = TestServer::start("contexts", true);
+    let response = server.post(
+        "/v1/navigate?context=alice",
+        r#"{"url":"https://example.test"}"#,
+    );
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let listed = body_of(&server.get("/v1/contexts")).to_string();
+    assert_eq!(listed, r#"{"contexts":["alice"]}"#);
+    // The default tab is untouched and still reachable.
+    assert_eq!(status_code(&server.get("/v1/snapshot")), "200");
+    let request = format!(
+        "DELETE /v1/contexts/alice HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n",
+        server.token
+    );
+    let closed = server.fragmented(&request);
+    assert_eq!(body_of(&closed), r#"{"closed":true}"#);
+    assert_eq!(body_of(&server.get("/v1/contexts")), r#"{"contexts":[]}"#);
+}
+
+#[test]
+fn a_context_name_cannot_be_a_path() {
+    let server = TestServer::start("context-name", true);
+    let response = server.get("/v1/snapshot?context=..%2Fx");
+    assert_eq!(status_code(&response), "400", "got {}", body_of(&response));
+}

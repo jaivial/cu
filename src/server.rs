@@ -552,7 +552,8 @@ pub fn route(
             | ("POST", "/v1/act")
             | ("POST", "/v1/click")
             | ("POST", "/v1/type")
-    );
+            | ("GET", "/v1/contexts")
+    ) || (method == "DELETE" && path.starts_with("/v1/contexts/"));
     if needs_browser {
         if let Err(error) = wait_until_ready(state) {
             return (
@@ -562,7 +563,52 @@ pub fn route(
             );
         }
     }
+    // `?context=NAME` runs a page action in an isolated browser context of
+    // the same browser instead of the persistent profile's tab.
+    let tab = if needs_browser && !path.starts_with("/v1/contexts") {
+        match form_value(query(full_path), "context").as_str() {
+            "" => Tab::default_for(state.cdp_port),
+            name => match context_tab(state.cdp_port, name) {
+                Ok(tab) => tab,
+                Err(e) => {
+                    return (
+                        "400 Bad Request",
+                        "application/json",
+                        format!("{{\"error\":{}}}", json_string(&e)),
+                    );
+                }
+            },
+        }
+    } else {
+        Tab::default_for(state.cdp_port)
+    };
     match (method, path) {
+        ("GET", "/v1/contexts") => (
+            "200 OK",
+            "application/json",
+            format!(
+                "{{\"contexts\":[{}]}}",
+                context_names(state.cdp_port)
+                    .iter()
+                    .map(|n| json_string(n))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        ),
+        ("DELETE", p) if p.starts_with("/v1/contexts/") => {
+            match close_context(state.cdp_port, &p["/v1/contexts/".len()..]) {
+                Ok(closed) => (
+                    "200 OK",
+                    "application/json",
+                    format!("{{\"closed\":{closed}}}"),
+                ),
+                Err(e) => (
+                    "502 Bad Gateway",
+                    "application/json",
+                    format!("{{\"error\":{}}}", json_string(&e)),
+                ),
+            }
+        }
         ("GET", "/v1/status") => (
             "200 OK",
             "application/json",
@@ -577,15 +623,14 @@ pub fn route(
                     "{\"error\":\"url is required\"}".into(),
                 );
             }
-            match cdp_command(
-                state.cdp_port,
+            match tab.command(
                 "Page.navigate",
                 &format!("{{\"url\":\"{}\"}}", json_escape(&url)),
             ) {
                 Ok(result) => {
                     // Do not hand back a half-loaded page, but never hang on a
                     // stream that stays open for ever.
-                    let waited = wait_for_page(state.cdp_port, SETTLE_MAX);
+                    let waited = wait_for_page_on(&tab, SETTLE_MAX);
                     (
                         "200 OK",
                         "application/json",
@@ -603,13 +648,13 @@ pub fn route(
                 ),
             }
         }
-        ("GET", "/v1/screenshot") => screenshot(state, query(full_path)),
+        ("GET", "/v1/screenshot") => screenshot(&tab, query(full_path)),
         // Act on snapshot refs. `/v1/act` takes a batch; `/v1/click` and
         // `/v1/type` are the same thing for a single action.
-        ("POST", "/v1/act") => act(state, crate::actions::parse_batch(body)),
-        ("POST", "/v1/click") => act(state, single("click", body)),
-        ("POST", "/v1/type") => act(state, single("type", body)),
-        ("GET", "/v1/snapshot") => match snapshot_pages(state, true) {
+        ("POST", "/v1/act") => act(&tab, crate::actions::parse_batch(body)),
+        ("POST", "/v1/click") => act(&tab, single("click", body)),
+        ("POST", "/v1/type") => act(&tab, single("type", body)),
+        ("GET", "/v1/snapshot") => match snapshot_tab(&tab, true) {
             Ok(text) => ("200 OK", "application/json", text),
             Err(error) => (
                 "502 Bad Gateway",
@@ -690,7 +735,7 @@ fn single(kind: &str, body: &str) -> Result<crate::actions::Batch, String> {
 }
 
 fn act(
-    state: &AppState,
+    tab: &Tab,
     batch: Result<crate::actions::Batch, String>,
 ) -> (&'static str, &'static str, String) {
     let error = |status, e: &str| {
@@ -702,7 +747,7 @@ fn act(
     };
     match batch {
         Err(e) => error("400 Bad Request", &e),
-        Ok(batch) => match crate::actions::run_batch(state.cdp_port, &batch) {
+        Ok(batch) => match crate::actions::run_batch(tab, &batch) {
             // A failed action is the agent's to handle, so it is a 200 with
             // `ok:false` and the index that failed, not a transport error.
             Ok(body) => ("200 OK", "application/json", body),
@@ -721,7 +766,7 @@ pub fn login_page() -> String {
 /// model reads a lossy frame just as well and the capture, encode and transfer
 /// all shrink, which is most of the latency of `Page.captureScreenshot`. PNG
 /// is still available with `format=png`.
-fn screenshot(state: &AppState, query: &str) -> (&'static str, &'static str, String) {
+fn screenshot(tab: &Tab, query: &str) -> (&'static str, &'static str, String) {
     let png = form_value(query, "format") == "png";
     let quality = form_value(query, "quality")
         .parse::<u32>()
@@ -736,8 +781,7 @@ fn screenshot(state: &AppState, query: &str) -> (&'static str, &'static str, Str
             format!(",\"quality\":{quality},\"optimizeForSpeed\":true"),
         )
     };
-    match cdp_command(
-        state.cdp_port,
+    match tab.command(
         "Page.captureScreenshot",
         &format!("{{\"format\":\"{format}\"{extra}}}"),
     ) {
@@ -772,8 +816,11 @@ fn query(path: &str) -> &str {
 /// The walk runs in the page, so this is one CDP round trip returning a few
 /// hundred bytes instead of a DOM dump the daemon then has to shrink.
 pub fn snapshot_pages(state: &AppState, compact: bool) -> Result<String, String> {
-    let result = cdp_command(
-        state.cdp_port,
+    snapshot_tab(&Tab::default_for(state.cdp_port), compact)
+}
+
+fn snapshot_tab(tab: &Tab, compact: bool) -> Result<String, String> {
+    let result = tab.command(
         "Runtime.evaluate",
         &format!(
             "{{\"expression\":{},\"returnByValue\":true}}",
@@ -911,6 +958,10 @@ fn settle_script(budget: Duration) -> String {
 /// fail; that is retried until the budget is spent, so a cross-document
 /// redirect still ends on a settled page rather than an error.
 pub fn wait_for_page(cdp_port: u16, budget: Duration) -> Duration {
+    wait_for_page_on(&Tab::default_for(cdp_port), budget)
+}
+
+fn wait_for_page_on(tab: &Tab, budget: Duration) -> Duration {
     let started = std::time::Instant::now();
     let budget = budget.max(SETTLE_TIMEOUT);
     while started.elapsed() < budget {
@@ -919,7 +970,7 @@ pub fn wait_for_page(cdp_port: u16, budget: Duration) -> Duration {
             "{{\"expression\":{},\"awaitPromise\":true,\"returnByValue\":true}}",
             json_string(&settle_script(left))
         );
-        match cdp_command(cdp_port, "Runtime.evaluate", &params) {
+        match tab.command("Runtime.evaluate", &params) {
             Ok(reply) if !reply.contains("\"exceptionDetails\"") => break,
             _ => thread::sleep(Duration::from_millis(2)),
         }
@@ -1077,6 +1128,142 @@ pub fn page_targets(discovery: &str) -> Vec<String> {
         .collect()
 }
 
+/// The page a command is for: the default tab, or the tab of a named context.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Tab {
+    pub cdp_port: u16,
+    /// DevTools target id; `None` is the persistent profile's own tab.
+    pub target: Option<String>,
+}
+
+impl Tab {
+    pub fn default_for(cdp_port: u16) -> Self {
+        Self {
+            cdp_port,
+            target: None,
+        }
+    }
+
+    /// Run one command on this tab over a pooled connection.
+    pub fn command(&self, method: &str, params: &str) -> Result<String, String> {
+        tab_command(self, method, params)
+    }
+}
+
+/// A browser context: an isolated cookie jar and cache inside the one browser.
+struct Context {
+    browser_context: String,
+    target: String,
+}
+
+/// Named contexts per browser.
+///
+/// A second agent (or a second account) used to mean a second `cu` and a
+/// second Chromium: ~180 MB and half a second to a second of start-up. A
+/// context is ~20 MB and ~35 ms, and shares the browser's processes.
+fn contexts() -> &'static Mutex<HashMap<(u16, String), Context>> {
+    static CONTEXTS: OnceLock<Mutex<HashMap<(u16, String), Context>>> = OnceLock::new();
+    CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The tab of context `name`, created on first use.
+pub fn context_tab(cdp_port: u16, name: &str) -> Result<Tab, String> {
+    if !valid_name(name) {
+        return Err("invalid context name".into());
+    }
+    let mut all = contexts().lock().unwrap_or_else(|e| e.into_inner());
+    let key = (cdp_port, name.to_string());
+    if let Some(context) = all.get(&key) {
+        return Ok(Tab {
+            cdp_port,
+            target: Some(context.target.clone()),
+        });
+    }
+    let created = cdp_browser_command(
+        cdp_port,
+        "Target.createBrowserContext",
+        "{\"disposeOnDetach\":false}",
+    )?;
+    let browser_context = json_string_value(&created, "browserContextId")
+        .ok_or("Chromium did not create a browser context")?;
+    let target = cdp_browser_command(
+        cdp_port,
+        "Target.createTarget",
+        &format!(
+            "{{\"url\":\"about:blank\",\"browserContextId\":{}}}",
+            json_string(&browser_context)
+        ),
+    )
+    .ok()
+    .and_then(|reply| json_string_value(&reply, "targetId"));
+    let Some(target) = target else {
+        let _ = dispose_context(cdp_port, &browser_context);
+        return Err("Chromium did not open a tab in the new context".into());
+    };
+    all.insert(
+        key,
+        Context {
+            browser_context,
+            target: target.clone(),
+        },
+    );
+    Ok(Tab {
+        cdp_port,
+        target: Some(target),
+    })
+}
+
+/// Close context `name`: its tab, cookies and cache go with it.
+pub fn close_context(cdp_port: u16, name: &str) -> Result<bool, String> {
+    let removed = contexts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(cdp_port, name.to_string()));
+    let Some(context) = removed else {
+        return Ok(false);
+    };
+    forget_tab(&Tab {
+        cdp_port,
+        target: Some(context.target),
+    });
+    dispose_context(cdp_port, &context.browser_context)?;
+    Ok(true)
+}
+
+/// Names of the open contexts.
+pub fn context_names(cdp_port: u16) -> Vec<String> {
+    let mut names: Vec<String> = contexts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .filter(|(port, _)| *port == cdp_port)
+        .map(|(_, name)| name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+fn dispose_context(cdp_port: u16, browser_context: &str) -> Result<(), String> {
+    cdp_browser_command(
+        cdp_port,
+        "Target.disposeBrowserContext",
+        &format!("{{\"browserContextId\":{}}}", json_string(browser_context)),
+    )
+    .map(|_| ())
+}
+
+/// Target ids that belong to a named context, so the default tab is never
+/// mistaken for one of them.
+fn context_targets(cdp_port: u16) -> Vec<String> {
+    contexts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|((port, _), _)| *port == cdp_port)
+        .map(|(_, c)| c.target.clone())
+        .collect()
+}
+
 /// A DevTools websocket kept open between commands.
 ///
 /// Opening one cost a `/json` discovery request, a TCP connect and a websocket
@@ -1089,13 +1276,25 @@ pub struct CdpConnection {
 }
 
 impl CdpConnection {
-    /// Discover the page target and complete the websocket handshake.
-    fn open(cdp_port: u16) -> Result<Self, String> {
-        let target = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")?;
-        let ws = page_targets(&target)
-            .into_iter()
-            .next()
-            .ok_or("Chromium did not expose a page target")?;
+    /// Discover the tab's target and complete the websocket handshake.
+    fn open(tab: &Tab) -> Result<Self, String> {
+        let discovery = http_get(&format!("127.0.0.1:{}", tab.cdp_port), "/json")?;
+        let ws = match &tab.target {
+            Some(id) => json_objects(&discovery)
+                .into_iter()
+                .find(|o| json_string_value(o, "id").as_deref() == Some(id))
+                .and_then(|o| json_string_value(&o, "webSocketDebuggerUrl"))
+                .ok_or("the context's tab is gone; close the context and open it again")?,
+            None => {
+                let taken = context_targets(tab.cdp_port);
+                json_objects(&discovery)
+                    .into_iter()
+                    .filter(|o| json_string_value(o, "type").as_deref() == Some("page"))
+                    .filter(|o| json_string_value(o, "id").is_none_or(|id| !taken.contains(&id)))
+                    .find_map(|o| json_string_value(&o, "webSocketDebuggerUrl"))
+                    .ok_or("Chromium did not expose a page target")?
+            }
+        };
         Self::connect(&ws)
     }
 
@@ -1221,19 +1420,19 @@ fn message_id(message: &str) -> Option<u64> {
 /// A batch of actions runs on one connection so its commands are ordered and
 /// pay no hand-off between them. Give it back with [`checkin`] only if every
 /// command on it completed.
-pub fn checkout(cdp_port: u16) -> Result<CdpConnection, String> {
-    let pool = cdp_pool(cdp_port);
+pub fn checkout(tab: &Tab) -> Result<CdpConnection, String> {
+    let pool = cdp_pool(tab);
     let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
-    guard.take(cdp_port)
+    guard.take(tab)
 }
 
 /// A fresh connection, for when a pooled one turned out to be dead.
-pub fn open_connection(cdp_port: u16) -> Result<CdpConnection, String> {
-    CdpConnection::open(cdp_port)
+pub fn open_connection(tab: &Tab) -> Result<CdpConnection, String> {
+    CdpConnection::open(tab)
 }
 
-pub fn checkin(cdp_port: u16, connection: CdpConnection) {
-    let pool = cdp_pool(cdp_port);
+pub fn checkin(tab: &Tab, connection: CdpConnection) {
+    let pool = cdp_pool(tab);
     let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
     guard.put(connection);
 }
@@ -1285,11 +1484,11 @@ struct CdpPool {
 
 impl CdpPool {
     /// Take a warm connection, or open one if the pool is empty.
-    fn take(&mut self, cdp_port: u16) -> Result<CdpConnection, String> {
+    fn take(&mut self, tab: &Tab) -> Result<CdpConnection, String> {
         self.idle
             .pop()
             .map(Ok)
-            .unwrap_or_else(|| CdpConnection::open(cdp_port))
+            .unwrap_or_else(|| CdpConnection::open(tab))
     }
 
     /// Give a still-usable connection back, up to the idle limit.
@@ -1300,13 +1499,28 @@ impl CdpPool {
     }
 }
 
-fn cdp_pool(cdp_port: u16) -> &'static Mutex<CdpPool> {
-    static POOLS: OnceLock<Mutex<HashMap<u16, &'static Mutex<CdpPool>>>> = OnceLock::new();
-    let pools = POOLS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = pools.lock().unwrap_or_else(|e| e.into_inner());
+fn pools() -> &'static Mutex<HashMap<Tab, &'static Mutex<CdpPool>>> {
+    static POOLS: OnceLock<Mutex<HashMap<Tab, &'static Mutex<CdpPool>>>> = OnceLock::new();
+    POOLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cdp_pool(tab: &Tab) -> &'static Mutex<CdpPool> {
+    let mut guard = pools().lock().unwrap_or_else(|e| e.into_inner());
     guard
-        .entry(cdp_port)
+        .entry(tab.clone())
         .or_insert_with(|| Box::leak(Box::new(Mutex::new(CdpPool { idle: Vec::new() }))))
+}
+
+/// Drop the warm connections of a tab that has been closed.
+fn forget_tab(tab: &Tab) {
+    let pool = pools()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(tab)
+        .copied();
+    if let Some(pool) = pool {
+        pool.lock().unwrap_or_else(|e| e.into_inner()).idle.clear();
+    }
 }
 
 /// Run one DevTools command on a pooled connection.
@@ -1316,11 +1530,15 @@ fn cdp_pool(cdp_port: u16) -> &'static Mutex<CdpPool> {
 /// handshake before the actual command. A connection the browser has dropped is
 /// reopened and retried once, so a target swap is not an error.
 pub fn cdp_command(cdp_port: u16, method: &str, params: &str) -> Result<String, String> {
-    let pool = cdp_pool(cdp_port);
+    tab_command(&Tab::default_for(cdp_port), method, params)
+}
+
+fn tab_command(tab: &Tab, method: &str, params: &str) -> Result<String, String> {
+    let pool = cdp_pool(tab);
     for attempt in 0..2 {
         let mut connection = {
             let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
-            guard.take(cdp_port)
+            guard.take(tab)
         }?;
         match connection.call(method, params) {
             Ok(reply) => {

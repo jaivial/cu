@@ -24,6 +24,8 @@ PORT = next(
 CLOSED_MARKER = os.environ.get("FAKE_CHROMIUM_CLOSED")
 # Input commands received, in order; served at /input-log for the tests.
 INPUT_LOG = []
+# Tabs opened in browser contexts: target id -> context id.
+CONTEXT_TABS = {}
 # Big enough to force the 64-bit websocket length form that a real screenshot
 # uses, so the frame reader cannot get away with the 16-bit one alone.
 PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"fake-png-bytes" * 8000).decode()
@@ -82,6 +84,15 @@ class Handler(BaseHTTPRequestHandler):
                     "url": "chrome-extension://abc/background.html",
                     "webSocketDebuggerUrl": "ws://127.0.0.1:%d/devtools/page/EXT1" % PORT,
                 },
+                *[
+                    {
+                        "id": target,
+                        "type": "page",
+                        "url": "about:blank",
+                        "webSocketDebuggerUrl": "ws://127.0.0.1:%d/devtools/page/%s" % (PORT, target),
+                    }
+                    for target in CONTEXT_TABS
+                ],
                 {
                     "description": "",
                     "devtoolsFrontendUrl": "devtools://devtools/inspector.html",
@@ -181,6 +192,17 @@ class Handler(BaseHTTPRequestHandler):
     def result_for(method, params=None):
         if method == "Page.navigate":
             return {"id": 1, "result": {"frameId": "f", "url": "https://example.test"}}
+        if method == "Target.createBrowserContext":
+            return {"result": {"browserContextId": "CTX%d" % (len(CONTEXT_TABS) + 1)}}
+        if method == "Target.createTarget":
+            target = "TAB%d" % (len(CONTEXT_TABS) + 1)
+            CONTEXT_TABS[target] = (params or {}).get("browserContextId")
+            return {"result": {"targetId": target}}
+        if method == "Target.disposeBrowserContext":
+            ctx = (params or {}).get("browserContextId")
+            for target in [t for t, c in CONTEXT_TABS.items() if c == ctx]:
+                del CONTEXT_TABS[target]
+            return {"result": {}}
         if method == "Page.getFrameTree":
             return {"result": {"frameTree": {"frame": {"id": "MAINFRAME", "url": "about:blank"}}}}
         if method in ("Input.dispatchMouseEvent", "Input.insertText", "Input.dispatchKeyEvent"):

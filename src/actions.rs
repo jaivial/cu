@@ -18,7 +18,7 @@
 use std::time::{Duration, Instant};
 
 use crate::server::{
-    self, CdpConnection, checkin, checkout, evaluated_string, json_array, json_objects,
+    self, CdpConnection, Tab, checkin, checkout, evaluated_string, json_array, json_objects,
     json_string, json_string_value, json_value, open_connection,
 };
 
@@ -170,9 +170,9 @@ pub struct Outcome {
 /// Run a batch. Stops at the first action that fails and says which.
 ///
 /// Returns the JSON response body.
-pub fn run_batch(cdp_port: u16, batch: &Batch) -> Result<String, String> {
+pub fn run_batch(tab: &Tab, batch: &Batch) -> Result<String, String> {
     let started = Instant::now();
-    let mut page = Page::open(cdp_port)?;
+    let mut page = Page::open(tab)?;
     let mut results = Vec::new();
     let mut failure = None;
     for (i, action) in batch.actions.iter().enumerate() {
@@ -215,7 +215,7 @@ pub fn run_batch(cdp_port: u16, batch: &Batch) -> Result<String, String> {
 
 /// The page a batch acts on: one DevTools connection with `Page` events on.
 struct Page {
-    cdp_port: u16,
+    tab: Tab,
     connection: Option<CdpConnection>,
     /// Main frame id: navigation events for sub-frames are not ours.
     frame: String,
@@ -225,12 +225,12 @@ struct Page {
 }
 
 impl Page {
-    fn open(cdp_port: u16) -> Result<Self, String> {
+    fn open(tab: &Tab) -> Result<Self, String> {
         // A pooled connection may belong to a browser that has gone away; the
         // first command finds out, and one fresh connection is tried.
-        let mut connection = checkout(cdp_port)?;
+        let mut connection = checkout(tab)?;
         if connection.call("Page.enable", "{}").is_err() {
-            connection = open_connection(cdp_port)?;
+            connection = open_connection(tab)?;
             connection.call("Page.enable", "{}")?;
         }
         let tree = connection.call("Page.getFrameTree", "{}")?;
@@ -241,7 +241,7 @@ impl Page {
             .and_then(|at| json_string_value(&tree[at..], "id"))
             .ok_or("page has no main frame")?;
         Ok(Self {
-            cdp_port,
+            tab: tab.clone(),
             connection: Some(connection),
             frame,
             poisoned: false,
@@ -255,10 +255,11 @@ impl Page {
     /// Stop `Page` events and give the connection back, so it does not fill
     /// up with events nobody reads.
     fn close(mut self) {
-        if let Some(mut connection) = self.connection.take() {
-            if !self.poisoned && connection.call("Page.disable", "{}").is_ok() {
-                checkin(self.cdp_port, connection);
-            }
+        if let Some(mut connection) = self.connection.take()
+            && !self.poisoned
+            && connection.call("Page.disable", "{}").is_ok()
+        {
+            checkin(&self.tab, connection);
         }
     }
 
@@ -447,7 +448,7 @@ impl Page {
             if !clean {
                 self.poisoned = true;
                 // The stream may hold half a frame; carry on on a fresh one.
-                let mut fresh = open_connection(self.cdp_port)?;
+                let mut fresh = open_connection(&self.tab)?;
                 fresh.call("Page.enable", "{}")?;
                 self.connection = Some(fresh);
             }
@@ -500,16 +501,8 @@ impl NavWatch {
                 self.started = true;
                 self.done = true;
             }
-            "Page.domContentEventFired" => {
-                if self.started {
-                    self.done = true
-                }
-            }
-            "Page.frameStoppedLoading" if main => {
-                if self.started {
-                    self.done = true
-                }
-            }
+            "Page.domContentEventFired" if self.started => self.done = true,
+            "Page.frameStoppedLoading" if main && self.started => self.done = true,
             _ => {}
         }
     }
