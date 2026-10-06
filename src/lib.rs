@@ -1,4 +1,5 @@
 //! Minimal client SDK for a running `cu` session server.
+pub mod server;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 

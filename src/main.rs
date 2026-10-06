@@ -6,9 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub mod server;
-
-use server::AppState;
+use cu::server::{self, AppState};
 
 const DEFAULT_PORT: u16 = 8787;
 
@@ -138,7 +136,7 @@ fn session(args: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::server::*;
+    use cu::server::*;
 
     #[test]
     fn json_values_are_extracted() {
