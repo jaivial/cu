@@ -638,6 +638,7 @@ pub fn route(
             | ("POST", "/v1/type")
             | ("GET", "/v1/contexts")
             | ("GET", "/v1/tabs")
+            | ("GET", "/v1/text")
     ) || (method == "DELETE"
         && (path.starts_with("/v1/contexts/") || path.starts_with("/v1/tabs/")));
     if needs_browser {
@@ -742,6 +743,46 @@ pub fn route(
             "application/json",
             "{\"running\":true,\"browser\":\"chromium\"}".into(),
         ),
+        // Visible text of the page, for the reading a snapshot deliberately
+        // does not do: prose, API responses, error messages. One evaluate,
+        // capped in the page so a huge document cannot flood the socket.
+        ("GET", "/v1/text") => match tab.command(
+            "Runtime.evaluate",
+            &format!(
+                "{{\"expression\":{},\"returnByValue\":true}}",
+                json_string(READ_TEXT_JS)
+            ),
+        ) {
+            Ok(reply) => match evaluated_string(&reply) {
+                Some(value) => {
+                    let text = json_string_value(&value, "text").unwrap_or_default();
+                    let truncated = json_string_value(&value, "full")
+                        .and_then(|f| f.parse::<usize>().ok())
+                        .zip(json_string_value(&value, "n").and_then(|n| n.parse::<usize>().ok()))
+                        .is_some_and(|(full, n)| full > n);
+                    let text: String = text.chars().take(TEXT_LIMIT).collect();
+                    (
+                        "200 OK",
+                        "application/json",
+                        format!(
+                            "{{\"text\":{},\"truncated\":{}}}",
+                            json_string(&text),
+                            truncated
+                        ),
+                    )
+                }
+                None => (
+                    "502 Bad Gateway",
+                    "application/json",
+                    "{\"error\":\"page did not return its text\"}".into(),
+                ),
+            },
+            Err(e) => (
+                "502 Bad Gateway",
+                "application/json",
+                format!("{{\"error\":{}}}", json_string(&e)),
+            ),
+        },
         // Pure file listing: works whether or not the browser is up, because
         // the files outlive the session that downloaded them.
         ("GET", "/v1/downloads") => (
@@ -983,6 +1024,16 @@ pub fn close_tab(cdp_port: u16, id: &str) -> Result<(), String> {
     unpin_target(cdp_port, id);
     Ok(())
 }
+
+/// Characters `GET /v1/text` returns before truncating: enough for an API
+/// response or several screens of prose, small enough that one reply stays
+/// a tool-sized payload.
+const TEXT_LIMIT: usize = 16_000;
+
+/// Visible text of the main document. `innerText` is what the user would
+/// read (layout-aware, no scripts or styles), sliced in the page so the
+/// transfer is bounded however big the document is.
+const READ_TEXT_JS: &str = "JSON.stringify((function(){var t=document.body?document.body.innerText:'';var s=t.slice(0,16001);return {n:s.length,full:t.length,text:s}})())";
 
 /// Finished downloads in `dir`, newest first, as the `/v1/downloads` body.
 ///

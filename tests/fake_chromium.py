@@ -275,6 +275,20 @@ class Handler(BaseHTTPRequestHandler):
             if "elementFromPoint" in expr:
                 # The top document sees the iframe at the click point.
                 return {"id": 1, "result": {"result": {"type": "string", "value": "IFRAME"}}}
+            if "innerText" in expr:
+                words = "the quick brown fox jumps over the lazy dog"
+                return {
+                    "id": 1,
+                    "result": {
+                        "result": {
+                            "type": "string",
+                            "value": json.dumps(
+                                {"n": len(words), "full": len(words), "text": words},
+                                separators=(",", ":"),
+                            ),
+                        }
+                    },
+                }
             if "document.readyState" in expr:
                 # The smart wait asks whether the page is usable; answer that it
                 # is, so navigate is not held for the whole settle budget.

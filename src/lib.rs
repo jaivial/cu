@@ -47,6 +47,11 @@ impl Client {
     pub fn downloads(&self) -> Result<String, String> {
         self.request("GET", "/v1/downloads", "")
     }
+    /// Visible text of the page: what to read when the answer is prose,
+    /// an API response or a message rather than something to act on.
+    pub fn text(&self) -> Result<String, String> {
+        self.request("GET", "/v1/text", "")
+    }
     /// Click the element a snapshot named `reference` (`e3`).
     pub fn click(&self, reference: &str) -> Result<String, String> {
         self.request(

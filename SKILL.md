@@ -12,7 +12,9 @@ Use `cu` when an agent needs a persistent local browser session.
    `ref`-addressable elements instead of an image, so the model gets what it
    needs and pays almost nothing for it. Use `cu shot` only when pixels matter.
    Lines under `- frame: <url>` are inside an iframe; their refs work like any
-   other -- click and type reach into the frame.
+   other -- click and type reach into the frame. When the answer is words
+   rather than something to act on (prose, an API response, a message), read
+   `cu text` -- the snapshot only lists what is clickable.
 5. Act on what the snapshot shows by ref: `cu click e3`, `cu type e2 "text"
    [--submit]`. For several steps, send them at once and get the resulting
    page back in the same call:

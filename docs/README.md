@@ -34,6 +34,13 @@ An editable region (`contenteditable`, as in a rich-text editor) appears
 as a `textbox`. A frame that cannot be read says so on its line rather
 than failing the snapshot.
 
+A snapshot is deliberately not a document dump: it shows what an agent
+can act on and where it is. When the answer itself is words -- prose, an
+API response, a message -- `GET /v1/text` (`cu text`, `Client::text`)
+returns the page's visible text instead, capped at 16 000 characters
+with `"truncated":true` when the page was longer (the main document;
+frames are not included yet).
+
 Screenshots are JPEG by default because a model reads a lossy frame just as
 well and the capture, encode and transfer all shrink. `GET
 /v1/screenshot?format=png` gives a lossless PNG back; `cu shot FILE` writes

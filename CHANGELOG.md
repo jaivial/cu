@@ -34,6 +34,9 @@
   `[contenteditable]` regions snapshot as textboxes.
 - `GET /v1/navigate` reports `settled:true|false`: false means the three
   second budget ran out on a page still loading.
+- `GET /v1/text` (`cu text`, `Client::text`): the page's visible text for the
+  reading a snapshot deliberately does not do -- prose, API responses,
+  messages -- capped at 16 000 characters with a `truncated` flag.
 - SDK: `tabs`, `close_tab`, `downloads`, `load_session`.
 
 - Speed for agents, measured in `docs/BENCHMARKS.md`. Cold start went from
