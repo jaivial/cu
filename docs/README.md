@@ -16,6 +16,29 @@ The HTTP API is loopback-only and bearer-token protected. `GET /login` and `POST
 
 `session save` copies the live profile to `.cu/sessions/NAME` and `session load NAME` copies it back, so a logged-in session survives a restart. Chromium's per-process lock files are not part of a session and are left out of the copy.
 
+### Snapshot and screenshot
+
+`GET /v1/snapshot` (or `cu snapshot`) returns the page as an LLM wants it: one
+line per interactive element, each with a stable `ref` the next action can name,
+plus the headings. It is a single CDP round trip and a few hundred bytes -- use
+it instead of reading the DOM or OCRing an image.
+
+```json
+{"snapshot":"- url: https://example.test/\n- page: Example\n- ref=e1 link \"More\"\n"}
+```
+
+Screenshots are JPEG by default because a model reads a lossy frame just as
+well and the capture, encode and transfer all shrink. `GET
+/v1/screenshot?format=png` gives a lossless PNG back; `cu shot FILE` writes
+either, naming the file to match.
+
+Navigation waits for the page to be interactive and stable before it answers,
+bounded to three seconds, and reports what it spent in `settled_ms`. A page
+that keeps a stream open for ever -- SSE, websocket, long poll -- therefore
+costs at most three seconds instead of hanging the action.
+
+Latency for every one of these is tracked in [BENCHMARKS.md](BENCHMARKS.md).
+
 The browser executable defaults to `chromium`; set `CU_BROWSER` to an alternate binary. Browsers are launched headless, which is what an agent usually wants; set `CU_HEADLESS=0` to attach a display instead. `CU_DATA_DIR` changes the default data directory and `CU_CDP_PORT` the DevTools port (default `9222`). Do not expose this server beyond localhost without adding TLS and an access-control layer.
 
 ## Login

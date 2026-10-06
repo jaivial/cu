@@ -1421,6 +1421,46 @@ mod tests {
 /// DOM (or a screenshot the model has to OCR) it gets one short line per
 /// interactive element, each carrying a stable `ref` the next action can name.
 /// Playwright MCP, browser-use and Stagehand all converge on this shape.
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    const SAMPLE: &str = r#"{"url":"https://a.test/p","title":"Page",
+        "nodes":[{"ref":"e1","role":"link","name":"More information"},
+                 {"ref":"e2","role":"textbox","name":"Search"}],
+        "headings":["Page"]}"#;
+
+    #[test]
+    fn a_snapshot_is_rendered_as_refs_the_agent_can_act_on() {
+        let snap = parse_snapshot(SAMPLE).expect("parses");
+        assert_eq!(snap.url, "https://a.test/p");
+        assert_eq!(snap.nodes.len(), 2);
+        assert_eq!(snap.nodes[0].ref_id, "e1");
+        assert_eq!(snap.nodes[1].role, "textbox");
+        let text = snap.render();
+        assert!(text.contains("- ref=e1 link \"More information\""));
+        assert!(text.contains("- page: Page\n"));
+        // No presentation markup and no raw HTML reaches the model.
+        assert!(!text.contains('<'));
+    }
+
+    #[test]
+    fn a_snapshot_without_nodes_is_empty_not_an_error() {
+        let snap = parse_snapshot(r#"{"url":"about:blank","nodes":[]}"#).expect("parses");
+        assert!(snap.nodes.is_empty());
+        assert_eq!(snap.title, "");
+    }
+
+    #[test]
+    fn an_array_is_extracted_without_its_neighbours() {
+        let json = r#"{"a":[1,{"b":"]"}],"nodes":[{"ref":"e1"}],"c":"[not an array]"}"#;
+        let nodes = json_array(json, "nodes").expect("nodes array");
+        assert_eq!(nodes, r#"[{"ref":"e1"}]"#);
+        assert!(json_array(json, "missing").is_none());
+        assert!(json_array(r#"{"a":"text"}"#, "a").is_none());
+    }
+}
+
 pub mod snapshot {
     /// One element worth telling the model about.
     pub struct Node {
