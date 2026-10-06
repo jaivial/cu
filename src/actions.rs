@@ -424,17 +424,14 @@ impl Page {
     /// Returns whether it navigated.
     ///
     /// A link click usually announces its navigation before Chromium answers
-    /// the input event, but a form submit is posted as a task and a click
-    /// handler may navigate from a timer, so one round trip through the
-    /// renderer's task queue is made first. The navigation request, if any,
-    /// is sent to the browser before that reply.
+    /// the input event; a form submit may announce it just after, so one
+    /// barrier round trip (~0.3 ms) is made first. A handler that navigates
+    /// from a timer is not waited for; the next snapshot shows where it went.
     fn settle(&mut self, watch: &mut NavWatch) -> Result<bool, String> {
         if !watch.started {
-            let _ = self.conn().call_observed(
-                "Runtime.evaluate",
-                "{\"expression\":\"new Promise(r=>setTimeout(r,0))\",\"awaitPromise\":true}",
-                &mut |event| watch.see(event),
-            );
+            let _ = self
+                .conn()
+                .call_observed("Runtime.evaluate", BARRIER, &mut |event| watch.see(event));
         }
         if !watch.started {
             return Ok(false);
@@ -507,6 +504,13 @@ impl NavWatch {
         }
     }
 }
+
+/// A no-op evaluate, used as a barrier. Its reply comes after every event the
+/// renderer emitted while handling the input before it, including the
+/// navigation request of a form submit. Awaiting a task (`setTimeout(0)` or a
+/// `MessageChannel` post) instead cost 12-15 ms per action: after input,
+/// headless Chromium runs the next task only on its next frame.
+const BARRIER: &str = "{\"expression\":\"0\"}";
 
 /// The in-page side of refs, installed by the snapshot.
 const REGISTRY: &str = "window.__cu";
