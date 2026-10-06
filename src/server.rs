@@ -67,6 +67,7 @@ fn clear_stale_locks(data: &Path) {
         }
     }
 }
+
 /// Launch the persistent Chromium that owns `data/profiles/default`.
 ///
 /// The DevTools port must match the port the daemon was configured with:
@@ -126,6 +127,8 @@ pub fn launch_browser(data: &Path, cdp_port: u16) -> Result<Child, String> {
     Ok(child)
 }
 
+/// How long to wait for a DevTools HTTP response before using what arrived.
+const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum accepted request head and body. Guards against unbounded buffering.
 const MAX_REQUEST: usize = 64 * 1024;
 
@@ -365,12 +368,104 @@ pub fn login_submit(body: &str, state: &AppState) -> String {
     "<h1>Login received</h1><p>Your credentials were delivered to the local session server. The password is not displayed or returned.</p>".into()
 }
 
+/// Value of a string field inside a JSON object.
+///
+/// Tolerates the whitespace Chromium puts after a colon and understands the
+/// escapes that show up in DevTools payloads.
+pub fn json_string_value(object: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let start = object.find(&needle)?.checked_add(needle.len())?;
+    let rest = object[start..].trim_start().strip_prefix(':')?.trim_start();
+    let mut chars = rest.strip_prefix('"')?.chars();
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'b' => out.push('\u{8}'),
+                'f' => out.push('\u{c}'),
+                'u' => {
+                    let hex: String = (0..4).filter_map(|_| chars.next()).collect();
+                    let code = u32::from_str_radix(&hex, 16).ok()?;
+                    out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
+                }
+                other => out.push(other),
+            },
+            other => out.push(other),
+        }
+    }
+    None
+}
+
+/// The objects of a JSON array, in order.
+///
+/// DevTools discovery is an array of target descriptions; this keeps only the
+/// top-level members so a nested object can never be mistaken for a target.
+pub fn json_objects(array: &str) -> Vec<String> {
+    let bytes = array.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if c == b'\\' {
+                    escaped = true;
+                } else if c == b'"' {
+                    in_string = false;
+                }
+            } else {
+                match c {
+                    b'"' => in_string = true,
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        out.push(array[start..i].to_string());
+    }
+    out
+}
+
+/// WebSocket URLs of the DevTools targets that are real pages.
+///
+/// `/json` also lists service workers and extension background pages; picking
+/// the first URL in the list used to send navigate and screenshot to a target
+/// that can render nothing.
+pub fn page_targets(discovery: &str) -> Vec<String> {
+    json_objects(discovery)
+        .into_iter()
+        .filter(|o| json_string_value(o, "type").as_deref() == Some("page"))
+        .filter_map(|o| json_string_value(&o, "webSocketDebuggerUrl"))
+        .collect()
+}
+
 pub fn cdp_command(cdp_port: u16, method: &str, params: &str) -> Result<String, String> {
     let target = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")?;
-    let ws = target
-        .split("\"webSocketDebuggerUrl\":\"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
+    let ws = page_targets(&target)
+        .into_iter()
+        .next()
         .ok_or("Chromium did not expose a page target")?;
     let (host, path) = ws
         .strip_prefix("ws://")
@@ -399,33 +494,96 @@ pub fn cdp_command(cdp_port: u16, method: &str, params: &str) -> Result<String, 
         frame.push(byte ^ mask[i % 4]);
     }
     stream.write_all(&frame).map_err(|e| e.to_string())?;
-    let mut header = [0; 2];
-    stream.read_exact(&mut header).map_err(|e| e.to_string())?;
-    let mut len = (header[1] & 0x7f) as usize;
+    let payload = read_frame(&mut stream, MAX_CDP_MESSAGE)?;
+    String::from_utf8(payload).map_err(|e| e.to_string())
+}
+/// A DevTools HTTP request may not be answered with `Connection: close`, so the
+/// response has to be framed rather than read to EOF: `read_to_string` used to
+/// block for ever on a browser that kept the socket open and the whole daemon
+/// stalled on its first navigate.
+/// Largest CDP payload accepted, including base64 screenshots.
+const MAX_CDP_MESSAGE: usize = 32 * 1024 * 1024;
+/// Read one (unmasked, server-to-client) websocket frame.
+///
+/// A screenshot comes back in a 64-bit length frame: only the 7- and 16-bit
+/// forms used to be handled, so `Page.captureScreenshot` failed with
+/// "CDP response is too large". Payloads are also read to their full announced
+/// length, which a single `read()` does not guarantee.
+fn read_frame(stream: &mut TcpStream, limit: usize) -> Result<Vec<u8>, String> {
+    let mut head = [0; 2];
+    stream.read_exact(&mut head).map_err(|e| e.to_string())?;
+    let opcode = head[0] & 0x0f;
+    let mut len = (head[1] & 0x7f) as usize;
     if len == 126 {
         let mut b = [0; 2];
         stream.read_exact(&mut b).map_err(|e| e.to_string())?;
         len = u16::from_be_bytes(b) as usize;
+    } else if len == 127 {
+        let mut b = [0; 8];
+        stream.read_exact(&mut b).map_err(|e| e.to_string())?;
+        len = usize::try_from(u64::from_be_bytes(b))
+            .map_err(|_| "CDP response is too large".to_string())?;
     }
-    if len == 127 {
+    if len > limit {
         return Err("CDP response is too large".into());
     }
     let mut payload = vec![0; len];
     stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
-    String::from_utf8(payload).map_err(|e| e.to_string())
+    // Text frames carry the JSON; anything else (ping/close/pong) is not an
+    // answer, so read the next frame instead of parsing it as a response.
+    match opcode {
+        0x1 | 0x2 => Ok(payload),
+        _ => read_frame(stream, limit),
+    }
 }
+
+/// GET a DevTools HTTP endpoint and return the response body.
+///
+/// Chromium does not answer with `Connection: close`, so the response has to be
+/// framed instead of read to EOF: `read_to_string` used to block for ever on a
+/// browser that kept the socket open, and the daemon stalled on its first
+/// navigate.
 pub fn http_get(address: &str, path: &str) -> Result<String, String> {
     let mut stream = TcpStream::connect(address).map_err(|e| e.to_string())?;
+    let _ = stream.set_read_timeout(Some(CDP_HTTP_TIMEOUT));
     write!(
         stream,
         "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
     )
     .map_err(|e| e.to_string())?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|e| e.to_string())?;
-    Ok(response.split("\r\n\r\n").nth(1).unwrap_or("").into())
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    let mut chunk = [0; 2048];
+    loop {
+        if let Some(end) = head_end(&buf) {
+            let head = String::from_utf8_lossy(&buf[..end]);
+            if let Some(len) =
+                header_value(&head, "content-length").and_then(|v| v.trim().parse::<usize>().ok())
+            {
+                if buf.len() >= end + len {
+                    break;
+                }
+            }
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            // Timed out with the body still incomplete: use what did arrive
+            // rather than hanging the request thread.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    Ok(text
+        .split_once("\r\n\r\n")
+        .or_else(|| text.split_once("\n\n"))
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default())
 }
 pub fn base64_encode(bytes: &[u8]) -> String {
     let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

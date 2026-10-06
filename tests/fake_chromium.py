@@ -14,7 +14,9 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1])
-PNG = base64.b64encode(b"\x89PNG\r\n\x1a\nfake-png-bytes").decode()
+# Big enough to force the 64-bit websocket length form that a real screenshot
+# uses, so the frame reader cannot get away with the 16-bit one alone.
+PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"fake-png-bytes" * 8000).decode()
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
@@ -33,10 +35,30 @@ class Handler(BaseHTTPRequestHandler):
             self.send_empty(404)
 
     def send_discovery(self):
-        # Chromium emits compact JSON, and `cu` parses it that way.
+        # Chromium pretty-prints this list and puts non-page targets (extension
+        # background pages, service workers) in it too, sometimes ahead of the
+        # page. Reproduce all of it so target selection is exercised.
         body = json.dumps(
-            [{"webSocketDebuggerUrl": "ws://127.0.0.1:%d/devtools/page/1" % PORT}],
-            separators=(",", ":"),
+            [
+                {
+                    "description": "",
+                    "devtoolsFrontendUrl": "devtools://devtools/inspector.html",
+                    "id": "EXT1",
+                    "title": "Extension",
+                    "type": "background_page",
+                    "url": "chrome-extension://abc/background.html",
+                    "webSocketDebuggerUrl": "ws://127.0.0.1:%d/devtools/page/EXT1" % PORT,
+                },
+                {
+                    "description": "",
+                    "devtoolsFrontendUrl": "devtools://devtools/inspector.html",
+                    "id": "PAGE1",
+                    "title": "about:blank",
+                    "type": "page",
+                    "url": "about:blank",
+                    "webSocketDebuggerUrl": "ws://127.0.0.1:%d/devtools/page/PAGE1" % PORT,
+                },
+            ]
         ).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -120,9 +142,13 @@ class Handler(BaseHTTPRequestHandler):
         frame = bytearray([0x81])
         if len(payload) < 126:
             frame.append(len(payload))
-        else:
+        elif len(payload) < 1 << 16:
             frame.append(126)
             frame += len(payload).to_bytes(2, "big")
+        else:
+            # Chromium answers a screenshot with a 64-bit length frame.
+            frame.append(127)
+            frame += len(payload).to_bytes(8, "big")
         frame += payload
         self.connection.sendall(bytes(frame))
 
