@@ -34,12 +34,18 @@ An editable region (`contenteditable`, as in a rich-text editor) appears
 as a `textbox`. A frame that cannot be read says so on its line rather
 than failing the snapshot.
 
+Controls inside a web component's *open* shadow root are walked too, and
+carry refs like any other: a page built from custom elements would
+otherwise snapshot as a page with nothing on it. A closed shadow root is
+invisible to every script and stays unread.
+
 A snapshot is deliberately not a document dump: it shows what an agent
 can act on and where it is. When the answer itself is words -- prose, an
 API response, a message -- `GET /v1/text` (`cu text`, `Client::text`)
 returns the page's visible text instead, capped at 16 000 characters
-with `"truncated":true` when the page was longer (the main document;
-frames are not included yet).
+with `"truncated":true` when the page was longer. It reads every frame,
+each named under its own `- frame: <url>` line, and reaches into open
+shadow roots.
 
 Screenshots are JPEG by default because a model reads a lossy frame just as
 well and the capture, encode and transfer all shrink. `GET
@@ -109,7 +115,9 @@ folder, so files an agent fetched are where it can see them.
 `GET /v1/downloads` (`cu downloads`, `Client::downloads`) lists the files
 that have finished, newest first; a file still being written is not
 listed yet, so check again after a moment. The click that started the
-download already named it in its result.
+download already named it in its result. A download started from
+`?context=NAME` goes to `<data>/downloads/NAME` and is listed with its
+`"context"`, because it is a different file from the default tab's.
 
 Latency for every one of these is tracked in [BENCHMARKS.md](BENCHMARKS.md),
 including a comparison with agent-browser and Playwright MCP.
