@@ -340,13 +340,31 @@ pub fn route(
                     state.data_dir.join("sessions").join(name),
                 )
             };
-            match copy_dir(&src, &dest) {
-                Ok(()) => ("200 OK", "application/json", "{\"saved\":true}".into()),
-                Err(e) => (
+            // The browser owns the live profile and rewrites it constantly, so
+            // step away from the page first and let the copy settle.
+            if !load {
+                let _ = cdp_command(state.cdp_port, "Page.navigate", "{\"url\":\"about:blank\"}");
+            }
+            let outcome = copy_dir(&src, &dest);
+            if let Err(e) = &outcome {
+                return (
                     "400 Bad Request",
                     "application/json",
-                    format!("{{\"error\":\"{}\"}}", json_escape(&e)),
-                ),
+                    format!("{{\"error\":\"{}\"}}", json_escape(e)),
+                );
+            }
+            // A note for the agent, without any secret: which session is live.
+            let _ = fs::write(
+                state
+                    .data_dir
+                    .join("sessions")
+                    .join(format!("{name}.current")),
+                if load { "loaded\n" } else { "saved\n" },
+            );
+            if load {
+                ("200 OK", "application/json", "{\"loaded\":true}".into())
+            } else {
+                ("200 OK", "application/json", "{\"saved\":true}".into())
             }
         }
         _ => (
@@ -742,6 +760,7 @@ pub fn valid_name(name: &str) -> bool {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
+
 pub fn copy_dir(src: &Path, dest: &Path) -> Result<(), String> {
     if !src.exists() {
         return Err("browser profile does not exist".into());
@@ -750,10 +769,32 @@ pub fn copy_dir(src: &Path, dest: &Path) -> Result<(), String> {
     for item in fs::read_dir(src).map_err(|e| e.to_string())? {
         let item = item.map_err(|e| e.to_string())?;
         let target = dest.join(item.file_name());
-        if item.path().is_dir() {
-            copy_dir(&item.path(), &target)?
+        let source = item.path();
+        // Chromium's profile holds symlinks (SingletonLock, SingletonSocket,
+        // SingletonCookie) that point outside the profile and are usually
+        // dangling. Copying the file they point to made `session save` fail
+        // with ENOENT, and would scatter browser state over the filesystem if
+        // it ever did exist, so symlinks are copied as symlinks.
+        // Chromium's per-process locks are not session state: a copied
+        // SingletonLock points at the machine and pid of the run that saved the
+        // profile, and the next browser refuses to start on top of it
+        // ("Failed to create a ProcessSingleton"). Leave them out entirely.
+        if item
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("Singleton"))
+        {
+            continue;
+        }
+        let meta = fs::symlink_metadata(&source).map_err(|e| e.to_string())?;
+        if meta.file_type().is_symlink() {
+            let link = fs::read_link(&source).map_err(|e| e.to_string())?;
+            let _ = fs::remove_file(&target);
+            std::os::unix::fs::symlink(&link, &target).map_err(|e| e.to_string())?;
+        } else if meta.is_dir() {
+            copy_dir(&source, &target)?
         } else {
-            fs::copy(item.path(), target).map_err(|e| e.to_string())?;
+            fs::copy(&source, &target).map_err(|e| e.to_string())?;
         }
     }
     Ok(())
