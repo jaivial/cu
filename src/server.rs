@@ -362,7 +362,7 @@ pub fn route(
                 if load { "loaded\n" } else { "saved\n" },
             );
             if load {
-                ("200 OK", "application/json", "{\"saved\":true}".into())
+                ("200 OK", "application/json", "{\"loaded\":true}".into())
             } else {
                 ("200 OK", "application/json", "{\"saved\":true}".into())
             }
@@ -829,6 +829,79 @@ mod tests {
         assert_eq!(header_value(head, "CONTENT-LENGTH"), Some("7"));
         assert_eq!(header_value(head, "content-length"), Some("7"));
         assert_eq!(header_value(head, "Authorization"), None);
+    }
+
+    #[test]
+    fn percent_encoding_and_plus_are_decoded() {
+        assert_eq!(url_decode("s3cret%2B50%25"), "s3cret+50%");
+        assert_eq!(url_decode("a+space"), "a space");
+        assert_eq!(url_decode("caf%C3%A9"), "caf\u{e9}");
+        // A stray escape is kept rather than swallowed.
+        assert_eq!(url_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn json_strings_are_escaped_and_read_back() {
+        let password = "quote\" backslash\\ newline\n";
+        assert_eq!(
+            json_string_value(&json_string(password), "unused").is_none(),
+            true
+        );
+        assert_eq!(json_string_value(&json_string(password), ""), None);
+        let encoded = format!("{{\"v\":{}}}", json_string(password));
+        assert_eq!(json_string_value(&encoded, "v").as_deref(), Some(password));
+    }
+
+    #[test]
+    fn page_targets_skip_workers_and_extensions() {
+        let discovery = r#"[
+          {
+             "description": "",
+             "title": "Extension",
+             "type": "background_page",
+             "url": "chrome-extension://abc/background.html",
+             "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/EXT"
+          },
+          {
+             "description": "",
+             "title": "about:blank",
+             "type": "page",
+             "url": "about:blank",
+             "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/PAGE"
+          }
+       ]"#;
+        assert_eq!(
+            page_targets(discovery),
+            vec!["ws://127.0.0.1:9222/devtools/page/PAGE".to_string()]
+        );
+        assert!(page_targets("[]").is_empty());
+        assert!(page_targets("not json").is_empty());
+    }
+
+    #[test]
+    fn a_login_page_rejects_empty_credentials() {
+        let state = AppState {
+            data_dir: std::env::temp_dir().join("cu-login-test"),
+            token: "t".into(),
+            cdp_port: 1,
+        };
+        let page = login_submit("username=&password=", &state);
+        assert!(!page.contains("Login received"));
+        assert!(page.contains("Try again"));
+    }
+
+    #[test]
+    fn a_session_cannot_be_read_out_of_the_login_response() {
+        let state = AppState {
+            data_dir: std::env::temp_dir().join("cu-login-test"),
+            token: "t".into(),
+            cdp_port: 1,
+        };
+        // The browser is unreachable on port 1, so nothing is typed; the point
+        // is that no password ever comes back in the page.
+        let page = login_submit("username=jaime&password=s3cret", &state);
+        assert!(!page.contains("s3cret"));
+        assert!(!page.contains("password"));
     }
 
     #[test]

@@ -401,3 +401,80 @@ fn an_invalid_session_name_is_rejected() {
     let response = server.post("/v1/session/../secrets", "{}");
     assert_eq!(status_code(&response), "400");
 }
+
+#[test]
+fn a_session_load_is_reported_as_loaded() {
+    let server = TestServer::start("session-load", false);
+    std::fs::create_dir_all(server.data_dir.join("sessions/trip_1")).expect("session dir");
+    let response = server.post("/v1/session/trip_1/load", "{}");
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    assert_eq!(body_of(&response), "{\"loaded\":true}");
+}
+
+#[test]
+fn a_saved_profile_leaves_the_process_locks_behind() {
+    let server = TestServer::start("symlink", false);
+    // Chromium leaves dangling links to its per-process locks in the profile.
+    // A copied SingletonLock names the machine and pid of the run that saved the
+    // profile, and the next browser refuses to start on top of it.
+    let profile = server.data_dir.join("profiles/default");
+    std::os::unix::fs::symlink("../elsewhere", profile.join("SingletonLock"))
+        .expect("create dangling lock");
+    std::fs::write(profile.join("Preferences"), "{}").expect("profile file");
+    let response = server.post("/v1/session/trip_2", "{}");
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let copied = server.data_dir.join("sessions/trip_2");
+    assert!(!copied.join("SingletonLock").exists());
+    assert!(!copied.join("SingletonLock").is_symlink());
+    assert!(
+        copied.join("Preferences").is_file(),
+        "state is still copied"
+    );
+}
+
+#[test]
+fn a_dangling_symlink_is_copied_as_a_link() {
+    let server = TestServer::start("dangling", false);
+    let profile = server.data_dir.join("profiles/default");
+    std::fs::write(profile.join("Preferences"), "{}").expect("profile file");
+    std::os::unix::fs::symlink("/no/such/path", profile.join("Vendor")).expect("dangling link");
+    let response = server.post("/v1/session/trip_3", "{}");
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    assert!(server.data_dir.join("sessions/trip_3/Vendor").is_symlink());
+}
+
+#[test]
+fn submitting_the_login_form_types_into_the_browser() {
+    let server = TestServer::start("login-form", true);
+    let response = send_fragmented(
+        &server.addr,
+        b"username=jaime&password=s3cret%2B50%25",
+        4,
+        Duration::from_millis(5),
+    )
+    .ok();
+    // The form must be POSTed to the unauthenticated endpoint, which is what a
+    // browser does; check it directly.
+    let request = format!(
+        "POST /login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n",
+        b"username=jaime&password=s3cret%2B50%25".len()
+    );
+    let _ = request;
+    let _ = response;
+    let page = send_fragmented(
+        &server.addr,
+        format!(
+            "POST /login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\nusername=jaime&password=s3cret%2B50%25",
+            b"username=jaime&password=s3cret%2B50%25".len()
+        )
+        .as_bytes(),
+        5,
+        Duration::from_millis(5),
+    )
+    .expect("login POST should be answered");
+    assert_eq!(status_code(&page), "200");
+    let body = body_of(&page);
+    // The typed password must never come back.
+    assert!(!body.contains("s3cret"), "password leaked: {body}");
+    assert!(body.contains("Login received"), "got {body}");
+}
