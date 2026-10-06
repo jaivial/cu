@@ -298,6 +298,20 @@ fn navigate_returns_the_cdp_result() {
 }
 
 #[test]
+fn a_navigation_the_browser_cannot_do_is_a_clear_error() {
+    let server = TestServer::start("navigate-fail", true);
+    let response = server.post("/v1/navigate", r#"{"url":"fail://nowhere.test"}"#);
+    // A 200 with `errorText` tucked inside the CDP result hid the failure;
+    // the agent must see what went wrong without parsing a nested payload.
+    assert_eq!(status_code(&response), "502", "got {}", body_of(&response));
+    let body = body_of(&response);
+    assert!(
+        body.contains("navigation failed: net::ERR_NAME_NOT_RESOLVED"),
+        "got {body}"
+    );
+}
+
+#[test]
 fn navigate_without_a_url_is_rejected() {
     let server = TestServer::start("navigate-empty", true);
     let response = server.post("/v1/navigate", "{\"url\":\"\"}");
@@ -552,8 +566,10 @@ fn navigate_reports_how_long_the_page_took_to_settle() {
     let response = server.post("/v1/navigate", "{\"url\":\"https://example.test\"}");
     assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
     let body = body_of(&response);
-    // The smart wait reports what it spent instead of hiding it.
+    // The smart wait reports what it spent instead of hiding it, and whether
+    // the wait ended on a ready page at all.
     assert!(body.contains("settled_ms"), "no settle timing in {body}");
+    assert!(body.contains("\"settled\":true"), "not settled in {body}");
     // And it comes back promptly: `Page.navigate` plus one settled probe.
     assert!(
         body.contains("\"url\":\"https://example.test\""),

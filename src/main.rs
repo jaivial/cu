@@ -176,7 +176,12 @@ fn write_screenshot(response: &str, path: Option<&str>) -> Result<(), String> {
     } else {
         ("jpeg_base64", "screenshot.jpg")
     };
-    let image = server::json_value(response, field).ok_or("server did not return an image")?;
+    // A failed capture comes back as an error object; show the server's
+    // words instead of a generic "no image" that hides why.
+    let image = server::json_value(response, field).ok_or_else(|| {
+        server::json_value(response, "error")
+            .unwrap_or_else(|| "server did not return an image".into())
+    })?;
     fs::write(path.unwrap_or(default_path), server::decode_base64(&image)?)
         .map_err(|e| e.to_string())
 }

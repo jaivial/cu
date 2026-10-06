@@ -629,16 +629,34 @@ pub fn route(
                 &format!("{{\"url\":\"{}\"}}", json_escape(&url)),
             ) {
                 Ok(result) => {
+                    // A navigation the browser could not perform answers with
+                    // `errorText` (`net::ERR_NAME_NOT_RESOLVED` and friends);
+                    // passing that on as a 200 hid a failed navigation from
+                    // the agent.
+                    if let Some(error) =
+                        json_string_value(&result, "errorText").filter(|e| !e.is_empty())
+                    {
+                        return (
+                            "502 Bad Gateway",
+                            "application/json",
+                            format!(
+                                "{{\"error\":{}}}",
+                                json_string(&format!("navigation failed: {error}"))
+                            ),
+                        );
+                    }
                     // Do not hand back a half-loaded page, but never hang on a
-                    // stream that stays open for ever.
-                    let waited = wait_for_page_on(&tab, SETTLE_MAX);
+                    // stream that stays open for ever. Whether the wait ended
+                    // on a ready page or on the budget says `settled`.
+                    let (waited, settled) = wait_for_page_on(&tab, SETTLE_MAX);
                     (
                         "200 OK",
                         "application/json",
                         format!(
-                            "{{\"result\":{},\"settled_ms\":{}}}",
+                            "{{\"result\":{},\"settled_ms\":{},\"settled\":{}}}",
                             result.trim(),
-                            waited.as_millis()
+                            waited.as_millis(),
+                            settled
                         ),
                     )
                 }
@@ -953,18 +971,23 @@ fn settle_script(budget: Duration) -> String {
 }
 
 /// Wait until the page is usable, or give up and let the agent have what is
-/// there. Returns how long the wait took.
+/// there. Returns how long the wait took and whether the page settled.
 ///
 /// A navigation that swaps the execution context under the evaluate makes it
 /// fail; that is retried until the budget is spent, so a cross-document
 /// redirect still ends on a settled page rather than an error.
-pub fn wait_for_page(cdp_port: u16, budget: Duration) -> Duration {
+pub fn wait_for_page(cdp_port: u16, budget: Duration) -> (Duration, bool) {
     wait_for_page_on(&Tab::default_for(cdp_port), budget)
 }
 
-fn wait_for_page_on(tab: &Tab, budget: Duration) -> Duration {
+/// The settle script resolves with the document's `readyState`, so the reply
+/// says whether the wait ended on a usable page (`settled`) or ran out of
+/// budget against a page still loading -- the difference between "here is
+/// your page" and "the page is still coming; take a snapshot before acting".
+fn wait_for_page_on(tab: &Tab, budget: Duration) -> (Duration, bool) {
     let started = std::time::Instant::now();
     let budget = budget.max(SETTLE_TIMEOUT);
+    let mut settled = false;
     while started.elapsed() < budget {
         let left = budget.saturating_sub(started.elapsed());
         let params = format!(
@@ -972,11 +995,14 @@ fn wait_for_page_on(tab: &Tab, budget: Duration) -> Duration {
             json_string(&settle_script(left))
         );
         match tab.command("Runtime.evaluate", &params) {
-            Ok(reply) if !reply.contains("\"exceptionDetails\"") => break,
+            Ok(reply) if !reply.contains("\"exceptionDetails\"") => {
+                settled = evaluated_string(&reply).is_some_and(|state| state != "loading");
+                break;
+            }
             _ => thread::sleep(Duration::from_millis(2)),
         }
     }
-    started.elapsed()
+    (started.elapsed(), settled)
 }
 
 /// Type the credentials into the page the browser is showing and submit it.

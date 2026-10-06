@@ -191,6 +191,15 @@ class Handler(BaseHTTPRequestHandler):
     @staticmethod
     def result_for(method, params=None):
         if method == "Page.navigate":
+            # A URL the browser cannot load answers with `errorText`, like a
+            # real Chromium against a name that does not resolve.
+            if (params or {}).get("url", "").startswith("fail://"):
+                return {
+                    "result": {
+                        "frameId": "f",
+                        "errorText": "net::ERR_NAME_NOT_RESOLVED",
+                    }
+                }
             return {"id": 1, "result": {"frameId": "f", "url": "https://example.test"}}
         if method == "Target.createBrowserContext":
             return {"result": {"browserContextId": "CTX%d" % (len(CONTEXT_TABS) + 1)}}
