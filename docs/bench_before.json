@@ -1,0 +1,41 @@
+{
+  "environment": {
+    "binary": "target/release/cu",
+    "browser": "/snap/bin/chromium",
+    "pages": "http://127.0.0.1:34485/",
+    "iters": 20,
+    "date": "2026-10-06T12:20:02+0000"
+  },
+  "start_ms": 431.34,
+  "actions": [
+    {
+      "action": "navigate",
+      "n": 20,
+      "min": 5.76,
+      "median": 8.59,
+      "p95": 12.8,
+      "max": 13.24,
+      "mean": 9.16
+    },
+    {
+      "action": "shot",
+      "n": 20,
+      "min": 32.34,
+      "median": 35.75,
+      "p95": 50.87,
+      "max": 51.11,
+      "mean": 40.79
+    },
+    {
+      "action": "shot x8 parallel",
+      "n": 4,
+      "min": 31.9,
+      "median": 92.84,
+      "p95": 131.92,
+      "max": 142.28,
+      "mean": 92.86,
+      "wall_ms": 135.21
+    }
+  ],
+  "snapshot_supported": false
+}
