@@ -992,39 +992,71 @@ fn encode_client_frame(bytes: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// One pooled connection per DevTools endpoint, shared by every request thread.
+/// How many warm DevTools connections are kept per browser.
 ///
-/// Commands on one page are inherently ordered, so a single connection guarded
-/// by a lock is not a bottleneck: it removes a discovery round trip, a TCP
-/// connect and a handshake from every action, and it lets parallel actions
-/// queue on a warm socket instead of each paying set-up again.
-fn cdp_pool(cdp_port: u16) -> Arc<Mutex<Option<CdpConnection>>> {
-    static POOL: OnceLock<Mutex<HashMap<u16, Arc<Mutex<Option<CdpConnection>>>>>> = OnceLock::new();
-    let pool = POOL.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
-    Arc::clone(guard.entry(cdp_port).or_default())
+/// Enough that a burst of parallel actions does not queue behind one socket,
+/// few enough that the browser is not holding idle fds. Extra connections
+/// opened during a burst are dropped instead of kept, so a spike costs one
+/// handshake and leaves nothing behind.
+const CDP_POOL_IDLE: usize = 8;
+
+/// Warm DevTools connections, per browser, that any request thread can take.
+struct CdpPool {
+    idle: Vec<CdpConnection>,
 }
 
-/// Run one DevTools command, reusing the open websocket when there is one.
-///
-/// A connection the browser has dropped is reopened and the command retried
-/// once, so a navigation that swapped the target does not surface as an error.
-pub fn cdp_command(cdp_port: u16, method: &str, params: &str) -> Result<String, String> {
-    let connection = cdp_pool(cdp_port);
-    let mut guard = connection.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(existing) = guard.as_mut() {
-        match existing.call(method, params) {
-            Ok(reply) => return Ok(reply),
-            Err(_) => *guard = None,
+impl CdpPool {
+    /// Take a warm connection, or open one if the pool is empty.
+    fn take(&mut self, cdp_port: u16) -> Result<CdpConnection, String> {
+        self.idle
+            .pop()
+            .map(Ok)
+            .unwrap_or_else(|| CdpConnection::open(cdp_port))
+    }
+
+    /// Give a still-usable connection back, up to the idle limit.
+    fn put(&mut self, connection: CdpConnection) {
+        if self.idle.len() < CDP_POOL_IDLE {
+            self.idle.push(connection);
         }
     }
-    let mut fresh = CdpConnection::open(cdp_port)?;
-    let reply = fresh.call(method, params);
-    // A failed open is not cached, so the next attempt tries again.
-    if reply.is_ok() {
-        *guard = Some(fresh);
+}
+
+fn cdp_pool(cdp_port: u16) -> &'static Mutex<CdpPool> {
+    static POOLS: OnceLock<Mutex<HashMap<u16, &'static Mutex<CdpPool>>>> = OnceLock::new();
+    let pools = POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = pools.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(cdp_port)
+        .or_insert_with(|| Box::leak(Box::new(Mutex::new(CdpPool { idle: Vec::new() }))))
+}
+
+/// Run one DevTools command on a pooled connection.
+///
+/// Reuse is what makes an action cheap: without it every navigate, screenshot
+/// and snapshot paid a `/json` discovery, a TCP connect and a websocket
+/// handshake before the actual command. A connection the browser has dropped is
+/// reopened and retried once, so a target swap is not an error.
+pub fn cdp_command(cdp_port: u16, method: &str, params: &str) -> Result<String, String> {
+    let pool = cdp_pool(cdp_port);
+    for attempt in 0..2 {
+        let mut connection = {
+            let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
+            guard.take(cdp_port)
+        }?;
+        match connection.call(method, params) {
+            Ok(reply) => {
+                let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
+                guard.put(connection);
+                return Ok(reply);
+            }
+            // A broken connection is only worth retrying once: the second try
+            // has just opened a fresh one.
+            Err(_error) if attempt == 0 => continue,
+            Err(error) => return Err(error),
+        }
     }
-    reply
+    unreachable!("the retry loop returns on its second attempt")
 }
 /// A DevTools HTTP request may not be answered with `Connection: close`, so the
 /// response has to be framed rather than read to EOF: `read_to_string` used to

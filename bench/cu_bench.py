@@ -215,7 +215,10 @@ def main():
         results["actions"] = [
             bench("navigate", args.iters,
                   lambda: cu.call("POST", "/v1/navigate", {"url": page})),
-            bench("shot", args.iters, lambda: cu.call("GET", "/v1/screenshot")),
+            bench("shot(jpeg)", args.iters,
+                  lambda: cu.call("GET", "/v1/screenshot")),
+            bench("shot(png)", args.iters,
+                  lambda: cu.call("GET", "/v1/screenshot?format=png")),
         ]
         results["snapshot_supported"] = has_snapshot(cu)
         if results["snapshot_supported"]:
