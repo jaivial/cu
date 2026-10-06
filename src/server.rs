@@ -13,6 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct AppState {
     pub data_dir: PathBuf,
     pub token: String,
+    /// Port Chromium listens on for the DevTools protocol (default 9222).
+    pub cdp_port: u16,
 }
 
 /// Accept loop. Binds to loopback only and serves one thread per connection.
@@ -175,6 +177,7 @@ pub fn route(
                 );
             }
             match cdp_command(
+                state.cdp_port,
                 "Page.navigate",
                 &format!("{{\"url\":\"{}\"}}", json_escape(&url)),
             ) {
@@ -187,7 +190,11 @@ pub fn route(
             }
         }
         ("GET", "/v1/screenshot") => {
-            match cdp_command("Page.captureScreenshot", "{\"format\":\"png\"}") {
+            match cdp_command(
+                state.cdp_port,
+                "Page.captureScreenshot",
+                "{\"format\":\"png\"}",
+            ) {
                 Ok(result) => (
                     "200 OK",
                     "application/json",
@@ -256,8 +263,8 @@ pub fn login_submit(body: &str, state: &AppState) -> String {
     "<h1>Login received</h1><p>Your credentials were delivered to the local session server. The password is not displayed or returned.</p>".into()
 }
 
-pub fn cdp_command(method: &str, params: &str) -> Result<String, String> {
-    let target = http_get("127.0.0.1:9222", "/json")?;
+pub fn cdp_command(cdp_port: u16, method: &str, params: &str) -> Result<String, String> {
+    let target = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")?;
     let ws = target
         .split("\"webSocketDebuggerUrl\":\"")
         .nth(1)

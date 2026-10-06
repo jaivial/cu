@@ -82,9 +82,14 @@ fn start(args: &[String]) -> Result<(), String> {
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| e.to_string())?;
     let _browser = server::launch_browser(&data)?;
     eprintln!("cu listening on http://127.0.0.1:{port}; profile remains open until server exits");
+    let cdp_port = env::var("CU_CDP_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9222);
     let state = Arc::new(AppState {
         data_dir: data,
         token,
+        cdp_port,
     });
     server::serve(state, listener);
     Ok(())
