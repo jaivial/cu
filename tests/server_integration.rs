@@ -847,6 +847,31 @@ fn text_returns_the_pages_visible_words() {
 }
 
 #[test]
+fn text_reads_the_frames_of_the_page_too() {
+    let server = TestServer::start("text-frames", true);
+    // A page with no frames: just the document, no frame lines.
+    let body = body_of(&server.get("/v1/text")).to_string();
+    assert!(body.contains("the quick brown fox"), "got {body}");
+    assert!(!body.contains("- frame:"), "no frames expected in {body}");
+
+    // With an iframe, its words come back named by the frame they came from,
+    // so the text never claims they are the page's own.
+    let response = server.post("/v1/navigate", r#"{"url":"https://example.test/frames"}"#);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&server.get("/v1/text")).to_string();
+    assert!(
+        body.contains("the quick brown fox"),
+        "main frame lost: {body}"
+    );
+    assert!(body.contains("words from inside the frame"), "got {body}");
+    assert!(
+        body.contains("- frame: https://example.test/child"),
+        "frame not named: {body}"
+    );
+    assert!(body.contains("\"truncated\":false"), "got {body}");
+}
+
+#[test]
 fn a_context_name_cannot_be_a_path() {
     let server = TestServer::start("context-name", true);
     let response = server.get("/v1/snapshot?context=..%2Fx");

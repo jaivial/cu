@@ -36,7 +36,9 @@
   second budget ran out on a page still loading.
 - `GET /v1/text` (`cu text`, `Client::text`): the page's visible text for the
   reading a snapshot deliberately does not do -- prose, API responses,
-  messages -- capped at 16 000 characters with a `truncated` flag.
+  messages -- capped at 16 000 characters with a `truncated` flag. It reads
+  every frame, each named under a `- frame: <url>` line, and reaches into open
+  shadow roots, whose text no `innerText` alone returns.
 - SDK: `tabs`, `close_tab`, `downloads`, `load_session`.
 
 - Speed for agents, measured in `docs/BENCHMARKS.md`. Cold start went from

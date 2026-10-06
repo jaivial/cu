@@ -744,45 +744,10 @@ pub fn route(
             "{\"running\":true,\"browser\":\"chromium\"}".into(),
         ),
         // Visible text of the page, for the reading a snapshot deliberately
-        // does not do: prose, API responses, error messages. One evaluate,
-        // capped in the page so a huge document cannot flood the socket.
-        ("GET", "/v1/text") => match tab.command(
-            "Runtime.evaluate",
-            &format!(
-                "{{\"expression\":{},\"returnByValue\":true}}",
-                json_string(READ_TEXT_JS)
-            ),
-        ) {
-            Ok(reply) => match evaluated_string(&reply) {
-                Some(value) => {
-                    let text = json_string_value(&value, "text").unwrap_or_default();
-                    let truncated = json_string_value(&value, "full")
-                        .and_then(|f| f.parse::<usize>().ok())
-                        .zip(json_string_value(&value, "n").and_then(|n| n.parse::<usize>().ok()))
-                        .is_some_and(|(full, n)| full > n);
-                    let text: String = text.chars().take(TEXT_LIMIT).collect();
-                    (
-                        "200 OK",
-                        "application/json",
-                        format!(
-                            "{{\"text\":{},\"truncated\":{}}}",
-                            json_string(&text),
-                            truncated
-                        ),
-                    )
-                }
-                None => (
-                    "502 Bad Gateway",
-                    "application/json",
-                    "{\"error\":\"page did not return its text\"}".into(),
-                ),
-            },
-            Err(e) => (
-                "502 Bad Gateway",
-                "application/json",
-                format!("{{\"error\":{}}}", json_string(&e)),
-            ),
-        },
+        // does not do: prose, API responses, error messages. Every frame is
+        // read, each one named, capped in the page so a huge document cannot
+        // flood the socket.
+        ("GET", "/v1/text") => text_response(|method, params| tab.command(method, params)),
         // Pure file listing: works whether or not the browser is up, because
         // the files outlive the session that downloaded them.
         ("GET", "/v1/downloads") => (
@@ -1030,10 +995,171 @@ pub fn close_tab(cdp_port: u16, id: &str) -> Result<(), String> {
 /// a tool-sized payload.
 const TEXT_LIMIT: usize = 16_000;
 
-/// Visible text of the main document. `innerText` is what the user would
-/// read (layout-aware, no scripts or styles), sliced in the page so the
-/// transfer is bounded however big the document is.
-const READ_TEXT_JS: &str = "JSON.stringify((function(){var t=document.body?document.body.innerText:'';var s=t.slice(0,16001);return {n:s.length,full:t.length,text:s}})())";
+/// Visible text of one document, capped in the page so a huge document cannot
+/// flood the socket however big it is.
+///
+/// `body.innerText` is what the user would read (layout-aware, no scripts or
+/// styles). A page that hands its content to a web component shows nothing
+/// there, so every open shadow root is read as well. A `ShadowRoot` has no
+/// `innerText` of its own in Chromium, so its words are collected from the
+/// visible leaves inside it; that is also what keeps a `display:none` control
+/// out of the answer, because `innerText` degrades to `textContent` for a
+/// subtree that is not rendered. A closed shadow root is invisible to every
+/// script, so it is not read -- exactly what a page itself would see.
+/// `n` is how many characters came back and `full` how many there were, which
+/// is what `truncated` is computed from.
+const READ_TEXT_JS: &str = r#"JSON.stringify((function(){
+  const shown = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 1 && r.height < 1) return false;
+    const s = getComputedStyle(el);
+    return s.visibility !== 'hidden' && s.display !== 'none';
+  };
+  // Chromium gives a ShadowRoot no innerText at all, so its words are read
+  // from the visible leaves inside it -- which is also what keeps a
+  // display:none control out of the answer, since innerText degrades to
+  // textContent for a subtree that is not rendered.
+  const root = (r) => {
+    const out = [];
+    for (const el of r.querySelectorAll('*')) {
+      // A host renders its shadow root rather than its own children: read
+      // that instead, or the same words come back twice.
+      if (el.shadowRoot) { out.push(root(el.shadowRoot)); continue; }
+      if (el.children.length) continue;
+      if (!shown(el)) continue;
+      const t = (el.innerText || '').trim();
+      if (t) out.push(t);
+    }
+    return out.filter(Boolean).join('\n');
+  };
+  // Only shadow hosts are collected. Everything else is in body.innerText
+  // already, and walking the document for leaves as well would double it.
+  let shadow = '';
+  for (const el of document.querySelectorAll('*')) if (el.shadowRoot) shadow += (shadow ? '\n' : '') + root(el.shadowRoot);
+  let t = document.body ? document.body.innerText : '';
+  if (shadow) t += (t ? '\n' : '') + shadow;
+  const s = t.slice(0,16001);
+  return {n:s.length,full:t.length,text:s};
+})())"#;
+
+/// Line that names a frame whose text could not be read.
+///
+/// Same wording the snapshot uses for a frame it could not walk: the words are
+/// missing because the frame moved or the browser would not expose it, which
+/// a new snapshot may fix, and the rest of the page is still worth reading.
+fn unreadable_frame(url: &str) -> String {
+    format!("- frame: {url} (unreadable right now; take a new snapshot)")
+}
+
+/// The `GET /v1/text` body: the visible text of every frame of the page.
+///
+/// The frames are the ones a snapshot walks, so text and snapshot agree on
+/// what a page is made of. The main document comes first and each iframe under
+/// a `- frame: <url>` line, so the words never claim to be the page's own.
+/// A frame that cannot be read is named, not fatal: the answer an agent wants
+/// is the prose, and half of it beats an error.
+fn text_response<F>(mut cmd: F) -> (&'static str, &'static str, String)
+where
+    F: FnMut(&str, &str) -> Result<String, String>,
+{
+    // The main document first: it is the frame an action lands on, and a page
+    // that fails here is a page that cannot be read at all.
+    let tree = cmd("Page.getFrameTree", "{}");
+    let tree = match tree {
+        Ok(tree) => tree,
+        Err(e) => {
+            return (
+                "502 Bad Gateway",
+                "application/json",
+                format!("{{\"error\":{}}}", json_string(&e)),
+            );
+        }
+    };
+    let mut frames = flatten_frame_tree(&tree);
+    if frames.is_empty() {
+        frames.push(Frame {
+            id: String::new(),
+            parent: None,
+            url: String::new(),
+        });
+    }
+    let mut text = String::new();
+    let mut truncated = false;
+    for (index, frame) in frames.iter().enumerate() {
+        // Subframes are read in an isolated world of their own, so a
+        // cross-origin frame is read without touching its scripts -- the same
+        // move the snapshot makes.
+        let context = if index == 0 {
+            String::new()
+        } else {
+            let isolated = cmd(
+                "Page.createIsolatedWorld",
+                &format!(
+                    "{{\"frameId\":{},\"worldName\":\"cu-text\"}}",
+                    json_string(&frame.id)
+                ),
+            );
+            match isolated
+                .as_deref()
+                .ok()
+                .and_then(|r| json_value(r, "executionContextId"))
+                .and_then(|v| v.parse::<i64>().ok())
+            {
+                // Trailing comma: the format below puts one comma between the
+                // expression and this fragment and none after it.
+                Some(id) => format!("\"contextId\":{id},"),
+                // The frame went away between the tree walk and here.
+                None => {
+                    text.push('\n');
+                    text.push_str(&unreadable_frame(&frame.url));
+                    continue;
+                }
+            }
+        };
+        let params = format!(
+            "{{\"expression\":{},{}\"returnByValue\":true}}",
+            json_string(READ_TEXT_JS),
+            context
+        );
+        let value = match cmd("Runtime.evaluate", &params) {
+            Ok(reply) => evaluated_string(&reply),
+            Err(_) => None,
+        };
+        let Some(value) = value else {
+            if index == 0 {
+                return (
+                    "502 Bad Gateway",
+                    "application/json",
+                    "{\"error\":\"page did not return its text\"}".into(),
+                );
+            }
+            text.push('\n');
+            text.push_str(&unreadable_frame(&frame.url));
+            continue;
+        };
+        let (full, n) = (
+            json_string_value(&value, "full").and_then(|f| f.parse::<usize>().ok()),
+            json_string_value(&value, "n").and_then(|n| n.parse::<usize>().ok()),
+        );
+        truncated |= full.zip(n).is_some_and(|(full, n)| full > n);
+        if index > 0 {
+            text.push('\n');
+            text.push_str(&format!("- frame: {}", frame.url));
+        }
+        text.push('\n');
+        text.push_str(&json_string_value(&value, "text").unwrap_or_default());
+    }
+    let text: String = text.chars().take(TEXT_LIMIT).collect();
+    (
+        "200 OK",
+        "application/json",
+        format!(
+            "{{\"text\":{},\"truncated\":{}}}",
+            json_string(&text),
+            truncated
+        ),
+    )
+}
 
 /// Finished downloads in `dir`, newest first, as the `/v1/downloads` body.
 ///

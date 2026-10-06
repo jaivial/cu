@@ -45,6 +45,7 @@ CHILD_SNAPSHOT = json.dumps(
     },
     separators=(",", ":"),
 )
+CHILD_WORDS = "words from inside the frame"
 FAKE_SNAPSHOT = json.dumps(
     {
         "url": "https://example.test/",
@@ -276,7 +277,12 @@ class Handler(BaseHTTPRequestHandler):
                 # The top document sees the iframe at the click point.
                 return {"id": 1, "result": {"result": {"type": "string", "value": "IFRAME"}}}
             if "innerText" in expr:
-                words = "the quick brown fox jumps over the lazy dog"
+                # In an iframe's isolated world the words are the frame's, so a
+                # test can tell the two documents apart.
+                if (params or {}).get("contextId") is not None:
+                    words = CHILD_WORDS
+                else:
+                    words = "the quick brown fox jumps over the lazy dog"
                 return {
                     "id": 1,
                     "result": {
