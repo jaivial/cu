@@ -47,13 +47,72 @@ pub fn launch_browser(data: &Path) -> Result<Child, String> {
         .map_err(|e| format!("could not start Chromium (set CU_BROWSER): {e}"))
 }
 
+/// Maximum accepted request head. Guards against unbounded buffering.
+const MAX_HEAD: usize = 64 * 1024;
+
+/// Read one request from the connection.
+///
+/// A request may arrive in any number of TCP segments, so a single `read()`
+/// cannot be relied on: the first segment is often just the start of the
+/// request line while the peer is still writing. Keep reading until the blank
+/// line that terminates the header block, then honour `Content-Length` so the
+/// whole body is available before routing.
+fn read_request(stream: &mut TcpStream) -> Result<String, String> {
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    let mut chunk = [0; 2048];
+    loop {
+        if let Some(pos) = find(&buf, b"\r\n\r\n") {
+            let head_end = pos + 4;
+            let head = String::from_utf8_lossy(&buf[..head_end]);
+            let len = header_value(&head, "content-length")
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if len > MAX_HEAD {
+                return Err("request body is too large".into());
+            }
+            while buf.len() < head_end + len {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break, // peer closed; serve whatever we have
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+            return String::from_utf8(buf).map_err(|_| "request is not valid UTF-8".into());
+        }
+        if buf.len() > MAX_HEAD {
+            return Err("request head is too large".into());
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                if buf.is_empty() {
+                    return Err("connection closed before a request was sent".into());
+                }
+                return Err("connection closed mid-request".into());
+            }
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// Read a full request and answer it. Errors are reported as a 400 response
+/// instead of dropping the connection so clients get a diagnostic.
 pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
-    let mut buf = [0; 16384];
-    let Ok(size) = stream.read(&mut buf) else {
-        return;
+    let request = match read_request(&mut stream) {
+        Ok(request) => request,
+        Err(error) => {
+            let body = format!("{{\"error\":\"{}\"}}", json_escape(&error));
+            let _ = write!(
+                stream,
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            return;
+        }
     };
-    let request = String::from_utf8_lossy(&buf[..size]);
-    let mut first = request.lines().next().unwrap_or("").split_whitespace();let method = first.next().unwrap_or("");
+    let mut first = request.lines().next().unwrap_or("").split_whitespace();
+    let method = first.next().unwrap_or("");
     let path = first.next().unwrap_or("");
     let authorized = request
         .lines()
