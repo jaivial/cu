@@ -20,6 +20,8 @@ browser start gets repeated watch windows instead of one permanent failure.
 
 ## Pending
 
+- **`/v1/text` reads the main document only.** Text inside iframes is not
+  included yet (the frame walk exists; merging per-frame text is straightforward).
 - **Shadow DOM is not walked.** The snapshot traverses the light DOM only;
   interactive elements inside a web component's shadow root are invisible.
   Most sites keep controls in the light DOM (YouTube's consent buttons

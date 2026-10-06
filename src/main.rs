@@ -50,6 +50,7 @@ fn main() {
         Some("shot") => request("GET", &on_tab("/v1/screenshot?format=jpeg"), None)
             .and_then(|s| write_screenshot(&s, args.get(1).map(String::as_str))),
         Some("snapshot") => request("GET", &on_tab("/v1/snapshot"), None).map(|s| println!("{s}")),
+        Some("text") => request("GET", &on_tab("/v1/text"), None).map(|s| println!("{s}")),
         Some("downloads") => request("GET", "/v1/downloads", None).map(|s| println!("{s}")),
         Some("tabs") => match args.get(1).map(String::as_str) {
             None => request("GET", "/v1/tabs", None).map(|s| println!("{s}")),
@@ -125,7 +126,7 @@ fn main() {
 }
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR]\n  cu status\n  cu navigate URL\n  cu shot [FILE]\n  cu snapshot\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR]\n  cu status\n  cu navigate URL\n  cu shot [FILE]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
     );
 }
 

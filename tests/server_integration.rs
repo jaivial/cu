@@ -837,6 +837,16 @@ fn iframe_contents_are_snapshotted_and_clickable() {
 }
 
 #[test]
+fn text_returns_the_pages_visible_words() {
+    let server = TestServer::start("text", true);
+    let response = server.get("/v1/text");
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&response);
+    assert!(body.contains("the quick brown fox"), "got {body}");
+    assert!(body.contains("\"truncated\":false"), "got {body}");
+}
+
+#[test]
 fn a_context_name_cannot_be_a_path() {
     let server = TestServer::start("context-name", true);
     let response = server.get("/v1/snapshot?context=..%2Fx");
