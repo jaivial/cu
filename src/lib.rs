@@ -64,6 +64,11 @@ impl Client {
     pub fn save_session(&self, name: &str) -> Result<String, String> {
         self.request("POST", &format!("/v1/session/{name}"), "{}")
     }
+    /// Load a saved session back over the live profile (a profile copy;
+    /// works while the browser is down).
+    pub fn load_session(&self, name: &str) -> Result<String, String> {
+        self.request("POST", &format!("/v1/session/{name}/load"), "{}")
+    }
     fn request(&self, method: &str, path: &str, body: &str) -> Result<String, String> {
         let address = self
             .address
