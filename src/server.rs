@@ -362,7 +362,7 @@ pub fn route(
                 if load { "loaded\n" } else { "saved\n" },
             );
             if load {
-                ("200 OK", "application/json", "{\"loaded\":true}".into())
+                ("200 OK", "application/json", "{\"saved\":true}".into())
             } else {
                 ("200 OK", "application/json", "{\"saved\":true}".into())
             }
