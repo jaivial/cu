@@ -360,14 +360,64 @@ pub fn route(
 pub fn login_page() -> String {
     "<!doctype html><meta name=\"viewport\" content=\"width=device-width\"><title>Secure login</title><h1>Sign in</h1><p>This form sends your password directly to the computer-use server. It is never shown to the AI agent.</p><form method=post><label>Username <input name=username autocomplete=username></label><br><label>Password <input name=password type=password autocomplete=current-password></label><br><button>Submit securely</button></form>".into()
 }
+
+/// Type the credentials into the page the browser is showing and submit it.
+///
+/// Any outcome is reported as a plain bool; the secret never reaches the
+/// response or the daemon's log.
+fn fill_login_form(user: &str, password: &str, state: &AppState) -> Result<(), String> {
+    let script = format!(
+        "(function(){{var p=document.querySelector('input[type=password]');\
+         if(!p)return 'no password field';\
+         var u=document.querySelector('input[name=username],input[type=email],input[type=text]');\
+         if(u)u.value={user};\
+         p.value={password};\
+         var f=p.closest('form');\
+         if(f){{f.submit();return 'submitted';}}\
+         return 'filled';}})()",
+        user = json_string(user),
+        password = json_string(password)
+    );
+    cdp_command(
+        state.cdp_port,
+        "Runtime.evaluate",
+        &format!(
+            "{{\"expression\":{},\"returnByValue\":true}}",
+            json_string(&script)
+        ),
+    )?;
+    Ok(())
+}
+/// Page shown after the human submitted the local login form.
+fn login_result_page(delivered: bool, user: &str) -> String {
+    let note = if delivered {
+        format!(
+            "Your credentials were typed into the browser session as {user}. The password is not displayed, stored or returned."
+        )
+    } else {
+        "Your credentials were received, but the browser was not reachable, so they were not typed anywhere. Start `cu start`, navigate to the sign-in page, then submit this form again.".to_string()
+    };
+    format!("<!doctype html><title>Secure login</title><h1>Login received</h1><p>{note}</p>")
+}
+/// Handle `POST /login`.
+///
+/// The password arrives in the form the human just filled in and never leaves
+/// this function's frame: it is typed into the page the browser is showing and
+/// then dropped. It is not written to disk, logged, or echoed back.
 pub fn login_submit(body: &str, state: &AppState) -> String {
     let user = form_value(body, "username");
     let password = form_value(body, "password");
-    let _ = fs::write(state.data_dir.join("last_login_user"), user);
-    let _password_received = !password.is_empty();
-    "<h1>Login received</h1><p>Your credentials were delivered to the local session server. The password is not displayed or returned.</p>".into()
+    if user.is_empty() || password.is_empty() {
+        return [
+            "<!doctype html><title>Secure login</title><h1>Sign in</h1>",
+            "<p>Both a username and a password are needed.</p>",
+            "<p><a href=\"/login\">Try again</a></p>",
+        ]
+        .concat();
+    }
+    let delivered = fill_login_form(&user, &password, state).is_ok();
+    login_result_page(delivered, &user)
 }
-
 /// Value of a string field inside a JSON object.
 ///
 /// Tolerates the whitespace Chromium puts after a colon and understands the
@@ -620,15 +670,64 @@ pub fn json_value(input: &str, key: &str) -> Option<String> {
     }
 }
 pub fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 pub fn form_value(body: &str, key: &str) -> String {
     body.split('&')
         .find_map(|item| item.strip_prefix(&format!("{key}=")).map(url_decode))
         .unwrap_or_default()
 }
+/// `s` as a JSON string literal.
+pub fn json_string(s: &str) -> String {
+    format!("\"{}\"", json_escape(s))
+}
+
+/// Decode an `application/x-www-form-urlencoded` value.
+///
+/// `+` means space and `%XX` is a byte; only `+` used to be handled, so a
+/// password containing `+`, `%` or a non-ASCII character arrived wrong.
 pub fn url_decode(s: &str) -> String {
-    s.replace('+', " ")
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 pub fn random_token() -> String {
     let now = SystemTime::now()
