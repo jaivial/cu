@@ -558,3 +558,43 @@ fn navigate_reports_how_long_the_page_took_to_settle() {
         "navigate result lost: {body}"
     );
 }
+
+#[test]
+fn stopping_the_daemon_closes_its_browser() {
+    let dir = std::env::temp_dir().join(format!("cu-it-shutdown-{}", std::process::id()));
+    let _ = remove_dir(&dir);
+    std::fs::create_dir_all(&dir).expect("data dir");
+    let marker = dir.join("closed");
+    let (port, cdp_port) = (free_port(), free_port());
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_cu"))
+        .args(["start", "--port", &port.to_string(), "--data"])
+        .arg(&dir)
+        .env(
+            "CU_BROWSER",
+            env!("CARGO_MANIFEST_DIR").to_owned() + "/tests/fake_chromium.py",
+        )
+        .env("CU_CDP_PORT", cdp_port.to_string())
+        .env("FAKE_CHROMIUM_CLOSED", &marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn cu");
+    // The browser is up once a page action goes through.
+    let token = loop {
+        if let Ok(config) = std::fs::read_to_string(dir.join("server.json")) {
+            if let Some(token) = server::json_value(&config, "token") {
+                if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    break token;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let client = cu::Client::new(format!("127.0.0.1:{port}"), token);
+    client.snapshot().expect("browser came up");
+    let _ = Command::new("kill").arg(daemon.id().to_string()).status();
+    let _ = daemon.wait();
+    let closed = std::fs::read_to_string(&marker).unwrap_or_default();
+    let _ = remove_dir(&dir);
+    assert_eq!(closed, "closed\n", "the browser outlived its daemon");
+}

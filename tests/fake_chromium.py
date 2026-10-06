@@ -9,11 +9,19 @@ without launching a real browser. Both run on a single port, like Chromium's
 import base64
 import hashlib
 import json
+import os
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PORT = int(sys.argv[1])
+# Started by the tests with the port as the first argument, or by the daemon
+# itself as `CU_BROWSER`, in which case it reads Chromium's own flag.
+PORT = next(
+    (int(a.split("=", 1)[1]) for a in sys.argv if a.startswith("--remote-debugging-port=")),
+    None,
+) or int(sys.argv[1])
+# Where to record that the browser was told to close (`Browser.close`).
+CLOSED_MARKER = os.environ.get("FAKE_CHROMIUM_CLOSED")
 # Big enough to force the 64-bit websocket length form that a real screenshot
 # uses, so the frame reader cannot get away with the 16-bit one alone.
 PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"fake-png-bytes" * 8000).decode()
@@ -43,6 +51,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/json":
             self.send_discovery()
+        elif self.path == "/json/version":
+            self.send_json(
+                {
+                    "Browser": "FakeChromium/1.0",
+                    "webSocketDebuggerUrl": "ws://127.0.0.1:%d/devtools/browser/B1" % PORT,
+                }
+            )
         elif self.path.startswith("/devtools/"):
             self.serve_websocket()
         else:
@@ -80,6 +95,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_json(self, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def send_empty(self, code):
         self.send_response(code)
         self.send_header("Content-Length", "0")
@@ -97,9 +120,14 @@ class Handler(BaseHTTPRequestHandler):
                 message = json.loads(frame.decode())
             except ValueError:
                 break
-            self.reply(
-                self.result_for(message.get("method", ""), message.get("params"))
-            )
+            method = message.get("method", "")
+            reply = self.result_for(method, message.get("params"))
+            reply["id"] = message.get("id", 1)
+            self.reply(reply)
+            if method == "Browser.close":
+                if CLOSED_MARKER:
+                    open(CLOSED_MARKER, "w").write("closed\n")
+                os._exit(0)
 
     def handshake(self):
         key = (self.headers.get("Sec-WebSocket-Key") or "").strip()

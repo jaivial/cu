@@ -92,6 +92,7 @@ fn start(args: &[String]) -> Result<(), String> {
     // returns in single-digit milliseconds instead of blocking ~0.5 s on
     // Chromium, and the browser warms up while the agent reads its first tool
     // result. Actions that need the browser wait on the readiness signal.
+    server::exit_on_signal(cdp_port);
     let browser = server::BrowserState::new();
     server::spawn_browser_thread(data.clone(), cdp_port, Arc::clone(&browser));
     eprintln!("cu listening on http://127.0.0.1:{port}; browser DevTools on 127.0.0.1:{cdp_port}");

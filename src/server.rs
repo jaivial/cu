@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
@@ -192,13 +193,90 @@ pub fn spawn_browser_thread(
     thread::spawn(move || match launch_browser(&data, cdp_port) {
         Ok(mut child) => {
             let _ = child.stdin.take();
+            let pid = child.id();
             match wait_for_browser(cdp_port, BROWSER_START_TIMEOUT, Some(&mut child)) {
-                Ok(()) => browser.mark_ready(),
+                Ok(()) => {
+                    BROWSER_PID.store(pid, Ordering::SeqCst);
+                    browser.mark_ready()
+                }
                 Err(e) => browser.mark_failed(e),
             }
         }
         Err(e) => browser.mark_failed(e),
     })
+}
+
+/// Pid of the browser this daemon launched, 0 while there is none.
+static BROWSER_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Close the browser this daemon launched.
+///
+/// A daemon that exits used to leave its whole Chromium tree behind -- eight
+/// processes and a quarter of a gigabyte each time `cu start` was re-run.
+/// `Browser.close` lets Chromium flush the profile (cookies, local storage)
+/// before it goes; SIGTERM is the fallback for a browser that does not answer.
+pub fn shutdown_browser(cdp_port: u16) {
+    let pid = BROWSER_PID.swap(0, Ordering::SeqCst);
+    if pid == 0 {
+        return;
+    }
+    let _ = cdp_browser_command(cdp_port, "Browser.close", "{}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline && process_alive(pid) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if process_alive(pid) {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+}
+
+/// Close the browser and exit when the daemon is asked to stop.
+///
+/// SIGTERM and SIGINT are blocked in every thread and collected by one thread
+/// with `sigwait`, so shutdown runs as ordinary code rather than inside a
+/// signal handler. Must be called before any other thread is spawned so they
+/// all inherit the mask.
+pub fn exit_on_signal(cdp_port: u16) {
+    unsafe extern "C" {
+        fn sigemptyset(set: *mut SigSet) -> i32;
+        fn sigaddset(set: *mut SigSet, sig: i32) -> i32;
+        fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32;
+        fn sigwait(set: *const SigSet, sig: *mut i32) -> i32;
+    }
+    /// `sigset_t` is 128 bytes on Linux/glibc and musl.
+    #[repr(C)]
+    struct SigSet([u64; 16]);
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+    const SIG_BLOCK: i32 = 0;
+    let mut set = SigSet([0; 16]);
+    // SAFETY: plain libc calls on a correctly sized, owned sigset.
+    unsafe {
+        sigemptyset(&mut set);
+        sigaddset(&mut set, SIGINT);
+        sigaddset(&mut set, SIGTERM);
+        pthread_sigmask(SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+    thread::spawn(move || {
+        let mut sig = 0;
+        // SAFETY: `set` was initialised above and lives in this closure.
+        unsafe { sigwait(&set, &mut sig) };
+        shutdown_browser(cdp_port);
+        std::process::exit(0);
+    });
+}
+
+fn process_alive(pid: u32) -> bool {
+    // A zombie still has a /proc entry; it is gone in every way that matters.
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map(|s| {
+            !s.rsplit(')')
+                .next()
+                .unwrap_or("")
+                .trim_start()
+                .starts_with('Z')
+        })
+        .unwrap_or(false)
 }
 
 /// Remove the per-process locks a killed browser left in a profile.
@@ -950,6 +1028,11 @@ impl CdpConnection {
             .into_iter()
             .next()
             .ok_or("Chromium did not expose a page target")?;
+        Self::connect(&ws)
+    }
+
+    /// Complete the websocket handshake with one DevTools endpoint.
+    fn connect(ws: &str) -> Result<Self, String> {
         let (host, path) = ws
             .strip_prefix("ws://")
             .and_then(|s| s.split_once('/'))
@@ -1076,6 +1159,14 @@ pub fn cdp_command(cdp_port: u16, method: &str, params: &str) -> Result<String, 
     }
     unreachable!("the retry loop returns on its second attempt")
 }
+/// Run one command on the browser-level DevTools endpoint (not a page).
+fn cdp_browser_command(cdp_port: u16, method: &str, params: &str) -> Result<String, String> {
+    let version = http_get(&format!("127.0.0.1:{cdp_port}"), "/json/version")?;
+    let ws = json_string_value(&version, "webSocketDebuggerUrl")
+        .ok_or("Chromium did not expose a browser endpoint")?;
+    CdpConnection::connect(&ws)?.call(method, params)
+}
+
 /// A DevTools HTTP request may not be answered with `Connection: close`, so the
 /// response has to be framed rather than read to EOF: `read_to_string` used to
 /// block for ever on a browser that kept the socket open and the whole daemon
