@@ -299,17 +299,31 @@ fn navigate_without_a_url_is_rejected() {
 }
 
 #[test]
-fn screenshot_returns_a_png() {
+fn a_png_is_returned_when_it_is_asked_for() {
     let server = TestServer::start("shot", true);
+    let response = server.get("/v1/screenshot?format=png");
+    assert_eq!(status_code(&response), "200");
+    let body = body_of(&response);
+    let encoded = server::json_value(body, "png_base64").expect("png_base64 payload");
+    let decoded = server::decode_base64(&encoded).expect("valid base64");
+    assert!(decoded.starts_with(b"\x89PNG\r\n\x1a\n"), "got {decoded:?}");
+}
+
+#[test]
+fn the_default_screenshot_is_a_fast_jpeg() {
+    let server = TestServer::start("shot-jpeg", true);
     let response = server.get("/v1/screenshot");
     assert_eq!(status_code(&response), "200");
     let body = body_of(&response);
-    let encoded = body
-        .trim_start_matches("{\"png_base64\":\"")
-        .trim_end_matches("\"}")
-        .to_string();
+    // The fast default: lossy, small, and labelled so the client names the file
+    // correctly.
+    assert_eq!(server::json_value(body, "format").as_deref(), Some("jpeg"));
+    let encoded = server::json_value(body, "jpeg_base64").expect("jpeg_base64 payload");
     let decoded = server::decode_base64(&encoded).expect("valid base64");
-    assert!(decoded.starts_with(b"\x89PNG\r\n\x1a\n"), "got {decoded:?}");
+    assert!(
+        decoded.starts_with(b"\x89PNG") || decoded.starts_with(&[0xff, 0xd8]),
+        "got {decoded:?}"
+    );
 }
 
 #[test]

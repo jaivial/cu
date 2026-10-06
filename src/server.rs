@@ -413,10 +413,13 @@ fn wait_until_ready(state: &AppState) -> Result<(), String> {
 
 pub fn route(
     method: &str,
-    path: &str,
+    full_path: &str,
     body: &str,
     state: &AppState,
 ) -> (&'static str, &'static str, String) {
+    // A query string selects options (`?format=png`), never a different
+    // resource, so the match below is on the path alone.
+    let path = full_path.split('?').next().unwrap_or("");
     // Only the routes that drive the page wait for the browser: `status`, the
     // login form and the 401/404 paths answer instantly whatever Chromium is
     // doing, which is what makes `cu start` return at once.
@@ -479,29 +482,7 @@ pub fn route(
                 ),
             }
         }
-        ("GET", "/v1/screenshot") => {
-            match cdp_command(
-                state.cdp_port,
-                "Page.captureScreenshot",
-                "{\"format\":\"png\"}",
-            ) {
-                Ok(result) => (
-                    "200 OK",
-                    "application/json",
-                    format!(
-                        "{{\"png_base64\":{}}}",
-                        json_value(&result, "data")
-                            .map(|v| format!("\"{v}\""))
-                            .unwrap_or_else(|| "null".into())
-                    ),
-                ),
-                Err(error) => (
-                    "502 Bad Gateway",
-                    "application/json",
-                    format!("{{\"error\":\"{}\"}}", json_escape(&error)),
-                ),
-            }
-        }
+        ("GET", "/v1/screenshot") => screenshot(state, query(full_path)),
         ("GET", "/v1/snapshot") => match snapshot_pages(state, true) {
             Ok(text) => ("200 OK", "application/json", text),
             Err(error) => (
@@ -570,6 +551,58 @@ pub fn route(
 
 pub fn login_page() -> String {
     "<!doctype html><meta name=\"viewport\" content=\"width=device-width\"><title>Secure login</title><h1>Sign in</h1><p>This form sends your password directly to the computer-use server. It is never shown to the AI agent.</p><form method=post><label>Username <input name=username autocomplete=username></label><br><label>Password <input name=password type=password autocomplete=current-password></label><br><button>Submit securely</button></form>".into()
+}
+
+/// Take a screenshot.
+///
+/// `format=jpeg` (default) and a modest quality are what an agent wants: a
+/// model reads a lossy frame just as well and the capture, encode and transfer
+/// all shrink, which is most of the latency of `Page.captureScreenshot`. PNG
+/// is still available with `format=png`.
+fn screenshot(state: &AppState, query: &str) -> (&'static str, &'static str, String) {
+    let png = form_value(query, "format") == "png";
+    let quality = form_value(query, "quality")
+        .parse::<u32>()
+        .ok()
+        .filter(|q| (1..=100).contains(q))
+        .unwrap_or(60);
+    let (format, extra) = if png {
+        ("png", String::new())
+    } else {
+        (
+            "jpeg",
+            format!(",\"quality\":{quality},\"optimizeForSpeed\":true"),
+        )
+    };
+    match cdp_command(
+        state.cdp_port,
+        "Page.captureScreenshot",
+        &format!("{{\"format\":\"{format}\"{extra}}}"),
+    ) {
+        Ok(result) => {
+            let field = if png { "png_base64" } else { "jpeg_base64" };
+            (
+                "200 OK",
+                "application/json",
+                format!(
+                    "{{\"format\":\"{format}\",\"{field}\":{}}}",
+                    json_value(&result, "data")
+                        .map(|v| format!("\"{v}\""))
+                        .unwrap_or_else(|| "null".into())
+                ),
+            )
+        }
+        Err(error) => (
+            "502 Bad Gateway",
+            "application/json",
+            format!("{{\"error\":\"{}\"}}", json_escape(&error)),
+        ),
+    }
+}
+
+/// The query string of a request path, without the `?`.
+fn query(path: &str) -> &str {
+    path.split_once('?').map(|(_, q)| q).unwrap_or("")
 }
 
 /// Build a `GET /v1/snapshot` response body.

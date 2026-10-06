@@ -25,7 +25,7 @@ fn main() {
             .map(|s| println!("{s}")),
             None => Err("usage: cu navigate <url>".into()),
         },
-        Some("shot") => request("GET", "/v1/screenshot", None)
+        Some("shot") => request("GET", "/v1/screenshot?format=jpeg", None)
             .and_then(|s| write_screenshot(&s, args.get(1).map(String::as_str))),
         Some("snapshot") => request("GET", "/v1/snapshot", None).map(|s| println!("{s}")),
         Some("login") => {
@@ -124,13 +124,16 @@ fn request(method: &str, path: &str, body: Option<&str>) -> Result<String, Strin
     Ok(response.split("\r\n\r\n").nth(1).unwrap_or("").into())
 }
 fn write_screenshot(response: &str, path: Option<&str>) -> Result<(), String> {
-    let image =
-        server::json_value(response, "png_base64").ok_or("server did not return an image")?;
-    fs::write(
-        path.unwrap_or("screenshot.png"),
-        server::decode_base64(&image)?,
-    )
-    .map_err(|e| e.to_string())
+    // The format is chosen by the server, so the client just saves what came
+    // back under the name that matches it.
+    let (field, default_path) = if response.contains("\"format\":\"png\"") {
+        ("png_base64", "screenshot.png")
+    } else {
+        ("jpeg_base64", "screenshot.jpg")
+    };
+    let image = server::json_value(response, field).ok_or("server did not return an image")?;
+    fs::write(path.unwrap_or(default_path), server::decode_base64(&image)?)
+        .map_err(|e| e.to_string())
 }
 fn session(args: &[String]) -> Result<(), String> {
     let action = args
