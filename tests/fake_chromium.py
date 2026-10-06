@@ -32,6 +32,19 @@ PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"fake-png-bytes" * 8000).decode()
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 # The in-page walk returns JSON; rendering it compactly is the daemon's job.
 # Refs are what the agent acts on, so they must survive the round trip.
+# When the page under test has an iframe, the frame tree gains a child and
+# walks run in its isolated world (context id 7), like a real Chromium.
+FRAMES_ON = {"on": False}
+CHILD_SNAPSHOT = json.dumps(
+    {
+        "url": "https://example.test/child",
+        "title": "child",
+        "nodes": [{"ref": "e9", "role": "textbox", "name": "inner"}],
+        "headings": [],
+        "next": 9,
+    },
+    separators=(",", ":"),
+)
 FAKE_SNAPSHOT = json.dumps(
     {
         "url": "https://example.test/",
@@ -193,13 +206,15 @@ class Handler(BaseHTTPRequestHandler):
         if method == "Page.navigate":
             # A URL the browser cannot load answers with `errorText`, like a
             # real Chromium against a name that does not resolve.
-            if (params or {}).get("url", "").startswith("fail://"):
+            url = (params or {}).get("url", "")
+            if url.startswith("fail://"):
                 return {
                     "result": {
                         "frameId": "f",
                         "errorText": "net::ERR_NAME_NOT_RESOLVED",
                     }
                 }
+            FRAMES_ON["on"] = "frames" in url
             return {"id": 1, "result": {"frameId": "f", "url": "https://example.test"}}
         if method == "Target.createBrowserContext":
             return {"result": {"browserContextId": "CTX%d" % (len(CONTEXT_TABS) + 1)}}
@@ -215,7 +230,31 @@ class Handler(BaseHTTPRequestHandler):
                 del CONTEXT_TABS[target]
             return {"result": {}}
         if method == "Page.getFrameTree":
+            if FRAMES_ON["on"]:
+                return {
+                    "result": {
+                        "frameTree": {
+                            "frame": {"id": "MAINFRAME", "url": "https://example.test/frames"},
+                            "childFrames": [
+                                {"frame": {"id": "CHILD1", "url": "https://example.test/child"}}
+                            ],
+                        }
+                    }
+                }
             return {"result": {"frameTree": {"frame": {"id": "MAINFRAME", "url": "about:blank"}}}}
+        if method == "Page.createIsolatedWorld":
+            return {"result": {"executionContextId": 7}}
+        if method == "DOM.getFrameOwner":
+            return {"result": {"backendNodeId": 42}}
+        if method == "DOM.resolveNode":
+            return {"result": {"object": {"objectId": "frame-owner-42"}}}
+        if method == "Runtime.callFunctionOn":
+            # scrollIntoView + getBoundingClientRect, as the daemon asks for.
+            return {
+                "result": {
+                    "result": {"type": "string", "value": '{"x":10,"y":20}'}
+                }
+            }
         if method in ("Input.dispatchMouseEvent", "Input.insertText", "Input.dispatchKeyEvent"):
             INPUT_LOG.append(method)
             return {"result": {}}
@@ -223,6 +262,19 @@ class Handler(BaseHTTPRequestHandler):
             return {"id": 1, "result": {"data": PNG}}
         if method == "Runtime.evaluate":
             expr = (params or {}).get("expression", "")
+            if "cuAgentSnapshot" in expr:
+                # The walk: in an iframe's isolated world it shows the frame,
+                # in the main world the page itself. (The walk embeds the
+                # registry, which mentions elementFromPoint, so this must be
+                # checked before the click-point branch below.)
+                if (params or {}).get("contextId") is not None:
+                    value = CHILD_SNAPSHOT
+                else:
+                    value = FAKE_SNAPSHOT
+                return {"id": 1, "result": {"result": {"type": "string", "value": value}}}
+            if "elementFromPoint" in expr:
+                # The top document sees the iframe at the click point.
+                return {"id": 1, "result": {"result": {"type": "string", "value": "IFRAME"}}}
             if "document.readyState" in expr:
                 # The smart wait asks whether the page is usable; answer that it
                 # is, so navigate is not held for the whole settle budget.
@@ -244,13 +296,6 @@ class Handler(BaseHTTPRequestHandler):
                 return {"result": {"result": {"type": "string", "value": value}}}
             if "__cu.focus(" in expr or "__cu.select(" in expr:
                 return {"result": {"result": {"type": "string", "value": "{}"}}}
-            if "cuAgentSnapshot" in expr:
-                return {
-                    "id": 1,
-                    "result": {
-                        "result": {"type": "string", "value": FAKE_SNAPSHOT}
-                    },
-                }
             return {"id": 1, "result": {"result": {"type": "undefined"}}}
         return {"id": 1, "result": {}}
 

@@ -790,6 +790,53 @@ fn the_last_tab_cannot_be_closed_but_another_can() {
 }
 
 #[test]
+fn iframe_contents_are_snapshotted_and_clickable() {
+    let server = TestServer::start("frames", true);
+    let response = server.post("/v1/navigate", r#"{"url":"https://example.test/frames"}"#);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+
+    // The snapshot reaches into the iframe: frame line, and its elements.
+    let response = server.get("/v1/snapshot");
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&response);
+    assert!(
+        body.contains("- frame: https://example.test/child"),
+        "got {body}"
+    );
+    assert!(body.contains("ref=e9"), "no iframe ref in {body}");
+
+    // Clicking an iframe ref enters the frame, adds the iframe's own offset
+    // and dispatches the mouse at main-document coordinates.
+    let response = server.post("/v1/click", r#"{"ref":"e9"}"#);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    assert!(
+        body_of(&response).contains("\"ok\":true"),
+        "got {}",
+        body_of(&response)
+    );
+    assert_eq!(
+        input_log(&server),
+        r#"["Input.dispatchMouseEvent", "Input.dispatchMouseEvent"]"#
+    );
+
+    // The closing snapshot of a batch sees the frame too, and an unknown
+    // ref is still the clear error an agent can act on.
+    let response = server.post("/v1/act", r#"{"actions":[{"do":"click","ref":"e9"}]}"#);
+    let body = body_of(&response);
+    assert!(body.contains("\"ok\":true"), "got {body}");
+    assert!(
+        body.contains("- frame: https://example.test/child"),
+        "got {body}"
+    );
+    let response = server.post("/v1/click", r#"{"ref":"e404"}"#);
+    assert!(
+        body_of(&response).contains("take a new snapshot"),
+        "got {}",
+        body_of(&response)
+    );
+}
+
+#[test]
 fn a_context_name_cannot_be_a_path() {
     let server = TestServer::start("context-name", true);
     let response = server.get("/v1/snapshot?context=..%2Fx");
