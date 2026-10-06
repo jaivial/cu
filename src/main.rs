@@ -27,6 +27,7 @@ fn main() {
         },
         Some("shot") => request("GET", "/v1/screenshot", None)
             .and_then(|s| write_screenshot(&s, args.get(1).map(String::as_str))),
+        Some("snapshot") => request("GET", "/v1/snapshot", None).map(|s| println!("{s}")),
         Some("login") => {
             println!(
                 "Open http://127.0.0.1:{DEFAULT_PORT}/login in a browser. Passwords go directly to the server."
@@ -46,7 +47,7 @@ fn main() {
 }
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR]\n  cu status\n  cu navigate URL\n  cu shot [FILE]\n  cu login\n  cu session save NAME"
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR]\n  cu status\n  cu navigate URL\n  cu shot [FILE]\n  cu snapshot\n  cu login\n  cu session save NAME"
     );
 }
 

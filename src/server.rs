@@ -488,6 +488,14 @@ pub fn route(
                 ),
             }
         }
+        ("GET", "/v1/snapshot") => match snapshot_pages(state, true) {
+            Ok(text) => ("200 OK", "application/json", text),
+            Err(error) => (
+                "502 Bad Gateway",
+                "application/json",
+                format!("{{\"error\":\"{}\"}}", json_escape(&error)),
+            ),
+        },
         ("POST", p) if p.starts_with("/v1/session/") => {
             let load = p.ends_with("/load");
             let name = p
@@ -548,6 +556,99 @@ pub fn route(
 
 pub fn login_page() -> String {
     "<!doctype html><meta name=\"viewport\" content=\"width=device-width\"><title>Secure login</title><h1>Sign in</h1><p>This form sends your password directly to the computer-use server. It is never shown to the AI agent.</p><form method=post><label>Username <input name=username autocomplete=username></label><br><label>Password <input name=password type=password autocomplete=current-password></label><br><button>Submit securely</button></form>".into()
+}
+
+/// Build a `GET /v1/snapshot` response body.
+///
+/// The walk runs in the page, so this is one CDP round trip returning a few
+/// hundred bytes instead of a DOM dump the daemon then has to shrink.
+pub fn snapshot_pages(state: &AppState, compact: bool) -> Result<String, String> {
+    let result = cdp_command(
+        state.cdp_port,
+        "Runtime.evaluate",
+        &format!(
+            "{{\"expression\":{},\"returnByValue\":true}}",
+            json_string(snapshot::SNAPSHOT_JS)
+        ),
+    )?;
+    // Runtime.evaluate wraps the string in {"result":{"result":{"value":...}}}.
+    // Runtime.evaluate wraps the returned string in
+    // {"result":{"result":{"type":"string","value":"..."}}}; look one level in
+    // and fall back to the raw reply so both shapes work.
+    let value = json_objects(&result)
+        .iter()
+        .filter_map(|o| json_string_value(o, "value"))
+        .next()
+        .or_else(|| json_string_value(&result, "value"))
+        .ok_or_else(|| "page did not return a snapshot".to_string())?;
+    let snap = parse_snapshot(&value)?;
+    Ok(if compact {
+        format!("{{\"snapshot\":{}}}", json_string(&snap.render()))
+    } else {
+        format!(
+            "{{\"snapshot\":{},\"url\":{},\"title\":{},\"nodes\":{}}}",
+            json_string(&snap.render()),
+            json_string(&snap.url),
+            json_string(&snap.title),
+            value
+        )
+    })
+}
+
+/// Parse the JSON the in-page walk produced.
+pub fn parse_snapshot(json: &str) -> Result<snapshot::Snapshot, String> {
+    let url = json_string_value(json, "url").unwrap_or_default();
+    let title = json_string_value(json, "title").unwrap_or_default();
+    let nodes_block = json_array(json, "nodes").unwrap_or_default();
+    let mut nodes = Vec::new();
+    for object in json_objects(&nodes_block) {
+        nodes.push(snapshot::Node {
+            ref_id: json_string_value(&object, "ref").unwrap_or_default(),
+            role: json_string_value(&object, "role").unwrap_or_default(),
+            name: json_string_value(&object, "name").unwrap_or_default(),
+            target: None,
+        });
+    }
+    Ok(snapshot::Snapshot { url, title, nodes })
+}
+
+/// The top-level array bound to `key`, as a string.
+pub fn json_array(input: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let start = input.find(&needle)?.checked_add(needle.len())?;
+    let rest = input[start..].trim_start().strip_prefix(':')?.trim_start();
+    if !rest.starts_with('[') {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, byte) in bytes.iter().enumerate() {
+        if in_string {
+            match byte {
+                b'\\' => escaped = !escaped,
+                b'"' if !escaped => in_string = false,
+                _ => {}
+            }
+            if *byte != b'\\' {
+                escaped = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(rest[..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Type the credentials into the page the browser is showing and submit it.
@@ -1085,4 +1186,109 @@ mod tests {
         assert_eq!(find(b"abc", b"\r\n\r\n"), None);
         assert_eq!(find(b"", b"\r\n\r\n"), None);
     }
+}
+
+/// Compact, LLM-oriented snapshot of the current page.
+///
+/// This is what makes an agent fast in practice: instead of shipping the whole
+/// DOM (or a screenshot the model has to OCR) it gets one short line per
+/// interactive element, each carrying a stable `ref` the next action can name.
+/// Playwright MCP, browser-use and Stagehand all converge on this shape.
+pub mod snapshot {
+    /// One element worth telling the model about.
+    pub struct Node {
+        /// Stable handle the agent uses to act on this element.
+        pub ref_id: String,
+        /// `link`, `button`, `textbox`, `heading`, ...
+        pub role: String,
+        /// Accessible name, already collapsed to one line.
+        pub name: String,
+        /// Interactive element this node can be clicked into, if any.
+        pub target: Option<String>,
+    }
+
+    /// The whole snapshot for a page.
+    pub struct Snapshot {
+        pub url: String,
+        pub title: String,
+        pub nodes: Vec<Node>,
+    }
+
+    impl Snapshot {
+        /// Render as the compact text an agent reads.
+        pub fn render(&self) -> String {
+            let mut out = String::new();
+            out.push_str(&format!("- url: {}\n", self.url));
+            if !self.title.is_empty() {
+                out.push_str(&format!("- page: {}\n", self.title));
+            }
+            for node in &self.nodes {
+                out.push_str(&format!(
+                    "- ref={} {} \"{}\"\n",
+                    node.ref_id, node.role, node.name
+                ));
+            }
+            out
+        }
+    }
+
+    /// JavaScript that walks the a11y-relevant tree and returns compact JSON.
+    ///
+    /// Everything happens in the page, so only the small result crosses CDP --
+    /// that is the whole point of a snapshot: one round trip, a few hundred
+    /// bytes, instead of a full DOM dump.
+    pub const SNAPSHOT_JS: &str = r#"
+/* cuAgentSnapshot */
+(() => {
+  const INTERACTIVE = 'a[href],button,input,select,textarea,[role=button],[role=link],[role=checkbox],[role=tab],[role=menuitem]';
+  const visible = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const s = getComputedStyle(el);
+    return s.visibility !== 'hidden' && s.display !== 'none';
+  };
+  const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const name = (el) => {
+    const labelledby = el.getAttribute('aria-labelledby');
+    if (labelledby) {
+      const t = clean(document.getElementById(labelledby)?.textContent);
+      if (t) return t;
+    }
+    const a = el.getAttribute('aria-label');
+    if (a) return clean(a);
+    const label = el.labels && el.labels[0];
+    if (label) return clean(label.textContent);
+    const img = el.querySelector('img[alt]');
+    if (img) return img.alt;
+    return clean(el.textContent) || clean(el.getAttribute('placeholder')) || clean(el.value) || '';
+  };
+  const nodes = [];
+  for (const el of document.querySelectorAll(INTERACTIVE)) {
+    if (!visible(el)) continue;
+    if (el.closest('[aria-hidden=true]')) continue;
+    const role = el.getAttribute('role')
+      || ({A:'link',BUTTON:'button',SELECT:'combobox',TEXTAREA:'textbox'})
+        [el.tagName]
+      || (el.tagName === 'INPUT'
+        ? ({text:'textbox',search:'searchbox',email:'textbox',password:'textbox',
+            number:'spinbutton',checkbox:'checkbox',radio:'radio',file:'button'})[el.type] || 'textbox'
+        : 'generic');
+    nodes.push({ ref: 'e' + (nodes.length + 1), role, name: name(el).slice(0, 120) });
+    if (nodes.length >= 200) break;
+  }
+  const headings = [];
+  for (const h of document.querySelectorAll('h1,h2,h3,[role=heading]')) {
+    if (!visible(h)) continue;
+    const t = clean(h.textContent).slice(0, 120);
+    if (t) headings.push(t);
+    if (headings.length >= 20) break;
+  }
+  return JSON.stringify({
+    url: location.href,
+    title: document.title,
+    nodes,
+    headings,
+  });
+})()
+"#;
 }

@@ -498,3 +498,29 @@ fn submitting_the_login_form_types_into_the_browser() {
     assert!(!body.contains("s3cret"), "password leaked: {body}");
     assert!(body.contains("Login received"), "got {body}");
 }
+
+#[test]
+fn a_snapshot_is_compact_and_carries_refs() {
+    let server = TestServer::start("snapshot", true);
+    let response = server.get("/v1/snapshot");
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&response);
+    // Compact means compact: a snapshot is a few hundred bytes, not a DOM dump.
+    assert!(
+        body.len() < 1024,
+        "snapshot should be small, got {} bytes: {body}",
+        body.len()
+    );
+    assert!(body.contains("ref=e1"), "no refs in {body}");
+    assert!(body.contains("link"), "no roles in {body}");
+}
+
+#[test]
+fn a_snapshot_needs_the_browser() {
+    let server = TestServer::start("snapshot-no-browser", false);
+    let response = server.get("/v1/snapshot");
+    // Without a page to walk there is nothing to snapshot; that must be an
+    // error an agent can act on, not an empty 200.
+    assert_eq!(status_code(&response), "503");
+    assert!(body_of(&response).contains("error"));
+}

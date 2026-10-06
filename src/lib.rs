@@ -27,6 +27,13 @@ impl Client {
             &format!("{{\"url\":\"{}\"}}", escape(url)),
         )
     }
+    /// Compact, LLM-friendly snapshot of the current page.
+    ///
+    /// A few hundred bytes per call instead of a DOM dump or an image to OCR,
+    /// which is what makes the read step of an agent loop cheap.
+    pub fn snapshot(&self) -> Result<String, String> {
+        self.request("GET", "/v1/snapshot", "")
+    }
     pub fn save_session(&self, name: &str) -> Result<String, String> {
         self.request("POST", &format!("/v1/session/{name}"), "{}")
     }

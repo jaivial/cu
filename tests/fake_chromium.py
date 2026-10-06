@@ -18,6 +18,20 @@ PORT = int(sys.argv[1])
 # uses, so the frame reader cannot get away with the 16-bit one alone.
 PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"fake-png-bytes" * 8000).decode()
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+# The in-page walk returns JSON; rendering it compactly is the daemon's job.
+# Refs are what the agent acts on, so they must survive the round trip.
+FAKE_SNAPSHOT = json.dumps(
+    {
+        "url": "https://example.test/",
+        "title": "bench",
+        "nodes": [
+            {"ref": "e1", "role": "link", "name": "one"},
+            {"ref": "e2", "role": "textbox", "name": "q"},
+        ],
+        "headings": ["Bench target"],
+    },
+    separators=(",", ":"),
+)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -83,7 +97,9 @@ class Handler(BaseHTTPRequestHandler):
                 message = json.loads(frame.decode())
             except ValueError:
                 break
-            self.reply(self.result_for(message.get("method", "")))
+            self.reply(
+                self.result_for(message.get("method", ""), message.get("params"))
+            )
 
     def handshake(self):
         key = (self.headers.get("Sec-WebSocket-Key") or "").strip()
@@ -130,11 +146,21 @@ class Handler(BaseHTTPRequestHandler):
         return bytes(data[i] ^ mask[i % 4] for i in range(length))
 
     @staticmethod
-    def result_for(method):
+    def result_for(method, params=None):
         if method == "Page.navigate":
             return {"id": 1, "result": {"frameId": "f", "url": "https://example.test"}}
         if method == "Page.captureScreenshot":
             return {"id": 1, "result": {"data": PNG}}
+        if method == "Runtime.evaluate":
+            expr = (params or {}).get("expression", "")
+            if "cuAgentSnapshot" in expr:
+                return {
+                    "id": 1,
+                    "result": {
+                        "result": {"type": "string", "value": FAKE_SNAPSHOT}
+                    },
+                }
+            return {"id": 1, "result": {"result": {"type": "undefined"}}}
         return {"id": 1, "result": {}}
 
     def reply(self, obj):
