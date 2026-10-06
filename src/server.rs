@@ -2148,16 +2148,21 @@ mod pool_tests {
     #[test]
     fn a_pooled_connection_is_reused_and_capped() {
         let port = free_loopback_port();
-        let pool = cdp_pool(port);
-        // Nothing is cached yet, and the pool is per browser.
+        let pool = cdp_pool(&Tab::default_for(port));
+        // Nothing is cached yet, and the pool is per tab.
         assert!(
             pool.lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .idle
                 .is_empty()
         );
+        let other = Tab {
+            cdp_port: port,
+            target: Some("CTX-TAB".into()),
+        };
+        assert!(!std::ptr::eq(pool, cdp_pool(&other)));
         assert!(
-            cdp_pool(port + 1)
+            cdp_pool(&Tab::default_for(port + 1))
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .idle
