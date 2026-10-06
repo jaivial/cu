@@ -47,23 +47,83 @@ pub fn wait_for_cdp(cdp_port: u16, timeout: Duration) -> Result<(), String> {
     ))
 }
 
+/// Remove the per-process locks a killed browser left in a profile.
+///
+/// Chromium exits without cleaning `Singleton*` up when it is killed, and then
+/// refuses every later start on that profile, so a daemon can never come back
+/// up after its browser was stopped.
+fn clear_stale_locks(data: &Path) {
+    let profile = data.join("profiles/default");
+    let Ok(entries) = fs::read_dir(&profile) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("Singleton"))
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+/// Launch the persistent Chromium that owns `data/profiles/default`.
+///
+/// The DevTools port must match the port the daemon was configured with:
+/// `launch_browser` used to hard-code 9222, so a daemon started with
+/// `--port`/`CU_CDP_PORT` pointed at a browser that was listening somewhere
+/// else and every navigate/screenshot failed with "connection refused".
+///
+/// Browsers are launched headless because agents usually run without a
+/// display; set `CU_HEADLESS=0` (or `--show`) to attach one instead.
 pub fn launch_browser(data: &Path, cdp_port: u16) -> Result<Child, String> {
     let binary = env::var("CU_BROWSER").unwrap_or_else(|_| "chromium".into());
-    Command::new(binary)
+    let headless = env::var("CU_HEADLESS")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    clear_stale_locks(data);
+    let mut command = Command::new(binary);
+    command
         .arg(format!("--remote-debugging-port={cdp_port}"))
         .args([
             "--remote-allow-origins=*",
             "--no-first-run",
             "--no-default-browser-check",
-            "--user-data-dir",
+            "--disable-dev-shm-usage",
         ])
-        .arg(data.join("profiles/default"))
+        // One argument: Chromium only parses `--user-data-dir=PATH` here, and
+        // treats a separate PATH as a second target ("Multiple targets are not
+        // supported in headless mode", exit 13).
+        .arg(format!(
+            "--user-data-dir={}",
+            data.join("profiles/default").display()
+        ))
         .arg("about:blank")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::null());
+    if headless {
+        command.arg("--headless=new");
+    }
+    // Chromium writes its startup diagnostics (including "no display") to
+    // stderr; keep it so a browser that dies at once can be diagnosed.
+    let mut child = command
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("could not start Chromium (set CU_BROWSER): {e}"))
+        .map_err(|e| format!("could not start Chromium (set CU_BROWSER): {e}"))?;
+    // A browser that exits immediately (no display, bad binary) must be
+    // reported instead of leaving a daemon that answers status but can never
+    // navigate.
+    thread::sleep(Duration::from_millis(300));
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|e| format!("could not check on Chromium: {e}"))?
+    {
+        return Err(format!(
+            "Chromium exited immediately ({status}); set CU_BROWSER to a working binary"
+        ));
+    }
+    Ok(child)
 }
 
 /// Maximum accepted request head and body. Guards against unbounded buffering.
