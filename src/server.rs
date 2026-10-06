@@ -549,6 +549,9 @@ pub fn route(
             | ("GET", "/v1/screenshot")
             | ("GET", "/v1/snapshot")
             | ("POST", "/v1/navigate-and-snapshot")
+            | ("POST", "/v1/act")
+            | ("POST", "/v1/click")
+            | ("POST", "/v1/type")
     );
     if needs_browser {
         if let Err(error) = wait_until_ready(state) {
@@ -601,6 +604,11 @@ pub fn route(
             }
         }
         ("GET", "/v1/screenshot") => screenshot(state, query(full_path)),
+        // Act on snapshot refs. `/v1/act` takes a batch; `/v1/click` and
+        // `/v1/type` are the same thing for a single action.
+        ("POST", "/v1/act") => act(state, crate::actions::parse_batch(body)),
+        ("POST", "/v1/click") => act(state, single("click", body)),
+        ("POST", "/v1/type") => act(state, single("type", body)),
         ("GET", "/v1/snapshot") => match snapshot_pages(state, true) {
             Ok(text) => ("200 OK", "application/json", text),
             Err(error) => (
@@ -664,6 +672,42 @@ pub fn route(
             "application/json",
             "{\"error\":\"not found\"}".into(),
         ),
+    }
+}
+
+/// A one-action batch from a `/v1/click` or `/v1/type` body.
+fn single(kind: &str, body: &str) -> Result<crate::actions::Batch, String> {
+    let object = body.trim();
+    let inner = object
+        .strip_prefix('{')
+        .and_then(|o| o.strip_suffix('}'))
+        .ok_or("body must be a JSON object")?;
+    let action = format!("{{\"do\":{},{inner}}}", json_string(kind));
+    Ok(crate::actions::Batch {
+        actions: vec![crate::actions::parse_action(&action)?],
+        snapshot: crate::actions::flag(object, "snapshot").unwrap_or(false),
+    })
+}
+
+fn act(
+    state: &AppState,
+    batch: Result<crate::actions::Batch, String>,
+) -> (&'static str, &'static str, String) {
+    let error = |status, e: &str| {
+        (
+            status,
+            "application/json",
+            format!("{{\"error\":{}}}", json_string(e)),
+        )
+    };
+    match batch {
+        Err(e) => error("400 Bad Request", &e),
+        Ok(batch) => match crate::actions::run_batch(state.cdp_port, &batch) {
+            // A failed action is the agent's to handle, so it is a 200 with
+            // `ok:false` and the index that failed, not a transport error.
+            Ok(body) => ("200 OK", "application/json", body),
+            Err(e) => error("502 Bad Gateway", &e),
+        },
     }
 }
 
@@ -733,20 +777,13 @@ pub fn snapshot_pages(state: &AppState, compact: bool) -> Result<String, String>
         "Runtime.evaluate",
         &format!(
             "{{\"expression\":{},\"returnByValue\":true}}",
-            json_string(snapshot::SNAPSHOT_JS)
+            json_string(&snapshot::script())
         ),
     )?;
-    // Runtime.evaluate wraps the string in {"result":{"result":{"value":...}}}.
-    // Runtime.evaluate wraps the returned string in
-    // {"result":{"result":{"type":"string","value":"..."}}}; look one level in
-    // and fall back to the raw reply so both shapes work.
-    let value = json_objects(&result)
-        .iter()
-        .filter_map(|o| json_string_value(o, "value"))
-        .next()
-        .or_else(|| json_string_value(&result, "value"))
-        .ok_or_else(|| "page did not return a snapshot".to_string())?;
+    let value =
+        evaluated_string(&result).ok_or_else(|| "page did not return a snapshot".to_string())?;
     let snap = parse_snapshot(&value)?;
+    snapshot::saw_refs_up_to(&value);
     Ok(if compact {
         format!("{{\"snapshot\":{}}}", json_string(&snap.render()))
     } else {
@@ -774,7 +811,38 @@ pub fn parse_snapshot(json: &str) -> Result<snapshot::Snapshot, String> {
             target: None,
         });
     }
-    Ok(snapshot::Snapshot { url, title, nodes })
+    let headings = json_array(json, "headings")
+        .map(|block| json_strings(&block))
+        .unwrap_or_default();
+    Ok(snapshot::Snapshot {
+        url,
+        title,
+        headings,
+        nodes,
+    })
+}
+
+/// The string members of a JSON array of strings, unescaped.
+pub fn json_strings(array: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = array;
+    while let Some(start) = rest.find('"') {
+        let member = &rest[start..];
+        // End of this member: the first quote that is not escaped.
+        let mut escaped = false;
+        let Some(len) = member.char_indices().skip(1).find_map(|(i, c)| {
+            let end = !escaped && c == '"';
+            escaped = !escaped && c == '\\';
+            end.then_some(i + 1)
+        }) else {
+            break;
+        };
+        if let Some(value) = json_string_value(&format!("{{\"s\":{}}}", &member[..len]), "s") {
+            out.push(value);
+        }
+        rest = &member[len..];
+    }
+    out
 }
 
 /// The top-level array bound to `key`, as a string.
@@ -1015,7 +1083,7 @@ pub fn page_targets(discovery: &str) -> Vec<String> {
 /// handshake per action -- all of it pure overhead repeated for every navigate,
 /// screenshot and snapshot an agent takes. Keeping the connection means an
 /// action is one write and one read.
-struct CdpConnection {
+pub struct CdpConnection {
     stream: TcpStream,
     next_id: u64,
 }
@@ -1052,7 +1120,20 @@ impl CdpConnection {
     }
 
     /// Send one command and read its reply, skipping events meant for nobody.
-    fn call(&mut self, method: &str, params: &str) -> Result<String, String> {
+    pub(crate) fn call(&mut self, method: &str, params: &str) -> Result<String, String> {
+        self.call_observed(method, params, &mut |_| {})
+    }
+
+    /// Like [`call`](Self::call), but hands every event that arrives before
+    /// the reply to `observe`. That is how an action learns it started a
+    /// navigation without a second round trip: Chromium announces the
+    /// navigation before it answers the input event that caused it.
+    pub(crate) fn call_observed(
+        &mut self,
+        method: &str,
+        params: &str,
+        observe: &mut dyn FnMut(&str),
+    ) -> Result<String, String> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         let message = format!("{{\"id\":{id},\"method\":\"{method}\",\"params\":{params}}}");
@@ -1060,17 +1141,113 @@ impl CdpConnection {
             .write_all(&encode_client_frame(message.as_bytes()))
             .map_err(|e| e.to_string())?;
         loop {
-            let payload = read_frame(&mut self.stream, MAX_CDP_MESSAGE)?;
-            let text = String::from_utf8(payload).map_err(|e| e.to_string())?;
+            let text = self.next_message(MAX_CDP_MESSAGE)?;
             // Events carry no `id`; a reply for an older, abandoned command is
             // not ours either. Both are skipped rather than misreported.
-            match json_value(&text, "id") {
-                Some(got) if got == id.to_string() => return Ok(text),
+            match message_id(&text) {
+                Some(got) if got == id => return Ok(text),
                 Some(_) => continue,
-                None => continue,
+                None => observe(&text),
             }
         }
     }
+
+    /// Read events until `done` says stop or `deadline` passes.
+    ///
+    /// Returns `false` if the deadline cut a read short: the stream may then
+    /// hold half a frame, so the caller must not pool the connection again.
+    pub(crate) fn pump_events(
+        &mut self,
+        deadline: std::time::Instant,
+        observe: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<bool, String> {
+        let clean = loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break false;
+            }
+            let _ = self.stream.set_read_timeout(Some(left));
+            match self.next_message(MAX_CDP_MESSAGE) {
+                Ok(text) => {
+                    if message_id(&text).is_none() && observe(&text) {
+                        break true;
+                    }
+                }
+                Err(_) => break false,
+            }
+        };
+        let _ = self.stream.set_read_timeout(Some(CDP_HTTP_TIMEOUT));
+        Ok(clean)
+    }
+
+    fn next_message(&mut self, limit: usize) -> Result<String, String> {
+        let payload = read_frame(&mut self.stream, limit)?;
+        String::from_utf8(payload).map_err(|e| e.to_string())
+    }
+}
+
+/// The `id` of a CDP message: a reply has one at the top level, an event has
+/// none. Nested objects (a frame tree, a node) have ids of their own, so the
+/// first `"id"` in the text is not necessarily the message's.
+fn message_id(message: &str) -> Option<u64> {
+    let bytes = message.as_bytes();
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for (i, &c) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            b'"' if depth == 1 && message[i..].starts_with("\"id\"") => {
+                return json_value(&message[i..], "id")?.parse().ok();
+            }
+            b'"' => in_string = true,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Take a warm DevTools connection for a sequence of commands.
+///
+/// A batch of actions runs on one connection so its commands are ordered and
+/// pay no hand-off between them. Give it back with [`checkin`] only if every
+/// command on it completed.
+pub fn checkout(cdp_port: u16) -> Result<CdpConnection, String> {
+    let pool = cdp_pool(cdp_port);
+    let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
+    guard.take(cdp_port)
+}
+
+/// A fresh connection, for when a pooled one turned out to be dead.
+pub fn open_connection(cdp_port: u16) -> Result<CdpConnection, String> {
+    CdpConnection::open(cdp_port)
+}
+
+pub fn checkin(cdp_port: u16, connection: CdpConnection) {
+    let pool = cdp_pool(cdp_port);
+    let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
+    guard.put(connection);
+}
+
+/// The string a `Runtime.evaluate` with `returnByValue` produced.
+///
+/// The reply is `{"result":{"result":{"type":"string","value":"..."}}}`; look
+/// one level in and fall back to the raw reply so both shapes work.
+pub fn evaluated_string(reply: &str) -> Option<String> {
+    json_objects(reply)
+        .iter()
+        .filter_map(|o| json_string_value(o, "value"))
+        .next()
+        .or_else(|| json_string_value(reply, "value"))
 }
 
 /// A client-to-server websocket frame: masked, as the protocol requires.
@@ -1590,6 +1767,17 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn headings_are_read_back_with_their_escapes() {
+        assert_eq!(
+            json_strings(r#"["Hello","a \"b\" c","x\\"]"#),
+            vec!["Hello", "a \"b\" c", "x\\"]
+        );
+        assert!(json_strings("[]").is_empty());
+        let snap = parse_snapshot(r#"{"url":"u","headings":["Welcome"],"nodes":[]}"#).unwrap();
+        assert!(snap.render().contains("- heading \"Welcome\"\n"));
+    }
+
+    #[test]
     fn an_array_is_extracted_without_its_neighbours() {
         let json = r#"{"a":[1,{"b":"]"}],"nodes":[{"ref":"e1"}],"c":"[not an array]"}"#;
         let nodes = json_array(json, "nodes").expect("nodes array");
@@ -1616,6 +1804,9 @@ pub mod snapshot {
     pub struct Snapshot {
         pub url: String,
         pub title: String,
+        /// Visible headings: the page's outline, which is what tells an agent
+        /// where it landed (a result, an error, a welcome).
+        pub headings: Vec<String>,
         pub nodes: Vec<Node>,
     }
 
@@ -1627,6 +1818,9 @@ pub mod snapshot {
             if !self.title.is_empty() {
                 out.push_str(&format!("- page: {}\n", self.title));
             }
+            for heading in &self.headings {
+                out.push_str(&format!("- heading \"{heading}\"\n"));
+            }
             for node in &self.nodes {
                 out.push_str(&format!(
                     "- ref={} {} \"{}\"\n",
@@ -1634,6 +1828,33 @@ pub mod snapshot {
                 ));
             }
             out
+        }
+    }
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// First ref number a freshly loaded document hands out.
+    ///
+    /// Refs restart in every document, so `e3` from the page before a
+    /// navigation would name some other element on the page after it, and an
+    /// agent acting on a stale snapshot would click the wrong thing. Carrying
+    /// the counter over from the daemon makes a stale ref miss instead.
+    static REF_BASE: AtomicU64 = AtomicU64::new(0);
+
+    /// The full in-page script: ref registry, then the walk.
+    pub fn script() -> String {
+        format!(
+            "window.__cuBase={};{}{}",
+            REF_BASE.load(Ordering::Relaxed),
+            crate::actions::REGISTRY_JS,
+            SNAPSHOT_JS
+        )
+    }
+
+    /// Record the highest ref a page has handed out.
+    pub fn saw_refs_up_to(snapshot_json: &str) {
+        if let Some(next) = super::json_value(snapshot_json, "next").and_then(|n| n.parse().ok()) {
+            REF_BASE.fetch_max(next, Ordering::Relaxed);
         }
     }
 
@@ -1663,6 +1884,7 @@ pub mod snapshot {
     if (a) return clean(a);
     const label = el.labels && el.labels[0];
     if (label) return clean(label.textContent);
+    if (el.tagName === 'SELECT') return clean(el.selectedOptions[0]?.label);
     const img = el.querySelector('img[alt]');
     if (img) return img.alt;
     return clean(el.textContent) || clean(el.getAttribute('placeholder')) || clean(el.value) || '';
@@ -1678,7 +1900,7 @@ pub mod snapshot {
         ? ({text:'textbox',search:'searchbox',email:'textbox',password:'textbox',
             number:'spinbutton',checkbox:'checkbox',radio:'radio',file:'button'})[el.type] || 'textbox'
         : 'generic');
-    nodes.push({ ref: 'e' + (nodes.length + 1), role, name: name(el).slice(0, 120) });
+    nodes.push({ ref: window.__cu.ref(el), role, name: name(el).slice(0, 120) });
     if (nodes.length >= 200) break;
   }
   const headings = [];
@@ -1693,6 +1915,7 @@ pub mod snapshot {
     title: document.title,
     nodes,
     headings,
+    next: window.__cu.next(),
   });
 })()
 "#;
@@ -1722,6 +1945,20 @@ mod pool_tests {
                 .idle
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_reply_is_matched_by_its_own_id_not_a_nested_one() {
+        assert_eq!(
+            message_id(r#"{"result":{"frame":{"id":"F1"}},"id":7}"#),
+            Some(7)
+        );
+        assert_eq!(message_id(r#"{"id":3,"result":{}}"#), Some(3));
+        assert_eq!(
+            message_id(r#"{"method":"Page.frameNavigated","params":{"frame":{"id":"F"}}}"#),
+            None
+        );
+        assert_eq!(message_id(r#"{"s":"\"id\":9","method":"x"}"#), None);
     }
 
     #[test]

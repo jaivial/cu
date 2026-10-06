@@ -22,6 +22,8 @@ PORT = next(
 ) or int(sys.argv[1])
 # Where to record that the browser was told to close (`Browser.close`).
 CLOSED_MARKER = os.environ.get("FAKE_CHROMIUM_CLOSED")
+# Input commands received, in order; served at /input-log for the tests.
+INPUT_LOG = []
 # Big enough to force the 64-bit websocket length form that a real screenshot
 # uses, so the frame reader cannot get away with the 16-bit one alone.
 PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"fake-png-bytes" * 8000).decode()
@@ -51,6 +53,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/json":
             self.send_discovery()
+        elif self.path == "/input-log":
+            self.send_json(INPUT_LOG)
         elif self.path == "/json/version":
             self.send_json(
                 {
@@ -177,6 +181,11 @@ class Handler(BaseHTTPRequestHandler):
     def result_for(method, params=None):
         if method == "Page.navigate":
             return {"id": 1, "result": {"frameId": "f", "url": "https://example.test"}}
+        if method == "Page.getFrameTree":
+            return {"result": {"frameTree": {"frame": {"id": "MAINFRAME", "url": "about:blank"}}}}
+        if method in ("Input.dispatchMouseEvent", "Input.insertText", "Input.dispatchKeyEvent"):
+            INPUT_LOG.append(method)
+            return {"result": {}}
         if method == "Page.captureScreenshot":
             return {"id": 1, "result": {"data": PNG}}
         if method == "Runtime.evaluate":
@@ -193,6 +202,15 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     },
                 }
+            if "__cu.locate(" in expr:
+                ref = expr.split("__cu.locate(")[1].split('"')[1]
+                if ref == "e404":
+                    value = '{"error":"e404 is not on the page any more; take a new snapshot"}'
+                else:
+                    value = '{"x":10.5,"y":20}'
+                return {"result": {"result": {"type": "string", "value": value}}}
+            if "__cu.focus(" in expr or "__cu.select(" in expr:
+                return {"result": {"result": {"type": "string", "value": "{}"}}}
             if "cuAgentSnapshot" in expr:
                 return {
                     "id": 1,

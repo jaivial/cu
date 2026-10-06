@@ -86,6 +86,7 @@ struct TestServer {
     addr: String,
     token: String,
     data_dir: PathBuf,
+    cdp_port: u16,
     /// The fake browser process, killed when the test ends.
     browser: Option<Child>,
     /// Readiness signal handed to the server under test.
@@ -132,6 +133,7 @@ impl TestServer {
             addr,
             token,
             data_dir,
+            cdp_port,
             browser,
             browser_state,
         }
@@ -597,4 +599,68 @@ fn stopping_the_daemon_closes_its_browser() {
     let closed = std::fs::read_to_string(&marker).unwrap_or_default();
     let _ = remove_dir(&dir);
     assert_eq!(closed, "closed\n", "the browser outlived its daemon");
+}
+
+/// Input commands the fake browser received, in order.
+fn input_log(server: &TestServer) -> String {
+    server::http_get(&format!("127.0.0.1:{}", server.cdp_port), "/input-log").expect("input log")
+}
+
+#[test]
+fn a_click_by_ref_is_a_real_mouse_click() {
+    let server = TestServer::start("click-ref", true);
+    let response = server.post("/v1/click", r#"{"ref":"e1"}"#);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&response);
+    assert!(body.contains("\"ok\":true"), "{body}");
+    // A single click does not pay for a snapshot unless it asks for one.
+    assert!(!body.contains("snapshot"), "{body}");
+    assert_eq!(
+        input_log(&server),
+        r#"["Input.dispatchMouseEvent", "Input.dispatchMouseEvent"]"#
+    );
+}
+
+#[test]
+fn a_batch_runs_in_order_and_ends_with_a_snapshot() {
+    let server = TestServer::start("act-batch", true);
+    let response = server.post(
+        "/v1/act",
+        r#"{"actions":[{"do":"type","ref":"e2","text":"hello","submit":true},{"do":"click","ref":"e1"}]}"#,
+    );
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&response);
+    assert!(body.starts_with("{\"ok\":true"), "{body}");
+    assert!(body.contains("ref=e1"), "no closing snapshot in {body}");
+    assert_eq!(
+        input_log(&server),
+        r#"["Input.insertText", "Input.dispatchKeyEvent", "Input.dispatchKeyEvent", "Input.dispatchMouseEvent", "Input.dispatchMouseEvent"]"#
+    );
+}
+
+#[test]
+fn a_batch_stops_at_a_stale_ref_and_says_which() {
+    let server = TestServer::start("act-stale", true);
+    let response = server.post(
+        "/v1/act",
+        r#"{"actions":[{"do":"click","ref":"e404"},{"do":"click","ref":"e1"}],"snapshot":false}"#,
+    );
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&response);
+    assert!(body.contains("\"ok\":false"), "{body}");
+    assert!(body.contains("\"failed\":0"), "{body}");
+    assert!(body.contains("take a new snapshot"), "{body}");
+    // Nothing after the failure ran.
+    assert_eq!(input_log(&server), "[]");
+}
+
+#[test]
+fn a_malformed_batch_is_a_bad_request() {
+    let server = TestServer::start("act-bad", true);
+    let response = server.post(
+        "/v1/act",
+        r##"{"actions":[{"do":"click","ref":"#login"}]}"##,
+    );
+    assert_eq!(status_code(&response), "400", "got {}", body_of(&response));
+    assert!(body_of(&response).contains("snapshot ref"));
 }
