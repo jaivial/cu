@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cu::server::{self, AppState};
@@ -409,6 +409,24 @@ fn default_data_dir() -> PathBuf {
     state.join("cu")
 }
 
+/// Snap-confined browsers cannot write inside hidden home directories
+/// (`~/.local/...`): they abort on the profile lock with a cryptic exit 21.
+/// Catch the combination up front and say what to do.
+fn snap_and_hidden_data(browser: &str, data: &Path) -> bool {
+    if !browser.contains("/snap/") {
+        return false;
+    }
+    let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    match data.strip_prefix(&home) {
+        Ok(rest) => rest.components().any(|c| {
+            c.as_os_str()
+                .to_str()
+                .is_some_and(|s| s.starts_with('.'))
+        }),
+        Err(_) => false,
+    }
+}
+
 fn start(args: &[String]) -> Result<(), String> {
     let mut port = DEFAULT_PORT;
     let mut data = default_data_dir();
@@ -430,6 +448,13 @@ fn start(args: &[String]) -> Result<(), String> {
             flag => return Err(format!("unknown option {flag}")),
         }
         i += 1;
+    }
+    let browser = env::var("CU_BROWSER").unwrap_or_else(|_| "chromium".into());
+    if snap_and_hidden_data(&browser, &data) {
+        return Err(format!(
+            "{browser} is snap-confined and cannot use the data dir {} (hidden home paths are denied). Set CU_BROWSER=/opt/google/chrome/chrome (or pass --data DIR outside a hidden folder)",
+            data.display()
+        ));
     }
     fs::create_dir_all(data.join("profiles/default")).map_err(|e| e.to_string())?;
     fs::create_dir_all(data.join("sessions")).map_err(|e| e.to_string())?;
@@ -538,6 +563,15 @@ mod tests {
     #[test]
     fn base64_decodes_png_prefix() {
         assert_eq!(decode_base64("iVBORw0KGgo=").unwrap(), b"\x89PNG\r\n\x1a\n");
+    }
+    #[test]
+    fn snap_browsers_refuse_hidden_home_data_dirs() {
+        use super::snap_and_hidden_data;
+        use std::path::PathBuf;
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert!(snap_and_hidden_data("/snap/bin/chromium", &PathBuf::from(&home).join(".local/state/cu")));
+        assert!(!snap_and_hidden_data("/snap/bin/chromium", &PathBuf::from("/tmp/cu")));
+        assert!(!snap_and_hidden_data("/opt/google/chrome/chrome", &PathBuf::from(&home).join(".local/state/cu")));
     }
     #[test]
     fn batch_lines_split_like_a_shell() {

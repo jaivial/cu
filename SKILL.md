@@ -34,6 +34,9 @@ sites you must not touch (a test runs real actions; use read-only goals there).
 
 1. **One Chrome is always open.** `cu start` (once) boots the singleton daemon;
    every later `cu` call just finds it. Never start one Chrome per test.
+   On this server start it with `CU_BROWSER=/opt/google/chrome/chrome cu start`
+   (snap chromium cannot write the hidden `~/.local` data dir; `cu start` says
+   so instead of failing with exit 21).
 2. **One tab (or context) per test.** `cu tab open URL --lease 300 --label my-test`
    returns a tab id; run everything with `--tab ID`. Need cookie isolation
    (parallel logins, per-test accounts)? Use `cu context open NAME --lease 300`
