@@ -1,13 +1,15 @@
 <script>
-  import TaskChart from './lib/TaskChart.svelte';
-  import { tools, tasks, tokens, speed, actionCosts, contexts, resources } from './lib/data.js';
+  import CompareTable from './lib/CompareTable.svelte';
+  import { tools, tasks, tokens, speed, actionCosts, contexts, resources, sweep, sweepHeadline } from './lib/data.js';
 
-  let scale = $state('linear');
   let tab = $state('cli');
 
-  const maxTokens = Math.max(...tokens.map((t) => t.tokens));
   const maxSpeed = Math.max(...speed.map((s) => s.before));
-  const n = (v) => v.toLocaleString('es-ES');
+  const grp = (s) => s.replace(/\B(?=(\d{3})+(?!\d))/g, '\u202f');
+  const n = (v) => grp(v.toLocaleString('es-ES'));
+  const fmt = (v) => (v < 10 ? v.toLocaleString('es-ES', { maximumFractionDigits: 1 }) : grp(Math.round(v).toLocaleString('es-ES')));
+  const secs = (v) => v.toFixed(2).replace('.', ',') + ' s';
+  const dec = (v, d) => v.toLocaleString('es-ES', { minimumFractionDigits: d, maximumFractionDigits: d });
 
   const snapshotLines = [
     ['- url: ', 'https://shop.test/'],
@@ -22,49 +24,81 @@
   const features = [
     {
       k: '01',
-      t: 'Un navegador que no se apaga',
-      d: 'Un Chromium persistente detrás de un servidor HTTP solo en loopback. El agente no lanza un navegador por acción: lo encuentra caliente, con su perfil y sus cookies.',
+      t: 'Un Chrome que no se apaga',
+      d: 'Un Chromium persistente detrás de un servidor HTTP solo en loopback, un daemon por máquina. El agente lo encuentra caliente desde cualquier sesión o proyecto, con su perfil y sus cookies.',
     },
     {
       k: '02',
-      t: 'Snapshots, no capturas',
-      d: 'Una línea por elemento interactivo con un ref estable. Unos cientos de bytes en un único viaje CDP, en lugar de volcar el DOM o leer píxeles.',
+      t: 'Una pestaña por test, con lease',
+      d: 'cu tab open URL --lease 300 abre una pestaña en ese Chrome compartido, y el lease la cierra si el test muere, se corta o el agente desaparece. cu context open NAME da un tarro de cookies aislado.',
     },
     {
       k: '03',
-      t: 'Actuar por ref, en lote',
-      d: 'click e3, type e2, o un formulario entero en una llamada que vuelve con la página nueva. Los refs sobreviven a acciones y snapshots.',
+      t: 'Snapshots, no capturas',
+      d: 'Una línea por elemento interactivo con un ref estable que sobrevive a las acciones. Los iframes y los shadow roots abiertos se recorren también: los componentes web no pintan páginas en blanco.',
     },
     {
       k: '04',
+      t: 'Actuar por ref, en lote',
+      d: 'click e3, type e2, o un formulario entero con cu act en una llamada que vuelve con la página nueva. cu batch junta muchos comandos en una sola ejecución.',
+    },
+    {
+      k: '05',
+      t: 'Texto cuando la respuesta son palabras',
+      d: 'cu text devuelve lo que la página dice de verdad: prosa, respuestas de API, mensajes, dentro de frames y shadow roots. Tope de 16 000 caracteres con aviso de corte.',
+    },
+    {
+      k: '06',
+      t: 'Descargas vigiladas',
+      d: 'Los archivos caen en <data>/downloads (con subcarpetas por contexto), cu downloads los lista y el click que los empezó los nombra en su resultado.',
+    },
+    {
+      k: '07',
       t: 'Las contraseñas no pasan por el modelo',
       d: 'El usuario las escribe en un formulario local en /login; el daemon las teclea en el navegador. Nunca se guardan, registran ni devuelven.',
+    },
+    {
+      k: '08',
+      t: 'Skill y tool nativa',
+      d: 'SKILL.md enseña a un agente todo el flujo: tests agénticos, user stories, informes de fallo. Y mini-tui expone cu como tool nativa junto a bash, sin servidor MCP por medio.',
     },
   ];
 
   const cli = [
-    ['cu start --data .cu', 'arranca el daemon; responde en ~6 ms y el navegador sube en segundo plano'],
-    ['cu status', 'estado del daemon y del navegador'],
-    ['cu navigate https://example.com', 'espera a que la página sea usable (máx. 3 s) e informa settled_ms'],
-    ['cu snapshot', 'la página para el LLM: url, título, headings y refs'],
+    ['cu start', 'un daemon por máquina; responde en ~6 ms y el navegador sube en segundo plano'],
+    ['cu status --short', 'daemon, navegador y cuántos leases hay abiertos'],
+    ['cu tab open URL --lease 300 --label test-1', 'pestaña para este test; el lease la cierra si el test muere'],
+    ['cu tab close ID · cu tab renew ID 600', 'cierra la pestaña o alarga su lease'],
+    ['cu context open NAME --lease 300', 'cookies aisladas en el mismo Chrome; se usa con --context NAME'],
+    ['cu lease', 'leases abiertos y segundos que les quedan'],
+    ['cu navigate URL', 'espera a que la página sea usable (máx. 3 s) e informa settled_ms'],
+    ['cu snapshot', 'la página para el LLM: url, título, headings y refs (frames y shadow roots)'],
+    ['cu text', 'palabras visibles: prosa, respuestas de API, mensajes'],
     ['cu click e3', 'click real con test de impacto; si algo lo tapa, lo dice'],
     ['cu type e2 "Ada" --submit', 'Input.insertText y, si se pide, Enter'],
     ["cu act '[{\"do\":\"type\",\"ref\":\"e2\",\"text\":\"Ada\"},{\"do\":\"click\",\"ref\":\"e5\"}]'", 'lote en una conexión, termina con snapshot'],
-    ['cu shot page.jpg', 'captura JPEG rápida; PNG si los píxeles importan'],
+    ["cu batch 'snapshot --tab t1' 'click e3 --tab t1'", 'muchos comandos, una llamada; una línea JSON por comando'],
+    ['cu shot page.jpg · cu downloads', 'captura JPEG rápida; descargas listadas desde <data>/downloads'],
     ['cu login', 'imprime el enlace /login para que el humano entre'],
     ['cu session save NAME / load NAME', 'guarda o restaura el perfil con la sesión iniciada'],
   ];
 
   const http = [
-    ['GET', '/v1/status', 'estado'],
-    ['POST', '/v1/navigate', '{"url": "..."}'],
+    ['GET', '/v1/status', 'estado, navegador y leases'],
+    ['POST', '/v1/navigate', '{"url": "..."} · espera asentada'],
     ['GET', '/v1/snapshot', 'página compacta con refs'],
+    ['GET', '/v1/text', 'palabras visibles, con - frame: <url>'],
     ['GET', '/v1/screenshot', '?format=png para PNG'],
     ['POST', '/v1/click', '{"ref": "e3"}'],
     ['POST', '/v1/type', '{"ref": "e2", "text": "hi", "submit": true}'],
     ['POST', '/v1/act', '{"actions": [...], "snapshot": true}'],
+    ['GET', '/v1/tabs', 'pestañas; el default, marcado'],
+    ['DELETE', '/v1/tabs/ID', 'cierra una pestaña'],
     ['GET', '/v1/contexts', 'lista contextos aislados'],
     ['DELETE', '/v1/contexts/NAME', 'cierra un contexto'],
+    ['GET', '/v1/downloads', 'archivos descargados, los terminados'],
+    ['GET', '/v1/leases', 'leases abiertos y su tiempo restante'],
+    ['POST', '/v1/lease', '{"key": "tab:ID", "seconds": 600}'],
     ['POST', '/v1/session/NAME', 'guarda el perfil vivo'],
     ['POST', '/v1/session/NAME/load', 'restaura una sesión guardada'],
     ['GET · POST', '/login', 'formulario humano, sin token'],
@@ -78,6 +112,50 @@
     ['navigate', 'url'],
     ['wait', 'ms'],
   ];
+
+  // Comparison tables. Every number comes from docs/BENCHMARKS.md; bars are
+  // relative to the worst of each row and the best of each row is highlighted.
+  const speedRows = tasks.map((t) => {
+    const max = Math.max(...tools.map((x) => t.v[x.id]));
+    const min = Math.min(...tools.map((x) => t.v[x.id]));
+    return {
+      label: t.name,
+      sub: t.note,
+      cells: tools.map((x) => ({
+        text: fmt(t.v[x.id]),
+        frac: t.v[x.id] / max,
+        best: t.v[x.id] === min,
+        color: x.color,
+      })),
+    };
+  });
+
+  const maxTokens = Math.max(...tokens.map((t) => t.tokens));
+  const tokenRows = tokens.map((t) => ({
+    label: t.tool,
+    sub: t.cmd,
+    cells: [
+      { text: n(t.tokens), frac: t.tokens / maxTokens, best: t.best, color: t.color },
+      { text: t.bytes ? n(t.bytes) : '—', frac: null },
+      {
+        text: t.best ? '1×' : (t.tokens / 350).toLocaleString('es-ES', { maximumFractionDigits: 1 }) + '×',
+        frac: null,
+      },
+    ],
+  }));
+
+  const sweepRows = sweep.map((s) => ({
+    label: `${s.c} vías`,
+    sub: `${s.tests} tests${s.star ? ' *' : ''}`,
+    cells: [
+      { text: dec(s.tps, s.tps < 1 ? 2 : 1), frac: s.tps / 24.5, best: s.c === 50, color: 'var(--cu)' },
+      { text: secs(s.p50), frac: s.p50 / 1.4, color: 'var(--ab)' },
+      { text: secs(s.p95), frac: s.p95 / 1.5 },
+      { text: dec(s.cpu, 2), frac: s.cpu / 0.35 },
+      { text: `${dec(s.rss, 1)} GB`, frac: s.rss / 1.7 },
+      { text: `${dec(s.rssCu, 1)} MB`, frac: null },
+    ],
+  }));
 </script>
 
 <a class="skip" href="#main">Saltar al contenido</a>
@@ -88,10 +166,11 @@
     <nav aria-label="Secciones">
       <a href="#que">Qué es</a>
       <a href="#api">API / CLI</a>
-      <a href="#bench">Benchmarks</a>
+      <a href="#bench">Velocidad</a>
       <a href="#tokens">Tokens</a>
+      <a href="#recursos">Recursos</a>
     </nav>
-    <span class="local">local · sin publicar</span>
+    <span class="local">local · sin nube</span>
   </div>
 </header>
 
@@ -109,6 +188,7 @@
         <div><dt>snapshot</dt><dd>3,7<small> ms</small></dd></div>
         <div><dt>10 clicks en lote</dt><dd>25<small> ms</small></dd></div>
         <div><dt>tokens por página</dt><dd>350<small> vs 1 314</small></dd></div>
+        <div><dt>tests en paralelo</dt><dd>50<small> en 1 Chrome</small></dd></div>
       </dl>
     </div>
 
@@ -178,6 +258,8 @@
               <li><code>{c}</code><span>{d}</span></li>
             {/each}
           </ul>
+          <p class="foot">Los comandos de página aceptan <code>--tab ID</code> o <code>--context NAME</code>.
+            <code>cu tabs</code> lista las pestañas (el default, marcado) y <code>cu tabs close ID</code> cierra una.</p>
         {:else if tab === 'http'}
           <ul class="routes">
             {#each http as [m, p, d]}
@@ -185,16 +267,19 @@
             {/each}
           </ul>
           <p class="foot">Todas con <code>Authorization: Bearer</code> salvo <code>/login</code>. Añade
-            <code>?context=NAME</code> a navigate, snapshot, screenshot o act.</p>
+            <code>?tab=ID</code> o <code>?context=NAME</code> a navigate, snapshot, text, screenshot o act;
+            pasar los dos a la vez es un error.</p>
         {:else}
           <pre class="code"><span class="k">let</span> cu = cu::Client::new(<span class="s">"127.0.0.1:8787"</span>, token);
 println!(<span class="s">"{"{}"}"</span>, cu.status()?);
 cu.navigate(<span class="s">"https://example.com"</span>)?;
 let page = cu.snapshot()?;
+let words = cu.text()?;
 cu.click(<span class="s">"e3"</span>)?;
 cu.act(<span class="s">r#"[{"{"}"do":"type","ref":"e2","text":"Ada"{"}"}]"#</span>)?;
 cu.save_session(<span class="s">"example"</span>)?;</pre>
-          <p class="foot">El token vive en <code>.cu/server.json</code>; mantenlo privado.</p>
+          <p class="foot">El token vive en <code>.cu/server.json</code>; mantenlo privado. Además:
+            <code>tabs</code>, <code>close_tab</code>, <code>downloads</code> y <code>load_session</code>.</p>
         {/if}
       </div>
 
@@ -254,7 +339,7 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
   <section class="wrap section" id="bench">
     <header class="sec-head">
       <p class="num">03</p>
-      <h2>Benchmarks reales</h2>
+      <h2>Velocidad contra agent-browser y Playwright MCP</h2>
       <p class="sub">
         Mismo binario (Chrome for Testing headless shell 153), mismo sitio local y las mismas seis tareas de agente.
         <code>cu</code> y agent-browser por CLI, un proceso por acción; Playwright MCP por stdio JSON-RPC. Mediana
@@ -262,45 +347,18 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
       </p>
     </header>
 
-    <div class="controls">
-      <ul class="legend">
-        {#each tools as t}
-          <li><i style="background:{t.color}"></i>{t.label}</li>
-        {/each}
-      </ul>
-      <div class="seg" role="group" aria-label="Escala de las barras">
-        <button aria-pressed={scale === 'linear'} onclick={() => (scale = 'linear')}>Lineal por tarea</button>
-        <button aria-pressed={scale === 'log'} onclick={() => (scale = 'log')}>Logarítmica común</button>
-      </div>
-    </div>
-
-    <div class="charts">
-      {#each tasks as task (task.key)}
-        <TaskChart {task} {scale} />
+    <ul class="legend" aria-label="Herramientas comparadas">
+      {#each tools as t}
+        <li><i style="background:{t.color}"></i>{t.label}</li>
       {/each}
-    </div>
+    </ul>
 
-    <details class="raw">
-      <summary>Ver la tabla completa</summary>
-      <div class="scroll">
-        <table class="data">
-          <thead>
-            <tr><th>tarea</th>{#each tools as t}<th class="r">{t.label}</th>{/each}</tr>
-          </thead>
-          <tbody>
-            {#each tasks as task}
-              {@const m = Math.min(...tools.map((t) => task.v[t.id]))}
-              <tr>
-                <td>{task.name}</td>
-                {#each tools as t}
-                  <td class="r" class:win={task.v[t.id] === m}>{n(task.v[t.id])}</td>
-                {/each}
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      </div>
-    </details>
+    <CompareTable
+      caption="Tareas de agente · mediana de 10 rondas, en ms · menos es mejor · la mejor de cada fila, resaltada"
+      first="tarea"
+      columns={tools.map((t) => ({ label: t.label }))}
+      rows={speedRows}
+    />
 
     <ul class="fair">
       <li><code>cu</code> y Playwright MCP esperan la navegación que provoca una acción; agent-browser vuelve antes,
@@ -349,50 +407,80 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
       </p>
     </header>
 
-    <div class="tok">
-      <div class="tok-chart">
-        {#each tokens as t}
-          <div class="tk" class:best={t.best}>
-            <div class="tk-label">
-              <span>{t.tool}</span><code>{t.cmd}</code>
-            </div>
-            <div class="tk-track">
-              <span class="tk-bar" style="width:{(t.tokens / maxTokens) * 100}%; --c:{t.color}"></span>
-            </div>
-            <span class="tk-val">{n(t.tokens)}</span>
-          </div>
-        {/each}
-      </div>
-
-      <div class="scroll">
-        <table class="data">
-          <thead>
-            <tr><th>herramienta</th><th class="r">tokens</th><th class="r">bytes</th><th class="r">vs cu</th></tr>
-          </thead>
-          <tbody>
-            {#each tokens as t}
-              <tr class:winrow={t.best}>
-                <td>{t.tool} <code>{t.cmd}</code></td>
-                <td class="r">{n(t.tokens)}</td>
-                <td class="r">{t.bytes ? n(t.bytes) : '—'}</td>
-                <td class="r">{t.best ? '1×' : (t.tokens / 350).toLocaleString('es-ES', { maximumFractionDigits: 1 }) + '×'}</td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      </div>
-    </div>
+    <CompareTable
+      caption="Snapshot de la misma página · menos es mejor · la mejor de la fila, resaltada"
+      first="herramienta"
+      columns={[{ label: 'tokens' }, { label: 'bytes' }, { label: 'vs cu' }]}
+      rows={tokenRows}
+    />
 
     <p class="big-quote">
       <span>3,8×</span> menos tokens que Playwright MCP por cada vistazo a la página: una línea por elemento
       interactivo, sin marcado de presentación ni nodos de texto, con tope de 200 nodos y 120 caracteres por nombre.
     </p>
   </section>
+
+  <section class="wrap section" id="recursos">
+    <header class="sec-head">
+      <p class="num">05</p>
+      <h2>Recursos y concurrencia</h2>
+      <p class="sub">
+        El modelo que un CI quiere: <strong>un Chrome siempre abierto</strong>, y cada test abre su propia pestaña
+        con lease en ese Chrome y la cierra al terminar (si el test muere, el lease la cierra). ¿Cuánto cuesta
+        cuando 50 tests corren a la vez, y dónde satura?
+      </p>
+    </header>
+
+    <dl class="stats wide">
+      {#each sweepHeadline as h}
+        <div><dt>{h.d}</dt><dd>{h.k}</dd></div>
+      {/each}
+    </dl>
+
+    <CompareTable
+      caption="De 5 a 50 tests simultáneos, una pestaña con lease cada uno · menos es mejor salvo tests/s"
+      first="concurrencia"
+      columns={[
+        { label: 'tests/s' },
+        { label: 'flujo p50' },
+        { label: 'flujo p95' },
+        { label: 'CPU Chrome' },
+        { label: 'RSS Chrome' },
+        { label: 'RSS cu' },
+      ]}
+      rows={sweepRows}
+      bestSr="el mayor caudal de la tabla"
+      note="* La oleada de 5 vías se encontró una llamada colgada hasta el timeout de 60 s del harness (una flujo de menos registrado); el resto de niveles, 0 errores. Pico real de la corrida: 50/50 en verde, 2,1 s de pared, 1,84 GB de RSS de Chrome (11 procesos), 11 MB para el daemon de cu y 71 % de máquina ocupada."
+    />
+
+    <ul class="fair">
+      <li><strong>Chrome no es el cuello de botella.</strong> Con 50 pestañas usa menos de 0,4 de 12 cores y
+        1,8 GB de 64 GB: Chrome es el recurso que se comparte, no el límite.</li>
+      <li><strong>El caudal se aplana hacia los 25-35 flujos simultáneos</strong> (tests/s: 12 → 19 → 23 → 24)
+        mientras la latencia por flujo crece casi lineal con la concurrencia (p50: 0,29 s → 1,40 s de 10 a 50).
+        Satura primero la parte serializada del camino — los viajes de ida y vuelta por loopback y el lanzamiento
+        de un proceso <code>cu</code> por llamada —, no la CPU del renderer.</li>
+      <li><strong>~18 MB por pestaña abierta</strong> para una página JS de este tamaño (0,8 GB con pocas →
+        1,8 GB con 50). Nada frente a 64 GB.</li>
+      <li><strong>Recomendado:</strong> 8 tests simultáneos por defecto, 12 como tope interactivo y hasta 50 en un
+        lote sin supervisión (medido: 100/100 en verde). Los leases hacen que la pila se limpie sola.</li>
+    </ul>
+
+    <div class="pending">
+      <h3>Medida contra un sitio real de producción: pendiente</h3>
+      <p>
+        Hay una medida de <code>cu</code> sobre un sitio real en producción — flujos con sesión iniciada sobre el
+        sitio en vivo — ejecutándose por separado. Sus cifras se añadirán aquí cuando termine la corrida; hasta
+        entonces no se inventa ningún número.
+      </p>
+    </div>
+  </section>
 </main>
 
 <footer class="wrap foot-site">
-  <p><code>cu</code> · solo local, nada publicado. Datos de <code>docs/BENCHMARKS.md</code>; reproducibles con
-    <code>python3 bench/compare.py --iters 10</code>.</p>
+  <p><code>cu</code> corre solo en local, sin nube detrás. Datos de <code>docs/BENCHMARKS.md</code>; reproducibles con
+    <code>python3 bench/compare.py --iters 10</code>. Código en
+    <a href="https://github.com/jaivial/cu">github.com/jaivial/cu</a>.</p>
 </footer>
 
 <style>
@@ -446,6 +534,8 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
   .stats dt { font-size: 0.78rem; color: var(--dim); }
   .stats dd { margin: 0; font-family: var(--mono); font-size: 1.6rem; font-weight: 600; letter-spacing: -0.03em; }
   .stats small { font-size: 0.8rem; color: var(--dim); font-weight: 400; letter-spacing: 0; }
+  .stats.wide { margin: 0 0 2.2rem; gap: 3rem; }
+  .stats.wide dd { font-size: 1.9rem; }
 
   .term {
     background: #0e100e; border: 1px solid var(--line); border-radius: 14px; overflow: hidden;
@@ -503,11 +593,11 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
   /* api */
   .tabs { display: inline-flex; gap: 0.25rem; padding: 0.25rem; border: 1px solid var(--line);
     border-radius: 10px; margin-bottom: 1rem; background: var(--panel); }
-  .tabs button, .seg button {
+  .tabs button {
     font: inherit; font-size: 0.85rem; color: var(--dim); background: none; border: 0;
     padding: 0.4rem 0.9rem; border-radius: 7px; cursor: pointer;
   }
-  .tabs button[aria-selected='true'], .seg button[aria-pressed='true'] { background: var(--fg); color: var(--bg); }
+  .tabs button[aria-selected='true'] { background: var(--fg); color: var(--bg); }
   .api-grid { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); gap: 1rem; }
   .panel, .mini {
     background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 1.3rem 1.4rem;
@@ -546,33 +636,19 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
   .kv td { color: var(--dim); }
   .kv th { font-weight: 500; padding-right: 0.8rem; }
   .kv thead th, .kv thead td { font-size: 0.72rem; color: var(--faint); font-weight: 400; text-transform: uppercase; letter-spacing: 0.08em; }
-  .kv .r, .data .r { text-align: right; padding-left: 0.8rem; padding-right: 0; }
+  .kv .r { text-align: right; padding-left: 0.8rem; padding-right: 0; }
   .kv th code { color: var(--cu); }
   .dimc { color: var(--faint) !important; }
   .trio { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: 1rem; }
 
   /* benchmarks */
-  .controls { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.2rem; }
-  .legend { list-style: none; padding: 0; margin: 0; display: flex; gap: 1.2rem; flex-wrap: wrap; font-size: 0.85rem; color: var(--dim); }
+  .legend { list-style: none; padding: 0; margin: 0 0 1.2rem; display: flex; gap: 1.2rem; flex-wrap: wrap; font-size: 0.85rem; color: var(--dim); }
   .legend li { display: flex; align-items: center; gap: 0.45rem; }
   .legend i { width: 12px; height: 12px; border-radius: 3px; }
-  .seg { display: inline-flex; padding: 0.25rem; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
-  .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(330px, 100%), 1fr)); gap: 1rem; }
-
-  .raw { margin-top: 1.4rem; border: 1px solid var(--line); border-radius: 12px; padding: 0.2rem 1.2rem; }
-  .raw summary { cursor: pointer; padding: 0.8rem 0; color: var(--dim); font-size: 0.9rem; }
-  .raw[open] summary { color: var(--fg); }
-  .scroll { overflow-x: auto; }
-  .data { width: 100%; border-collapse: collapse; font-size: 0.88rem; margin-bottom: 0.8rem; }
-  .data th { font-weight: 500; font-size: 0.75rem; color: var(--faint); text-transform: uppercase; letter-spacing: 0.06em; text-align: left; }
-  .data th, .data td { padding: 0.6rem 0; border-bottom: 1px solid var(--line); white-space: nowrap; }
-  .data td.r { font-family: var(--mono); font-variant-numeric: tabular-nums; }
-  .data .win { color: var(--cu); font-weight: 600; }
-  .winrow td { color: var(--cu); }
-  .winrow td code { color: var(--cu); }
 
   .fair { margin: 1.6rem 0 0; padding: 0 0 0 1.1rem; color: var(--dim); font-size: 0.88rem; display: grid; gap: 0.5rem; max-width: 52rem; }
   .fair code { color: var(--fg); }
+  .fair strong { color: var(--fg); font-weight: 600; }
 
   .speed { margin-top: 3rem; padding: 1.6rem; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
   .speed-head h3 { margin: 0; font-size: 1.15rem; }
@@ -590,29 +666,26 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
   .sp-note { font-size: 0.8rem; color: var(--dim); text-align: right; }
   .res { margin-top: 1rem; max-width: 34rem; }
 
-  /* tokens */
-  .tok { display: grid; grid-template-columns: 1.3fr 1fr; gap: 2rem; align-items: center; }
-  .tok-chart { display: grid; gap: 1.1rem; }
-  .tk { display: grid; grid-template-columns: 1fr 4rem; gap: 0.35rem 1rem; align-items: center; }
-  .tk-label { grid-column: 1 / -1; display: flex; gap: 0.6rem; align-items: baseline; font-size: 0.9rem; }
-  .tk-label code { color: var(--dim); font-size: 0.78rem; }
-  .tk-track { height: 28px; background: var(--track); border-radius: 6px; overflow: hidden; }
-  .tk-bar { display: block; height: 100%; background: var(--c); border-radius: 6px; opacity: 0.85; }
-  .tk.best .tk-bar { opacity: 1; box-shadow: 0 0 24px -4px var(--cu); }
-  .tk-val { font-family: var(--mono); font-size: 1.05rem; text-align: right; font-variant-numeric: tabular-nums; }
-  .tk.best .tk-val, .tk.best .tk-label span { color: var(--cu); font-weight: 600; }
-
   .big-quote { margin: 3rem 0 4rem; font-size: clamp(1.15rem, 2.2vw, 1.5rem); line-height: 1.4; max-width: 50rem; color: var(--dim); letter-spacing: -0.01em; }
   .big-quote span { font-family: var(--serif); font-style: italic; color: var(--cu); font-size: 1.8em; line-height: 1; }
 
+  .pending {
+    margin: 2.5rem 0 4rem; padding: 1.5rem 1.7rem; border: 1px dashed var(--line); border-radius: 14px;
+    background: var(--panel); max-width: 52rem;
+  }
+  .pending h3 { margin: 0 0 0.5rem; font-size: 1.05rem; letter-spacing: -0.01em; }
+  .pending p { margin: 0; color: var(--dim); font-size: 0.92rem; }
+  .pending code { color: var(--fg); }
+
   .foot-site { border-top: 1px solid var(--line); padding: 2rem 0 3rem; color: var(--faint); font-size: 0.84rem; }
   .foot-site code { color: var(--dim); }
+  .foot-site a { color: var(--dim); }
 
   /* responsive */
   @media (max-width: 980px) {
     .hero { grid-template-columns: 1fr; padding: 4rem 0 3.5rem; gap: 2.5rem; }
     .features { grid-template-columns: repeat(2, 1fr); }
-    .api-grid, .trio, .tok { grid-template-columns: minmax(0, 1fr); }
+    .api-grid, .trio { grid-template-columns: minmax(0, 1fr); }
     .sp { grid-template-columns: 9rem 1fr; }
     .sp-note { grid-column: 2; text-align: left; }
   }
@@ -624,10 +697,10 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
     .flow i { display: none; }
     .routes li { grid-template-columns: 4.6rem 1fr; }
     .routes li span:last-child { grid-column: 2; }
-    .charts { grid-template-columns: 1fr; }
     .sp { grid-template-columns: 1fr; gap: 0.5rem; }
     .sp-note { grid-column: 1; }
     .stats { gap: 1.4rem; }
+    .stats.wide { gap: 1.6rem; }
     .section { padding-top: 4rem; }
   }
 </style>

@@ -50,3 +50,21 @@ export const resources = [
   { what: 'tiempo de CPU', before: '~1,65 s', after: '~1,15 s (−30%)' },
   { what: 'navegador huérfano al parar', before: 'todo', after: 'nada' },
 ];
+
+// 50 parallel tests, one Chrome, one leased tab per test. One run,
+// 2026-10-06, machine load ~2.5-3 of 12 cores ("cargado").
+export const sweep = [
+  { c: 5, tests: 9, star: true, tps: 0.15, p50: 0.15, p95: 0.17, cpu: 0.05, rss: 0.8, rssCu: 2.1, busy: 32 },
+  { c: 10, tests: 20, tps: 12.4, p50: 0.29, p95: 0.30, cpu: 0.12, rss: 1.0, rssCu: 2.8, busy: 38 },
+  { c: 20, tests: 40, tps: 18.9, p50: 0.52, p95: 0.56, cpu: 0.18, rss: 1.3, rssCu: 4.3, busy: 55 },
+  { c: 35, tests: 70, tps: 22.7, p50: 0.96, p95: 1.02, cpu: 0.33, rss: 1.5, rssCu: 8.1, busy: 63 },
+  { c: 50, tests: 100, tps: 24.5, p50: 1.40, p95: 1.50, cpu: 0.35, rss: 1.7, rssCu: 10.6, busy: 69 },
+];
+
+// The 50-way headline, same run.
+export const sweepHeadline = [
+  { k: '50/50', d: 'tests en verde a 50 vías' },
+  { k: '2,1 s', d: 'de pared para los dos lotes de 50' },
+  { k: '~18 MB', d: 'por pestaña abierta en Chrome' },
+  { k: '0,35', d: 'de 12 cores de CPU de Chrome (máx.)' },
+];
