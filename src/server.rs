@@ -754,15 +754,30 @@ pub fn route(
             match open_page_tab(state.cdp_port, &url) {
                 Ok(id) => {
                     let lease = set_lease(state.cdp_port, LeaseKind::Tab, &id, &label, lease);
+                    // A tab opened at a URL gets the same settle wait as
+                    // navigate, so the snapshot that follows sees the page.
+                    let settled = if url.is_empty() {
+                        true
+                    } else {
+                        wait_for_page_on(
+                            &Tab {
+                                cdp_port: state.cdp_port,
+                                target: Some(id.clone()),
+                            },
+                            SETTLE_MAX,
+                        )
+                        .1
+                    };
                     (
                         "200 OK",
                         "application/json",
                         format!(
-                            "{{\"tab\":{},\"url\":{},\"label\":{},\"lease\":{}}}",
+                            "{{\"tab\":{},\"url\":{},\"label\":{},\"lease\":{},\"settled\":{}}}",
                             json_string(&id),
                             json_string(&url),
                             json_string(&label),
-                            lease
+                            lease,
+                            settled
                         ),
                     )
                 }
