@@ -184,14 +184,6 @@ def bench_parallel(cu, iters, workers=8):
             "wall_ms": round(wall, 2)}
 
 
-def has_snapshot(cu):
-    try:
-        cu.call("GET", "/v1/snapshot", timeout=10)
-        return True
-    except Exception as e:
-        code = getattr(getattr(e, "code", None), "__int__", lambda: 0)() if e else 0
-        return False
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -211,7 +203,16 @@ def main():
                                "date": time.strftime("%Y-%m-%dT%H:%M:%S%z")}}
     try:
         results["start_ms"] = round(cu.start(), 2)
-        cu.call("POST", "/v1/navigate", {"url": page})
+        # The browser warms up in the background after start returns; wait for
+        # it rather than measuring a 503 because Chromium was still loading.
+        for _ in range(200):
+            try:
+                cu.call("POST", "/v1/navigate", {"url": page})
+                break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise SystemExit("browser never became ready")
         results["actions"] = [
             bench("navigate", args.iters,
                   lambda: cu.call("POST", "/v1/navigate", {"url": page})),
@@ -220,15 +221,14 @@ def main():
             bench("shot(png)", args.iters,
                   lambda: cu.call("GET", "/v1/screenshot?format=png")),
         ]
-        # Compaction: what the LLM is sent instead of the DOM it would have to
-        # read. The bulk page has 180 interactive nodes.
+        # Compaction: what the LLM is sent instead of the HTML it would have
+        # had to read.
         body = cu.call("GET", "/v1/snapshot").decode()
         results["snapshot_bytes"] = len(body)
         results["page_bytes"] = len(PAGE)
         results["compaction"] = round(len(body) / len(PAGE), 3)
-        if results["snapshot_supported"]:
-            results["actions"].insert(
-                1, bench("snapshot", args.iters, lambda: cu.call("GET", "/v1/snapshot")))
+        results["actions"].insert(
+            1, bench("snapshot", args.iters, lambda: cu.call("GET", "/v1/snapshot")))
         results["actions"].append(bench_parallel(cu, max(1, args.iters // 5)))
     finally:
         cu.stop()

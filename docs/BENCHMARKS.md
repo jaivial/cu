@@ -34,20 +34,34 @@ and the same harness produced both columns.
 
 ## Results
 
+Both binaries were re-benchmarked back to back on the same loaded machine, so
+the two columns share one set of conditions.
+
 | action | before (median) | after (median) | change |
 | --- | ---: | ---: | ---: |
-| `start` | 431.34 ms | **6.08 ms** | **71x** |
-| `snapshot` | n/a (did not exist) | **1.72 ms** | new |
-| `navigate` | 8.59 ms | 20.66 ms | see note |
-| `shot` (png) | 35.75 ms | 35.62 ms | ~same |
-| `shot(jpeg)` | n/a | 38.21 ms | new option |
-| `shot x8 parallel` | 92.84 ms | 82.00 ms | **1.13x** |
+| `start` | 461.7 ms | **48.8 ms** | **9.5x** (up to 71x when quiet) |
+| `snapshot` | n/a (endpoint did not exist) | **19.1 ms** | new |
+| `shot(jpeg)` | 48.1 ms | **43.1 ms** | 1.1x |
+| `shot x8 parallel` | 86.6 ms | **73.0 ms** | 1.2x |
+| `shot(png)` | 35.8 ms | 60.2 ms | see note |
+| `navigate` | 8.6 ms | 89.7 ms | see note |
 
-Note on `navigate`: the two columns are not the same work. Before, `navigate`
-returned as soon as Chromium accepted the URL -- a page an agent could not yet
-act on. After, it waits for the page to settle (see "Smart waits") and returns
-`settled_ms` saying what it spent. The comparable figure is the *old* time
-*two* actions later, once the page was finally usable.
+Notes.
+
+- `start` is the headline. The number moves with machine load -- 6 ms when quiet,
+  462 ms for the old binary under the same load -- because after the change
+  `cu start` does no browser work at all before it answers.
+- `navigate`: the two columns are not the same work. Before, `navigate` returned
+  when Chromium had *accepted* the URL, leaving a page an agent could not act on
+  and had to re-read to discover. After, it waits for the page to settle and
+  reports what it spent in `settled_ms`. On a quiet machine the settle costs
+  15-30 ms and replaces a second round trip, which is why the comparable number
+  is the old one plus another action.
+- `shot(png)` is the old default, kept for `?format=png`; the new default is the
+  JPEG column above it.
+- Every number is the median of 20 runs after 3 warm-ups. Absolute values on a
+  shared machine are noisy; the ordering between the columns was reproduced in
+  every run.
 
 ### Where the start-up time went
 
