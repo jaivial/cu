@@ -35,6 +35,10 @@ impl Client {
     pub fn snapshot(&self) -> Result<String, String> {
         self.request("GET", "/v1/snapshot", "")
     }
+    /// Files the browser has finished downloading, newest first.
+    pub fn downloads(&self) -> Result<String, String> {
+        self.request("GET", "/v1/downloads", "")
+    }
     /// Click the element a snapshot named `reference` (`e3`).
     pub fn click(&self, reference: &str) -> Result<String, String> {
         self.request(

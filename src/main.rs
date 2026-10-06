@@ -28,6 +28,7 @@ fn main() {
         Some("shot") => request("GET", "/v1/screenshot?format=jpeg", None)
             .and_then(|s| write_screenshot(&s, args.get(1).map(String::as_str))),
         Some("snapshot") => request("GET", "/v1/snapshot", None).map(|s| println!("{s}")),
+        Some("downloads") => request("GET", "/v1/downloads", None).map(|s| println!("{s}")),
         Some("click") => match args.get(1) {
             Some(r) => request(
                 "POST",
@@ -91,7 +92,7 @@ fn main() {
 }
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR]\n  cu status\n  cu navigate URL\n  cu shot [FILE]\n  cu snapshot\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME"
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR]\n  cu status\n  cu navigate URL\n  cu shot [FILE]\n  cu snapshot\n  cu downloads\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME"
     );
 }
 
@@ -124,6 +125,10 @@ fn start(args: &[String]) -> Result<(), String> {
     }
     fs::create_dir_all(data.join("profiles/default")).map_err(|e| e.to_string())?;
     fs::create_dir_all(data.join("sessions")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(data.join("downloads")).map_err(|e| e.to_string())?;
+    // Chromium refuses a relative download directory, so the path handed to
+    // the browser must be absolute whatever way `cu` was started.
+    let data = fs::canonicalize(&data).unwrap_or(data);
     let token = server::random_token();
     fs::write(
         data.join("server.json"),

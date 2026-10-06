@@ -551,6 +551,23 @@ fn a_snapshot_is_compact_and_carries_refs() {
 }
 
 #[test]
+fn downloads_are_listed_from_the_session_directory() {
+    let server = TestServer::start("downloads", false);
+    // Listing files needs no browser: the files outlive the session.
+    assert_eq!(body_of(&server.get("/v1/downloads")), "{\"downloads\":[]}");
+    let dir = server.data_dir.join("downloads");
+    std::fs::create_dir_all(&dir).expect("downloads dir");
+    std::fs::write(dir.join("report.pdf"), b"1234").expect("file");
+    // A file Chromium is still writing must not appear as finished.
+    std::fs::write(dir.join("half.zip.crdownload"), b"1").expect("partial");
+    let response = server.get("/v1/downloads");
+    let body = body_of(&response);
+    assert!(body.contains("\"name\":\"report.pdf\""), "got {body}");
+    assert!(body.contains("\"bytes\":4"), "got {body}");
+    assert!(!body.contains("crdownload"), "partial listed: {body}");
+}
+
+#[test]
 fn a_snapshot_needs_the_browser() {
     let server = TestServer::start("snapshot-no-browser", false);
     let response = server.get("/v1/snapshot");

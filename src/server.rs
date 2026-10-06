@@ -205,12 +205,62 @@ pub fn spawn_browser_thread(
             // the pid that shutdown closes.
             BROWSER_PID.store(child.id(), Ordering::SeqCst);
             match wait_for_browser(cdp_port, BROWSER_START_TIMEOUT, Some(&mut child)) {
-                Ok(()) => browser.mark_ready(),
+                Ok(()) => {
+                    // Downloads land in the session's own directory (see
+                    // `spawn_browser_control`), before readiness so the first
+                    // click is already covered.
+                    spawn_browser_control(cdp_port, &data);
+                    browser.mark_ready()
+                }
                 Err(e) => browser.mark_failed(e),
             }
         }
         Err(e) => browser.mark_failed(e),
     })
+}
+
+/// One browser-level DevTools connection held for the daemon's whole life.
+///
+/// It exists for downloads. `Browser.setDownloadBehavior` with a custom
+/// directory is only honoured while a session with `eventsEnabled` stays
+/// attached (Chromium 145: set from a socket that then closes, and the
+/// browser keeps its own default -- the user's real Downloads folder, where
+/// an agent can neither see nor manage the files). The daemon therefore
+/// connects once, enables the download events and drains them forever; the
+/// page sessions still see `Page.downloadWillBegin` too, which is what turns
+/// a click into a `"download"` result.
+fn spawn_browser_control(cdp_port: u16, data: &Path) {
+    let download_path = data.join("downloads").to_string_lossy().into_owned();
+    thread::spawn(move || {
+        let Some(connection) = browser_control_connection(cdp_port) else {
+            return;
+        };
+        let mut connection = connection;
+        if let Err(error) = connection.call(
+            "Browser.setDownloadBehavior",
+            &format!(
+                "{{\"behavior\":\"allow\",\"downloadPath\":{},\"eventsEnabled\":true}}",
+                json_string(&download_path)
+            ),
+        ) {
+            // Not fatal: downloads fall back to the browser's own default
+            // directory, which the agent then cannot see.
+            eprintln!("cu: could not redirect downloads: {error}");
+            return;
+        }
+        // Drain browser events (download progress, target changes) so the
+        // socket buffer never fills up. A blocking read with no timeout: the
+        // session must outlive hours between downloads.
+        let _ = connection.stream.set_read_timeout(None);
+        while connection.next_message(MAX_CDP_MESSAGE).is_ok() {}
+    });
+}
+
+/// A browser-level websocket from the discovery document.
+fn browser_control_connection(cdp_port: u16) -> Option<CdpConnection> {
+    let version = http_get(&format!("127.0.0.1:{cdp_port}"), "/json/version").ok()?;
+    let ws = json_string_value(&version, "webSocketDebuggerUrl")?;
+    CdpConnection::connect(&ws).ok()
 }
 
 /// Pid of the browser this daemon launched, 0 while there is none.
@@ -622,6 +672,13 @@ pub fn route(
             "application/json",
             "{\"running\":true,\"browser\":\"chromium\"}".into(),
         ),
+        // Pure file listing: works whether or not the browser is up, because
+        // the files outlive the session that downloaded them.
+        ("GET", "/v1/downloads") => (
+            "200 OK",
+            "application/json",
+            downloads_json(&state.data_dir.join("downloads")),
+        ),
         ("POST", "/v1/navigate") => {
             let url = json_value(body, "url").unwrap_or_default();
             if url.is_empty() {
@@ -780,6 +837,49 @@ fn act(
             Err(e) => error("502 Bad Gateway", &e),
         },
     }
+}
+
+/// Finished downloads in `dir`, newest first, as the `/v1/downloads` body.
+///
+/// A file Chromium is still writing carries the `.crdownload` suffix, so an
+/// entry here is complete and safe for the agent to read.
+pub fn downloads_json(dir: &Path) -> String {
+    let mut files: Vec<(SystemTime, String)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.ends_with(".crdownload") {
+                continue;
+            }
+            let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+            files.push((
+                mtime,
+                format!(
+                    "{{\"name\":{},\"bytes\":{}}}",
+                    json_string(name),
+                    meta.len()
+                ),
+            ));
+        }
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    format!(
+        "{{\"downloads\":[{}]}}",
+        files
+            .iter()
+            .map(|(_, item)| item.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 pub fn login_page() -> String {
