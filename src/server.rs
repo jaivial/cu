@@ -156,9 +156,15 @@ pub fn wait_for_browser(
     mut child: Option<&mut Child>,
 ) -> Result<(), String> {
     let started = std::time::Instant::now();
+    // Both loopback stacks: with the IPv4 port taken by a browser that is
+    // still shutting down, Chromium binds the DevTools port on `::1` only,
+    // and an IPv4-only probe then never sees its own browser.
     let address = format!("127.0.0.1:{cdp_port}");
+    let address_v6 = format!("[::1]:{cdp_port}");
     loop {
-        if http_get(&address, "/json/version").is_ok() {
+        if http_get(&address, "/json/version").is_ok()
+            || http_get(&address_v6, "/json/version").is_ok()
+        {
             return Ok(());
         }
         // `as_deref_mut` reborrows instead of moving the child out of the
@@ -193,12 +199,13 @@ pub fn spawn_browser_thread(
     thread::spawn(move || match launch_browser(&data, cdp_port) {
         Ok(mut child) => {
             let _ = child.stdin.take();
-            let pid = child.id();
+            // Recorded before readiness: a launch that times out (or a
+            // browser that comes up late) used to leave the whole Chromium
+            // tree running for ever, because only a successful launch stored
+            // the pid that shutdown closes.
+            BROWSER_PID.store(child.id(), Ordering::SeqCst);
             match wait_for_browser(cdp_port, BROWSER_START_TIMEOUT, Some(&mut child)) {
-                Ok(()) => {
-                    BROWSER_PID.store(pid, Ordering::SeqCst);
-                    browser.mark_ready()
-                }
+                Ok(()) => browser.mark_ready(),
                 Err(e) => browser.mark_failed(e),
             }
         }
