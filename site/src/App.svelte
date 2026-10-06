@@ -1,6 +1,7 @@
 <script>
   import CompareTable from './lib/CompareTable.svelte';
-  import { tools, tasks, tokens, speed, actionCosts, contexts, resources, sweep, sweepHeadline } from './lib/data.js';
+  import { tools, tasks, tokens, speed, actionCosts, contexts, resources, sweep, sweepHeadline,
+    realLevels, realHeadline, realWaits, realBlock, realVsAb } from './lib/data.js';
 
   let tab = $state('cli');
 
@@ -156,6 +157,53 @@
       { text: `${dec(s.rssCu, 1)} MB`, frac: null },
     ],
   }));
+
+  // Real-site rows: bars are relative to the slowest value of each column of
+  // the table; the recommended level (10 flows) is highlighted.
+  const realRows = realLevels.map((l) => ({
+    label: `${l.c} flujo${l.c === 1 ? '' : 's'}`,
+    sub: l.c === 25 ? 'los que no terminaron no cuentan; por encima del precipicio' : l.c === 10 ? 'el nivel recomendado' : 'un flujo solo',
+    cells: [
+      { text: `${l.ok} / ${l.of}`, frac: l.ok / l.of, best: l.c === 10, color: 'var(--cu)' },
+      { text: `${dec(l.p50, 1)} s`, frac: l.p50 / 67.4, color: 'var(--cu)' },
+      { text: `${dec(l.p95, 1)} s`, frac: l.p95 / 80.1, color: 'var(--cu)' },
+      { text: `${dec(l.ans, 1)} s`, frac: l.ans / 6.9, color: 'var(--ab)' },
+      { text: `${l.frac} %`, frac: l.frac / 31, color: 'var(--ab)' },
+      { text: dec(l.cores, 2), frac: l.cores / 0.28, color: 'var(--cu-2)' },
+      { text: `${dec(l.rss, 1)} GB`, frac: null },
+      { text: dec(l.cuCores, 2), frac: null },
+    ],
+  }));
+
+  const realWaitRows = realWaits.map((w) => ({
+    label: w.label,
+    sub: w.sub,
+    cells: [{ text: w.t, frac: w.frac, best: !!w.best, color: w.best ? 'var(--cu)' : 'var(--ab)' }],
+  }));
+
+  const realBlockRows = realBlock.map((b) => ({
+    label: b.label,
+    cells: [
+      { text: b.ok, frac: null },
+      { text: `${dec(b.t[0], 1)} s`, frac: b.t[0] / 67.4 },
+      { text: `${dec(b.t[1], 1)} s`, frac: b.t[1] / 80.1 },
+      { text: `${dec(b.t[2], 1)} s`, frac: b.t[2] / 6.5, color: 'var(--ab)' },
+    ],
+  }));
+
+  const realVsAbRows = realVsAb.map((v) => ({
+    label: v.tool,
+    sub: v.mode,
+    cells: [
+      { text: v.ok, frac: null },
+      { text: `${dec(v.p50, 1)} s`, frac: v.p50 / 67.4, color: 'var(--cu)' },
+      { text: `${dec(v.p95, 1)} s`, frac: v.p95 / 80.1, color: 'var(--cu)' },
+      { text: `${dec(v.open, 1)} s`, frac: v.open / 12.0, best: v.tool === 'cu', color: 'var(--cu-2)' },
+      { text: `${dec(v.ans, 1)} s`, frac: v.ans / 9.2, best: v.tool === 'cu', color: 'var(--ab)' },
+      { text: `${v.procs}`, frac: v.procs / 113, best: v.tool === 'cu' },
+      { text: `${dec(v.rss, 1)} GB`, frac: v.rss / 12.8, best: v.tool === 'cu' },
+    ],
+  }));
 </script>
 
 <a class="skip" href="#main">Saltar al contenido</a>
@@ -169,6 +217,7 @@
       <a href="#bench">Velocidad</a>
       <a href="#tokens">Tokens</a>
       <a href="#recursos">Recursos</a>
+      <a href="#real">Sitio real</a>
     </nav>
     <span class="local">local · sin nube</span>
   </div>
@@ -466,14 +515,134 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
         lote sin supervisión (medido: 100/100 en verde). Los leases hacen que la pila se limpie sola.</li>
     </ul>
 
-    <div class="pending">
-      <h3>Medida contra un sitio real de producción: pendiente</h3>
-      <p>
-        Hay una medida de <code>cu</code> sobre un sitio real en producción — flujos con sesión iniciada sobre el
-        sitio en vivo — ejecutándose por separado. Sus cifras se añadirán aquí cuando termine la corrida; hasta
-        entonces no se inventa ningún número.
+  </section>
+
+  <section class="wrap section" id="real">
+    <header class="sec-head">
+      <p class="num">06</p>
+      <h2>Contra una app real de producción</h2>
+      <p class="sub">
+        Todo lo anterior corre contra páginas locales. Esto corre los flujos que un agente de QA ejecuta de verdad
+        contra <strong>una app web real de producción en build de desarrollo</strong> (servidor dev: una petición por
+        módulo, el navegador admite ~6 sockets por origen), por la red, con sesión iniciada y una pestaña con lease
+        por flujo en el Chrome compartido. Medianas p50/p95 de los flujos de cada nivel, sobre una caja compartida de
+        12 cores con otros agentes corriendo.
       </p>
-    </div>
+    </header>
+
+    <p class="flow-desc">
+      El flujo: abrir una pestaña en una ruta profunda → iniciar sesión si la app dice que no hay sesión → navegar a
+      una sección y una subruta → abrir el chat del asistente, conversación nueva, enviar un marcador y esperar a que
+      ese marcador aparezca <strong>dos veces</strong> en el texto (el eco del mensaje más la respuesta en streaming) →
+      cerrar la pestaña. Sin esperas por reloj: cada <code>wait</code> es por texto, estado o URL.
+    </p>
+
+    <dl class="stats wide">
+      {#each realHeadline as h}
+        <div><dt>{h.d}</dt><dd>{h.k}</dd></div>
+      {/each}
+    </dl>
+
+    <CompareTable
+      caption="1, 10 y 25 flujos en paralelo, sesión compartida · menos es mejor salvo los que llevan · el nivel recomendado, resaltado"
+      first="flujos"
+      columns={[
+        { label: 'ok' },
+        { label: 'total p50' },
+        { label: 'total p95' },
+        { label: 'respuesta p50' },
+        { label: '% del flujo' },
+        { label: 'CPU Chrome' },
+        { label: 'RSS Chrome' },
+        { label: 'cores cu' },
+      ]}
+      rows={realRows}
+      bestSr="mejor de la fila"
+      note="Chrome usa 0,15-0,28 de los 12 cores; los ~6 GB de RSS son el navegador compartido entero (pestañas de otros agentes incluidas), ~18 MB por pestaña. El daemon de cu: 0,01-0,03 cores y ~2 MB."
+    />
+
+    <ul class="fair">
+      <li><strong>Recomendado: hasta 10 flujos por Chrome compartido</strong> contra este despliegue — ~90 % de
+        éxito, p50 ~67 s por flujo de los cuales ~6,5 s son la respuesta del asistente, y Chrome por debajo de un
+        tercio de core. Cuenta con p95 ~80 s y un reintento cuando «la app no llegó a pintar».</li>
+      <li><strong>A 25 flujos solo terminaron 3 de 25, y es límite de la app, no de cu.</strong> Los otros 22 se
+        quedaron en el shell vacío sin renderizar durante 60 s, reproducido dos veces: un build de desarrollo arranca
+        en frío con una petición por módulo, así que 25 arranques en frío se encolan en minutos. Las mismas 25
+        pestañas con lease contra las páginas locales de arriba fueron 100/100 en verde. Para subir de ahí: escalonar
+        la primera navegación (~1-2 s), un build de producción de la app, o repartir entre navegadores/orígenes.</li>
+      <li><strong>Chrome no es el cuello de botella.</strong> El servidor de la app y su presupuesto de sockets por
+        origen sí lo son.</li>
+      <li><strong>El login es barato cuando el anti-bot coopera y durísimo cuando no.</strong> En frío: 0,75-1,5 s;
+        con el captcha throttleado, los mismos 30-120 s, y los logins en paralelo se pisan (8 sesiones volvieron al
+        login a mitad de flujo en la tanda de 25; agent-browser completó 0/20 en 120 s así). Escalona los logins
+        reales; comparte sesión en las corridas de concurrencia.</li>
+      <li><strong>La respuesta es la única fase que no se encola:</strong> ~5-7 s p50 con 1, 10 y 25 flujos alike
+        (p95 ~20 s a 10). Su peso en el flujo baja (31 % con un flujo → ~12 % a 10-25) porque lo que crece es la
+        contención de la página, no la respuesta. Timeouts de 60-120 s cubren el p95.</li>
+    </ul>
+
+    <h3 class="sub-h">Palanca 1 · esperar por texto, nunca por networkidle</h3>
+    <p class="lever">
+      La app mantiene dos streams de eventos abiertos toda su vida (una lista en vivo y un stream de conversaciones),
+      así que <code>networkidle</code> no se alcanza nunca. Un flujo instrumentado:
+    </p>
+    <CompareTable
+      caption="Qué espera el flujo y cuánto tarda · el texto gana, la red nunca se calma"
+      first="espera"
+      columns={[{ label: 'medido' }]}
+      rows={realWaitRows}
+      bestSr="la espera que funciona"
+    />
+
+    <h3 class="sub-h">Palanca 2 · bloquear imágenes, fuentes y media: aquí no es la palanca</h3>
+    <CompareTable
+      caption="Nivel 10, dos olas, contra el mismo baseline · el peso de esta app son módulos JS y la cola de sockets, no media"
+      first="configuración"
+      columns={[{ label: 'ok' }, { label: 'total p50' }, { label: 'total p95' }, { label: 'respuesta p50' }]}
+      rows={realBlockRows}
+    />
+
+    <h3 class="sub-h">Los mismos flujos por agent-browser (10 flujos)</h3>
+    <CompareTable
+      caption="Mismos pasos, misma caja, un navegador entero por sesión de agent-browser · la forma de la comparación es arquitectónica"
+      first="herramienta"
+      columns={[
+        { label: 'ok' },
+        { label: 'total p50' },
+        { label: 'total p95' },
+        { label: 'apertura p50' },
+        { label: 'respuesta p50' },
+        { label: 'procesos' },
+        { label: 'RSS máx' },
+      ]}
+      rows={realVsAbRows}
+    />
+
+    <ul class="fair">
+      <li>Los totales son comparables porque a 10 flujos cada herramienta gasta el tiempo en otro sitio: <code>cu</code>
+        hace cola en el presupuesto de sockets por origen de la app pero sus llamadas por paso siguen siendo rápidas
+        (apertura 0,1 s), mientras diez sesiones de agent-browser arrancan la app en frío sin caché compartida
+        (apertura 12 s, 30 s de boot cada una) pero tienen diez presupuestos de sockets independientes.</li>
+      <li>Los dos esperan por texto; la respuesta son 6,5 s (<code>cu</code>, sondeo de texto) contra 9,2 s
+        (agent-browser, sondeo de snapshot, más grueso). Dos flujos de cada corrida los perdió el mismo flake de
+        arranque de la app.</li>
+      <li><code>cu</code> mete todas las pestañas en un Chrome (27 procesos a 10 flujos); agent-browser paga un
+        navegador completo por sesión (113 procesos, el doble de RAM). Con logins en frío — cada sesión entrando por su
+        cuenta — agent-browser terminó <strong>0 de 20</strong> en 120 s; <code>cu</code> con una sesión compartida
+        sostiene 18 de 20.</li>
+    </ul>
+
+    <h3 class="sub-h">Lo que estas corridas dicen de cu</h3>
+    <ul class="fair">
+      <li><strong>Un comando de página enviado a través de una navegación client-side puede colgarse para siempre.</strong>
+        El daemon espera sin deadline y filtra un hilo y una conexión cada vez; el harness reintentó y terminó. Un
+        deadline por comando CDP pertenece a <code>cu</code>.</li>
+      <li><strong>Los refs mueren si la app re-renderiza entre el snapshot y el click</strong> («could not locate eN»):
+        snapshot nuevo y reintento; escribir en el composer también mata el ref del botón de enviar, así que se envía
+        con type + Enter.</li>
+      <li><strong><code>cu act</code> sale con código 0 y cuerpo <code>{"{"}"ok":false{"}"}</code></strong> — hay que leer el
+        cuerpo.</li>
+    </ul>
   </section>
 </main>
 
@@ -669,13 +838,12 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
   .big-quote { margin: 3rem 0 4rem; font-size: clamp(1.15rem, 2.2vw, 1.5rem); line-height: 1.4; max-width: 50rem; color: var(--dim); letter-spacing: -0.01em; }
   .big-quote span { font-family: var(--serif); font-style: italic; color: var(--cu); font-size: 1.8em; line-height: 1; }
 
-  .pending {
-    margin: 2.5rem 0 4rem; padding: 1.5rem 1.7rem; border: 1px dashed var(--line); border-radius: 14px;
-    background: var(--panel); max-width: 52rem;
+  .flow-desc { color: var(--dim); font-size: 0.92rem; max-width: 52rem; margin: -1.2rem 0 2rem; }
+  .flow-desc code, .lever code { color: var(--fg); }
+  .sub-h {
+    margin: 3rem 0 1rem; font-size: 1.15rem; letter-spacing: -0.015em; font-weight: 650;
   }
-  .pending h3 { margin: 0 0 0.5rem; font-size: 1.05rem; letter-spacing: -0.01em; }
-  .pending p { margin: 0; color: var(--dim); font-size: 0.92rem; }
-  .pending code { color: var(--fg); }
+  .lever { color: var(--dim); font-size: 0.9rem; max-width: 52rem; margin: 0 0 1rem; }
 
   .foot-site { border-top: 1px solid var(--line); padding: 2rem 0 3rem; color: var(--faint); font-size: 0.84rem; }
   .foot-site code { color: var(--dim); }
