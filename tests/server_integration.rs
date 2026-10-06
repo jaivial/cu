@@ -593,9 +593,11 @@ fn stopping_the_daemon_closes_its_browser() {
         std::thread::sleep(Duration::from_millis(10));
     };
     let client = cu::Client::new(format!("127.0.0.1:{port}"), token);
-    client.snapshot().expect("browser came up");
+    let up = client.snapshot();
+    // Stop the daemon before asserting anything, so a failure cannot leak it.
     let _ = Command::new("kill").arg(daemon.id().to_string()).status();
     let _ = daemon.wait();
+    up.expect("browser came up");
     let closed = std::fs::read_to_string(&marker).unwrap_or_default();
     let _ = remove_dir(&dir);
     assert_eq!(closed, "closed\n", "the browser outlived its daemon");

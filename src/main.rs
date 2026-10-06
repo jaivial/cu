@@ -28,6 +28,50 @@ fn main() {
         Some("shot") => request("GET", "/v1/screenshot?format=jpeg", None)
             .and_then(|s| write_screenshot(&s, args.get(1).map(String::as_str))),
         Some("snapshot") => request("GET", "/v1/snapshot", None).map(|s| println!("{s}")),
+        Some("click") => match args.get(1) {
+            Some(r) => request(
+                "POST",
+                "/v1/click",
+                Some(&format!("{{\"ref\":{}}}", server::json_string(r))),
+            )
+            .map(|s| println!("{s}")),
+            None => Err("usage: cu click REF".into()),
+        },
+        Some("type") => match (args.get(1), args.get(2)) {
+            (Some(r), Some(text)) => request(
+                "POST",
+                "/v1/type",
+                Some(&format!(
+                    "{{\"ref\":{},\"text\":{},\"submit\":{}}}",
+                    server::json_string(r),
+                    server::json_string(text),
+                    args.iter().any(|a| a == "--submit")
+                )),
+            )
+            .map(|s| println!("{s}")),
+            _ => Err("usage: cu type REF TEXT [--submit]".into()),
+        },
+        // `cu act '[{"do":"click","ref":"e3"}, ...]'`, or the JSON on stdin.
+        Some("act") => {
+            let actions = match args.get(1) {
+                Some(a) if a != "-" => Ok(a.clone()),
+                _ => {
+                    let mut input = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut input)
+                        .map(|_| input)
+                        .map_err(|e| e.to_string())
+                }
+            };
+            actions.and_then(|actions| {
+                request(
+                    "POST",
+                    "/v1/act",
+                    Some(&format!("{{\"actions\":{}}}", actions.trim())),
+                )
+                .map(|s| println!("{s}"))
+            })
+        }
         Some("login") => {
             println!(
                 "Open http://127.0.0.1:{DEFAULT_PORT}/login in a browser. Passwords go directly to the server."
@@ -47,7 +91,7 @@ fn main() {
 }
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR]\n  cu status\n  cu navigate URL\n  cu shot [FILE]\n  cu snapshot\n  cu login\n  cu session save NAME"
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR]\n  cu status\n  cu navigate URL\n  cu shot [FILE]\n  cu snapshot\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME"
     );
 }
 

@@ -35,6 +35,20 @@ impl Client {
     pub fn snapshot(&self) -> Result<String, String> {
         self.request("GET", "/v1/snapshot", "")
     }
+    /// Click the element a snapshot named `reference` (`e3`).
+    pub fn click(&self, reference: &str) -> Result<String, String> {
+        self.request(
+            "POST",
+            "/v1/click",
+            &format!("{{\"ref\":\"{}\"}}", escape(reference)),
+        )
+    }
+    /// Run a batch of actions in one round trip; `actions` is a JSON array
+    /// such as `[{"do":"type","ref":"e2","text":"hi"},{"do":"click","ref":"e3"}]`.
+    /// The reply ends with a fresh snapshot.
+    pub fn act(&self, actions: &str) -> Result<String, String> {
+        self.request("POST", "/v1/act", &format!("{{\"actions\":{actions}}}"))
+    }
     pub fn save_session(&self, name: &str) -> Result<String, String> {
         self.request("POST", &format!("/v1/session/{name}"), "{}")
     }
