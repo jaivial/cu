@@ -35,6 +35,14 @@ impl Client {
     pub fn snapshot(&self) -> Result<String, String> {
         self.request("GET", "/v1/snapshot", "")
     }
+    /// Open tabs: id, url, title, and which one the default tab resolves to.
+    pub fn tabs(&self) -> Result<String, String> {
+        self.request("GET", "/v1/tabs", "")
+    }
+    /// Close a tab (a popup, a window a click opened). The last tab is refused.
+    pub fn close_tab(&self, id: &str) -> Result<String, String> {
+        self.request("DELETE", &format!("/v1/tabs/{id}"), "{}")
+    }
     /// Files the browser has finished downloading, newest first.
     pub fn downloads(&self) -> Result<String, String> {
         self.request("GET", "/v1/downloads", "")

@@ -207,6 +207,8 @@ class Handler(BaseHTTPRequestHandler):
             target = "TAB%d" % (len(CONTEXT_TABS) + 1)
             CONTEXT_TABS[target] = (params or {}).get("browserContextId")
             return {"result": {"targetId": target}}
+        if method == "Target.closeTarget":
+            return {"result": {"success": True}}
         if method == "Target.disposeBrowserContext":
             ctx = (params or {}).get("browserContextId")
             for target in [t for t, c in CONTEXT_TABS.items() if c == ctx]:
