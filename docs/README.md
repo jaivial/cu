@@ -1,6 +1,6 @@
 # cu
 
-`cu` keeps one Chromium profile alive for an agent instead of launching a new browser per action. The profile is stored below `.cu/profiles/default`, and named copies are stored below `.cu/sessions`.
+`cu` keeps one Chromium profile alive for an agent instead of launching a new browser per action. The daemon keeps one Chrome per machine: its data dir defaults to `~/.local/state/cu` (the profile below `profiles/default`, named copies below `sessions`), so every session and project drives the same browser. `--data DIR` or `CU_DATA_DIR` buy a private daemon.
 
 ## Quick start
 
@@ -114,7 +114,7 @@ download already named it in its result.
 Latency for every one of these is tracked in [BENCHMARKS.md](BENCHMARKS.md),
 including a comparison with agent-browser and Playwright MCP.
 
-The browser executable defaults to `chromium`; set `CU_BROWSER` to an alternate binary. Browsers are launched headless, which is what an agent usually wants; set `CU_HEADLESS=0` to attach a display instead. `CU_DATA_DIR` changes the default data directory and `CU_CDP_PORT` the DevTools port (default `9222`). Do not expose this server beyond localhost without adding TLS and an access-control layer.
+The browser executable defaults to `chromium`; set `CU_BROWSER` to an alternate binary. Browsers are launched headless, which is what an agent usually wants; set `CU_HEADLESS=0` to attach a display instead. `CU_DATA_DIR` changes the default data directory (`~/.local/state/cu`; one daemon and one Chrome per machine is the model) and `CU_CDP_PORT` the DevTools port (default `9222`). Do not expose this server beyond localhost without adding TLS and an access-control layer.
 
 ## Login
 
