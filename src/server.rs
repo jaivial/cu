@@ -222,6 +222,44 @@ fn clear_stale_locks(data: &Path) {
     }
 }
 
+/// Flags every browser is launched with.
+///
+/// An agent's browser needs pages, DevTools and the profile -- not updates,
+/// sync, translation, crash upload, audio or a GPU process. Each of those is a
+/// process or a background timer, and on a loaded machine they compete with
+/// the page for CPU. Site isolation is relaxed so same-site frames share one
+/// renderer, which is most of the memory saving.
+pub const BROWSER_ARGS: &[&str] = &[
+    "--remote-allow-origins=*",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-dev-shm-usage",
+    // Background work an agent never asked for.
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-sync",
+    "--disable-default-apps",
+    "--disable-extensions",
+    "--disable-breakpad",
+    "--disable-crash-reporter",
+    "--metrics-recording-only",
+    "--no-pings",
+    "--mute-audio",
+    "--password-store=basic",
+    // Rendering: software raster in the browser process, no GPU process.
+    "--disable-gpu",
+    "--in-process-gpu",
+    // The network service as a thread of the browser, not a process.
+    "--enable-features=NetworkServiceInProcess",
+    // Fewer processes: same-site frames share a renderer.
+    "--disable-site-isolation-trials",
+    "--renderer-process-limit=4",
+    "--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,\
+     AutofillServerCommunication,CalculateNativeWinOcclusion,InterestFeedContentSuggestions,\
+     CertificateTransparencyComponentUpdater,LensOverlay,PaintHolding,\
+     SpareRendererForSitePerProcess,BackForwardCache",
+];
+
 /// Launch the persistent Chromium that owns `data/profiles/default`.
 ///
 /// The DevTools port must match the port the daemon was configured with:
@@ -241,12 +279,7 @@ pub fn launch_browser(data: &Path, cdp_port: u16) -> Result<Child, String> {
     let mut command = Command::new(binary);
     command
         .arg(format!("--remote-debugging-port={cdp_port}"))
-        .args([
-            "--remote-allow-origins=*",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-dev-shm-usage",
-        ])
+        .args(BROWSER_ARGS)
         // One argument: Chromium only parses `--user-data-dir=PATH` here, and
         // treats a separate PATH as a second target ("Multiple targets are not
         // supported in headless mode", exit 13).
@@ -1442,6 +1475,27 @@ mod snapshot_tests {
         assert!(script.contains("DOMContentLoaded"));
         assert!(script.contains("setTimeout"));
         assert!(script.contains("1234"));
+    }
+
+    #[test]
+    fn the_browser_is_launched_light() {
+        for flag in [
+            "--disable-gpu",
+            "--disable-extensions",
+            "--disable-background-networking",
+        ] {
+            assert!(BROWSER_ARGS.contains(&flag), "{flag} missing");
+        }
+        // One --disable-features: Chromium only honours the last one it sees.
+        let features: Vec<_> = BROWSER_ARGS
+            .iter()
+            .filter(|a| a.starts_with("--disable-features="))
+            .collect();
+        assert_eq!(features.len(), 1);
+        assert!(
+            !features[0].contains(' '),
+            "feature list must not hold spaces"
+        );
     }
 
     #[test]
