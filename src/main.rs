@@ -16,28 +16,46 @@ fn main() {
     // `--tab ID` runs any page command in another tab (a popup a click
     // opened, found with `cu tabs`); it is lifted out before dispatch.
     let mut tab: Option<String> = None;
+    let mut context: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--tab" {
-            if i + 1 >= args.len() {
-                eprintln!("cu: --tab needs a tab id (see `cu tabs`)");
-                std::process::exit(1);
+        let (flag, slot, hint) = match args[i].as_str() {
+            "--tab" => ("--tab", &mut tab, "a tab id (see `cu tabs`)"),
+            "--context" => ("--context", &mut context, "a context name"),
+            _ => {
+                i += 1;
+                continue;
             }
-            tab = Some(args.remove(i + 1));
-            args.remove(i);
-        } else {
-            i += 1;
+        };
+        if i + 1 >= args.len() {
+            eprintln!("cu: {flag} needs {hint}");
+            std::process::exit(1);
         }
+        *slot = Some(args.remove(i + 1));
+        args.remove(i);
     }
-    // Append `tab=` to a page command's path, keeping any query it has.
-    let on_tab = |path: &str| match &tab {
-        None => path.to_string(),
-        Some(id) if path.contains('?') => format!("{path}&tab={id}"),
-        Some(id) => format!("{path}?tab={id}"),
+    // Append `tab=`/`context=` to a page command's path, keeping any query it
+    // has: `--tab ID` runs in another tab, `--context NAME` in an isolated
+    // browser context of the same Chrome (giving both is an error server-side).
+    let on_tab = |path: &str| {
+        let mut pick = Vec::new();
+        if let Some(id) = &tab {
+            pick.push(format!("tab={id}"));
+        }
+        if let Some(name) = &context {
+            pick.push(format!("context={name}"));
+        }
+        if pick.is_empty() {
+            path.to_string()
+        } else if path.contains('?') {
+            format!("{path}&{}", pick.join("&"))
+        } else {
+            format!("{path}?{}", pick.join("&"))
+        }
     };
     let result = match args.first().map(String::as_str) {
         Some("start") => start(&args[1..]),
-        Some("status") => request("GET", "/v1/status", None).map(|s| println!("{s}")),
+        Some("status") => status(&args[1..]),
         Some("navigate") => match args.get(1) {
             Some(url) => request(
                 "POST",
@@ -107,6 +125,10 @@ fn main() {
                 .map(|s| println!("{s}"))
             })
         }
+        Some("tab") => tab_cmd(&args[1..]),
+        Some("context") => context_cmd(&args[1..]),
+        Some("lease") => lease_cmd(&args[1..]),
+        Some("batch") => batch(&args[1..]),
         Some("login") => {
             println!(
                 "Open http://127.0.0.1:{DEFAULT_PORT}/login in a browser. Passwords go directly to the server."
@@ -124,9 +146,247 @@ fn main() {
         std::process::exit(1);
     }
 }
+/// `cu status [--short]`: full JSON, or one compact line for scripts.
+fn status(args: &[String]) -> Result<(), String> {
+    let s = request("GET", "/v1/status", None)?;
+    if args.first().map(String::as_str) == Some("--short") {
+        // JSON strings come back quoted; `true`/numbers are bare literals.
+        let field = |k: &str| {
+            server::json_value(&s, k)
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| {
+                let needle = format!("\"{k}\":");
+                s.split_once(&needle)
+                    .map(|(_, rest)| {
+                        rest.trim_start()
+                            .split(|c: char| !c.is_ascii_alphanumeric() && c != '.')
+                            .next()
+                            .unwrap_or("")
+                            .to_string()
+                    })
+                    .unwrap_or_default()
+            })
+        };
+        println!(
+            "running={} browser={} leases={}",
+            field("running"),
+            field("browser"),
+            field("leases")
+        );
+    } else {
+        println!("{s}");
+    }
+    Ok(())
+}
+
+/// Parse `--lease N` / `--label NAME` plus one positional argument.
+fn lease_and_label(args: &[String]) -> Result<(String, String, Option<String>), String> {
+    let mut positional = String::new();
+    let mut lease = None;
+    let mut label = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--lease" => {
+                i += 1;
+                lease = Some(args.get(i).ok_or("--lease needs seconds")?.clone());
+            }
+            "--label" => {
+                i += 1;
+                label = args.get(i).ok_or("--label needs a name")?.clone();
+            }
+            flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
+            other => positional = other.to_string(),
+        }
+        i += 1;
+    }
+    Ok((positional, label, lease))
+}
+
+/// `cu tab open [URL] [--lease S] [--label NAME]`, `close ID`, `renew ID [S]`.
+fn tab_cmd(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("open") => {
+            let (url, label, lease) = lease_and_label(&args[1..])?;
+            let mut body = format!(
+                "{{\"url\":{},\"label\":{}}}",
+                server::json_string(&url),
+                server::json_string(&label)
+            );
+            if let Some(seconds) = lease {
+                body.insert(body.len() - 1, ',');
+                body.push_str(&format!("\"lease\":{seconds}"));
+            }
+            request("POST", "/v1/tabs", Some(&body)).map(|s| println!("{s}"))
+        }
+        Some("close") => match args.get(1) {
+            Some(id) => request("DELETE", &format!("/v1/tabs/{id}"), Some("{}")).map(|s| println!("{s}")),
+            None => Err("usage: cu tab close ID".into()),
+        },
+        Some("renew") => match args.get(1) {
+            Some(id) => {
+                let seconds = args.get(2).map(String::as_str).unwrap_or("600");
+                request(
+                    "POST",
+                    "/v1/lease",
+                    Some(&format!(
+                        "{{\"key\":{},\"seconds\":{}}}",
+                        server::json_string(&format!("tab:{id}")),
+                        seconds
+                    )),
+                )
+                .map(|s| println!("{s}"))
+            }
+            None => Err("usage: cu tab renew ID [SECONDS]".into()),
+        },
+        _ => Err("usage: cu tab open [URL] [--lease S] [--label NAME] | close ID | renew ID [SECONDS]".into()),
+    }
+}
+
+/// `cu context open NAME [--lease S] [--label NAME]`, `close NAME`.
+fn context_cmd(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("open") => {
+            let (name, label, lease) = lease_and_label(&args[1..])?;
+            if name.is_empty() {
+                return Err("usage: cu context open NAME [--lease S] [--label NAME]".into());
+            }
+            let mut body = format!(
+                "{{\"name\":{},\"label\":{}}}",
+                server::json_string(&name),
+                server::json_string(&label)
+            );
+            if let Some(seconds) = lease {
+                body.insert(body.len() - 1, ',');
+                body.push_str(&format!("\"lease\":{seconds}"));
+            }
+            request("POST", "/v1/contexts", Some(&body)).map(|s| println!("{s}"))
+        }
+        Some("close") => match args.get(1) {
+            Some(name) => {
+                request("DELETE", &format!("/v1/contexts/{name}"), Some("{}")).map(|s| println!("{s}"))
+            }
+            None => Err("usage: cu context close NAME".into()),
+        },
+        _ => Err("usage: cu context open NAME [--lease S] [--label NAME] | close NAME".into()),
+    }
+}
+
+/// `cu lease` lists held leases; `cu lease KEY [SECONDS]` sets or extends one.
+fn lease_cmd(args: &[String]) -> Result<(), String> {
+    match args.first() {
+        None => request("GET", "/v1/leases", None).map(|s| println!("{s}")),
+        Some(key) => {
+            let seconds = args.get(1).map(String::as_str).unwrap_or("600");
+            request(
+                "POST",
+                "/v1/lease",
+                Some(&format!(
+                    "{{\"key\":{},\"seconds\":{}}}",
+                    server::json_string(key),
+                    seconds
+                )),
+            )
+            .map(|s| println!("{s}"))
+        }
+    }
+}
+
+/// Split one `cu batch` line into argv words: spaces, with "double" and
+/// 'single' quotes for arguments that contain spaces.
+fn split_command_line(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in line.chars() {
+        if escaped {
+            current.push(c);
+            escaped = false;
+        } else if c == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else {
+                current.push(c);
+            }
+        } else if c == '"' || c == '\'' {
+            quote = Some(c);
+        } else if c.is_whitespace() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// `cu batch 'CMD' 'CMD' ...` (or command lines on stdin): many commands, one
+/// tool call. One compact JSON line per command; the exit code is 0 only when
+/// every command succeeded.
+fn batch(args: &[String]) -> Result<(), String> {
+    let lines: Vec<String> = if args.is_empty() {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_to_string(&mut input)
+            .map_err(|e| e.to_string())?;
+        input
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(String::from)
+            .collect()
+    } else {
+        args.to_vec()
+    };
+    if lines.is_empty() {
+        return Err("usage: cu batch 'CMD [ARGS...]' ... (or command lines on stdin)".into());
+    }
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    let mut failed = 0usize;
+    for line in &lines {
+        let argv = split_command_line(line);
+        if argv.is_empty() {
+            continue;
+        }
+        let out = std::process::Command::new(&exe)
+            .args(&argv)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            println!(
+                "{{\"cmd\":{},\"ok\":true,\"out\":{}}}",
+                server::json_string(line),
+                server::json_string(&stdout)
+            );
+        } else {
+            failed += 1;
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let error = stderr.strip_prefix("cu: ").unwrap_or(&stderr);
+            println!(
+                "{{\"cmd\":{},\"ok\":false,\"error\":{}}}",
+                server::json_string(line),
+                server::json_string(error)
+            );
+        }
+    }
+    if failed > 0 {
+        Err(format!("{failed} of {} commands failed", lines.len()))
+    } else {
+        Ok(())
+    }
+}
+
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR]\n  cu status\n  cu navigate URL\n  cu shot [FILE]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
+        "cu \u{2014} persistent browser for AI agents\n\n  cu start [--port N] [--data DIR]\n  cu status [--short]\n  cu navigate URL\n  cu shot [FILE]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu tab open [URL] [--lease S] [--label NAME]\n  cu tab close ID | cu tab renew ID [SECONDS]\n  cu context open NAME [--lease S] [--label NAME]\n  cu context close NAME\n  cu lease [KEY [SECONDS]]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu batch 'CMD' 'CMD' ...   (or command lines on stdin)\n  cu login\n  cu session save NAME\n\nPage commands take --tab ID or --context NAME to run in another tab or an\nisolated context. Leased tabs and contexts are closed by the daemon when the\nlease expires, so a test that dies leaves nothing behind.\n\nExit codes: 0 ok, 1 error (the message says what and why)."
     );
 }
 
@@ -260,6 +520,19 @@ mod tests {
     #[test]
     fn base64_decodes_png_prefix() {
         assert_eq!(decode_base64("iVBORw0KGgo=").unwrap(), b"\x89PNG\r\n\x1a\n");
+    }
+    #[test]
+    fn batch_lines_split_like_a_shell() {
+        use super::split_command_line;
+        assert_eq!(
+            split_command_line("navigate https://x.test --tab t1"),
+            vec!["navigate", "https://x.test", "--tab", "t1"]
+        );
+        assert_eq!(
+            split_command_line("type e2 \"hello world\" --submit"),
+            vec!["type", "e2", "hello world", "--submit"]
+        );
+        assert_eq!(split_command_line("click 'e 3'"), vec!["click", "e 3"]);
     }
     #[test]
     fn names_cannot_escape_profile_directory() {
