@@ -1,11 +1,12 @@
 //! Loopback HTTP server for `cu`: request parsing, routing and the browser bridge.
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -879,41 +880,118 @@ pub fn page_targets(discovery: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn cdp_command(cdp_port: u16, method: &str, params: &str) -> Result<String, String> {
-    let target = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")?;
-    let ws = page_targets(&target)
-        .into_iter()
-        .next()
-        .ok_or("Chromium did not expose a page target")?;
-    let (host, path) = ws
-        .strip_prefix("ws://")
-        .and_then(|s| s.split_once('/'))
-        .ok_or("unsupported CDP websocket URL")?;
-    let mut stream = TcpStream::connect(host).map_err(|e| e.to_string())?;
-    let key = base64_encode(b"cu-cdp-clientkey");
-    write!(stream, "GET /{path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").map_err(|e| e.to_string())?;
-    let mut handshake = [0; 2048];
-    let n = stream.read(&mut handshake).map_err(|e| e.to_string())?;
-    if !String::from_utf8_lossy(&handshake[..n]).starts_with("HTTP/1.1 101") {
-        return Err("Chromium rejected CDP websocket handshake".into());
+/// A DevTools websocket kept open between commands.
+///
+/// Opening one cost a `/json` discovery request, a TCP connect and a websocket
+/// handshake per action -- all of it pure overhead repeated for every navigate,
+/// screenshot and snapshot an agent takes. Keeping the connection means an
+/// action is one write and one read.
+struct CdpConnection {
+    stream: TcpStream,
+    next_id: u64,
+}
+
+impl CdpConnection {
+    /// Discover the page target and complete the websocket handshake.
+    fn open(cdp_port: u16) -> Result<Self, String> {
+        let target = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")?;
+        let ws = page_targets(&target)
+            .into_iter()
+            .next()
+            .ok_or("Chromium did not expose a page target")?;
+        let (host, path) = ws
+            .strip_prefix("ws://")
+            .and_then(|s| s.split_once('/'))
+            .ok_or("unsupported CDP websocket URL")?;
+        let mut stream = TcpStream::connect(host).map_err(|e| e.to_string())?;
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(Some(CDP_HTTP_TIMEOUT));
+        let key = base64_encode(b"cu-cdp-clientkey");
+        write!(stream, "GET /{path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+            .map_err(|e| e.to_string())?;
+        let mut handshake = [0; 2048];
+        let n = stream.read(&mut handshake).map_err(|e| e.to_string())?;
+        if !String::from_utf8_lossy(&handshake[..n]).starts_with("HTTP/1.1 101") {
+            return Err("Chromium rejected CDP websocket handshake".into());
+        }
+        Ok(Self { stream, next_id: 1 })
     }
-    let message = format!("{{\"id\":1,\"method\":\"{method}\",\"params\":{params}}}");
+
+    /// Send one command and read its reply, skipping events meant for nobody.
+    fn call(&mut self, method: &str, params: &str) -> Result<String, String> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        let message = format!("{{\"id\":{id},\"method\":\"{method}\",\"params\":{params}}}");
+        self.stream
+            .write_all(&encode_client_frame(message.as_bytes()))
+            .map_err(|e| e.to_string())?;
+        loop {
+            let payload = read_frame(&mut self.stream, MAX_CDP_MESSAGE)?;
+            let text = String::from_utf8(payload).map_err(|e| e.to_string())?;
+            // Events carry no `id`; a reply for an older, abandoned command is
+            // not ours either. Both are skipped rather than misreported.
+            match json_value(&text, "id") {
+                Some(got) if got == id.to_string() => return Ok(text),
+                Some(_) => continue,
+                None => continue,
+            }
+        }
+    }
+}
+
+/// A client-to-server websocket frame: masked, as the protocol requires.
+fn encode_client_frame(bytes: &[u8]) -> Vec<u8> {
     let mask = [0x43, 0x55, 0x2d, 0x31];
-    let bytes = message.as_bytes();
     let mut frame = vec![0x81];
     if bytes.len() < 126 {
         frame.push(0x80 | bytes.len() as u8);
-    } else {
+    } else if bytes.len() < 65536 {
         frame.push(0x80 | 126);
         frame.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    } else {
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
     }
     frame.extend_from_slice(&mask);
     for (i, byte) in bytes.iter().enumerate() {
         frame.push(byte ^ mask[i % 4]);
     }
-    stream.write_all(&frame).map_err(|e| e.to_string())?;
-    let payload = read_frame(&mut stream, MAX_CDP_MESSAGE)?;
-    String::from_utf8(payload).map_err(|e| e.to_string())
+    frame
+}
+
+/// One pooled connection per DevTools endpoint, shared by every request thread.
+///
+/// Commands on one page are inherently ordered, so a single connection guarded
+/// by a lock is not a bottleneck: it removes a discovery round trip, a TCP
+/// connect and a handshake from every action, and it lets parallel actions
+/// queue on a warm socket instead of each paying set-up again.
+fn cdp_pool(cdp_port: u16) -> Arc<Mutex<Option<CdpConnection>>> {
+    static POOL: OnceLock<Mutex<HashMap<u16, Arc<Mutex<Option<CdpConnection>>>>>> = OnceLock::new();
+    let pool = POOL.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(guard.entry(cdp_port).or_default())
+}
+
+/// Run one DevTools command, reusing the open websocket when there is one.
+///
+/// A connection the browser has dropped is reopened and the command retried
+/// once, so a navigation that swapped the target does not surface as an error.
+pub fn cdp_command(cdp_port: u16, method: &str, params: &str) -> Result<String, String> {
+    let connection = cdp_pool(cdp_port);
+    let mut guard = connection.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = guard.as_mut() {
+        match existing.call(method, params) {
+            Ok(reply) => return Ok(reply),
+            Err(_) => *guard = None,
+        }
+    }
+    let mut fresh = CdpConnection::open(cdp_port)?;
+    let reply = fresh.call(method, params);
+    // A failed open is not cached, so the next attempt tries again.
+    if reply.is_ok() {
+        *guard = Some(fresh);
+    }
+    reply
 }
 /// A DevTools HTTP request may not be answered with `Connection: close`, so the
 /// response has to be framed rather than read to EOF: `read_to_string` used to
