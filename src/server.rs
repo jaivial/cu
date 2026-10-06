@@ -324,9 +324,10 @@ pub const BROWSER_ARGS: &[&str] = &[
     "--no-pings",
     "--mute-audio",
     "--password-store=basic",
-    // Rendering: software raster in the browser process, no GPU process.
+    // Rendering: software raster. (`--in-process-gpu` would also drop the GPU
+    // process, but it crashes chrome-headless-shell on cross-document
+    // navigation, so it is not used.)
     "--disable-gpu",
-    "--in-process-gpu",
     // The network service as a thread of the browser, not a process.
     "--enable-features=NetworkServiceInProcess",
     // Fewer processes: same-site frames share a renderer.
