@@ -705,69 +705,47 @@ pub fn json_array(input: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Is the page usable *now*, in the browser's own judgement?
+/// Wait in the page for the DOM to be usable, in one CDP round trip.
 ///
-/// This is the "smart wait". Waiting for the network to go quiet hangs forever
-/// on a page that holds an SSE stream, a websocket or a long poll open -- which
-/// is most of them -- so the question asked here is the one Playwright calls
-/// `domcontentloaded` plus "has the DOM stopped changing".
-fn page_is_settled(cdp_port: u16) -> bool {
-    let probe = r#"(function(){
-      return JSON.stringify({
-        ready: document.readyState,
-        loading: document.readyState === 'loading',
-        mutating: (function(){
-          var n = 0;
-          var obs = new MutationObserver(function(m){ n += m.length; });
-          obs.observe(document.documentElement, {childList:true, subtree:true, attributes:true});
-          return n;
-        })()
-      });
-    })()"#;
-    match cdp_command(
-        cdp_port,
-        "Runtime.evaluate",
-        &format!(
-            "{{\"expression\":{},\"returnByValue\":true}}",
-            json_string(probe)
-        ),
-    ) {
-        Ok(result) => {
-            let value = json_objects(&result)
-                .iter()
-                .filter_map(|o| json_string_value(o, "value"))
-                .next()
-                .or_else(|| json_string_value(&result, "value"))
-                .unwrap_or_default();
-            let ready = json_string_value(&value, "ready");
-            // `complete` or `interactive` with no pending mutations is a page an
-            // agent can act on. `loading` is not.
-            matches!(ready.as_deref(), Some("complete") | Some("interactive"))
-                && json_value(&value, "mutating").as_deref() != Some("1")
-        }
-        Err(_) => false,
-    }
+/// The first smart wait polled `document.readyState` every 25 ms, so a page
+/// that became interactive just after a poll paid most of a tick for nothing:
+/// that was the navigate p95 regression (~25 ms -> ~67 ms). Here the page
+/// itself resolves a promise on `DOMContentLoaded` -- or at once when it is
+/// already past `loading` -- and the daemon awaits it, so the wait ends the
+/// moment the page is usable. An SSE stream or websocket cannot hold it open:
+/// the in-page timer caps it at `budget`.
+fn settle_script(budget: Duration) -> String {
+    format!(
+        "new Promise(function(r){{\
+           if(document.readyState!=='loading'){{r(document.readyState);return;}}\
+           document.addEventListener('DOMContentLoaded',function(){{r(document.readyState);}},{{once:true}});\
+           setTimeout(function(){{r(document.readyState);}},{});\
+         }})",
+        budget.as_millis()
+    )
 }
 
 /// Wait until the page is usable, or give up and let the agent have what is
-/// there.
+/// there. Returns how long the wait took.
 ///
-/// The budget is spent in favour of the agent, not against it: the first poll
-/// answers as soon as the DOM is interactive, which is typically a few tens of
-/// milliseconds after `Page.navigate` returns, and a page that never settles
-/// (SSE, websocket, long poll) costs at most `SETTLE_MAX` instead of hanging.
+/// A navigation that swaps the execution context under the evaluate makes it
+/// fail; that is retried until the budget is spent, so a cross-document
+/// redirect still ends on a settled page rather than an error.
 pub fn wait_for_page(cdp_port: u16, budget: Duration) -> Duration {
     let started = std::time::Instant::now();
-    let deadline = started + budget.max(SETTLE_TIMEOUT);
-    loop {
-        if page_is_settled(cdp_port) {
-            return started.elapsed();
+    let budget = budget.max(SETTLE_TIMEOUT);
+    while started.elapsed() < budget {
+        let left = budget.saturating_sub(started.elapsed());
+        let params = format!(
+            "{{\"expression\":{},\"awaitPromise\":true,\"returnByValue\":true}}",
+            json_string(&settle_script(left))
+        );
+        match cdp_command(cdp_port, "Runtime.evaluate", &params) {
+            Ok(reply) if !reply.contains("\"exceptionDetails\"") => break,
+            _ => thread::sleep(Duration::from_millis(2)),
         }
-        if std::time::Instant::now() >= deadline {
-            return started.elapsed();
-        }
-        thread::sleep(Duration::from_millis(25));
     }
+    started.elapsed()
 }
 
 /// Type the credentials into the page the browser is showing and submit it.
@@ -1456,6 +1434,14 @@ mod snapshot_tests {
         let snap = parse_snapshot(r#"{"url":"about:blank","nodes":[]}"#).expect("parses");
         assert!(snap.nodes.is_empty());
         assert_eq!(snap.title, "");
+    }
+
+    #[test]
+    fn the_settle_wait_resolves_in_the_page_and_is_bounded() {
+        let script = settle_script(Duration::from_millis(1234));
+        assert!(script.contains("DOMContentLoaded"));
+        assert!(script.contains("setTimeout"));
+        assert!(script.contains("1234"));
     }
 
     #[test]
