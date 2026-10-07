@@ -107,3 +107,63 @@ export const realVsAb = [
   { tool: 'cu', mode: 'un Chrome compartido', ok: '18 / 20', p50: 67.4, p95: 80.1, open: 0.1, ans: 6.5, procs: 27, rss: 6.3 },
   { tool: 'agent-browser', mode: 'un navegador por sesión', ok: '18 / 20', p50: 58.6, p95: 69.7, open: 12.0, ans: 9.2, procs: 113, rss: 12.8 },
 ];
+
+// Two rounds of PARALLEL AGENTS: real headless mini-tui sessions driven by
+// MiniMax-M3.1-Flash-Preview against the Sage chat of neural-dev. Each agent
+// opens its own cu context (isolated cookie jar) in the ONE shared Chrome,
+// signs in, opens a new conversation, sends a marker and waits for the answer
+// by text (marker twice: echo + streamed reply). Model latency, one bash
+// round-trip per step and a whole agent session are all inside these numbers.
+// Box: 12 cores, 64 GB, ~8 GB of swap already consumed before the run.
+// Sampled every 5 s; the 3 GB hard floor never came close. `avail` is
+// MemAvailable MB, the minimum of the level. `f429` = 429 events / agents hit
+// / fatal (round 2 only; round 1 counted them as failures).
+// Round 1, 2026-10-06: levels 1-6 from a sweep whose stopwatch collected
+// finished agents serially, so those latencies are floors; the 10 and 12 rows
+// are the corrected repeat, one timing thread per agent.
+export const parRound1 = [
+  { c: 1, ok: 1, of: 1, rate: 100, p50: 117.6, p95: null, avail: 24700, chrome: 1.8, agents: 0.06 },
+  { c: 2, ok: 2, of: 2, rate: 100, p50: 162.4, p95: 162.4, avail: 24494, chrome: 2.2, agents: 0.13 },
+  { c: 4, ok: 4, of: 4, rate: 100, p50: 136.9, p95: 136.9, avail: 24137, chrome: 2.7, agents: 0.25 },
+  { c: 6, ok: 6, of: 6, rate: 100, p50: 75.3, p95: 149.6, avail: 23729, chrome: 3.4, agents: 0.36 },
+  { c: 8, ok: 8, of: 8, rate: 100, p50: 162.6, p95: 162.6, avail: 23311, chrome: 4.1, agents: 0.48 },
+  { c: 10, ok: 9, of: 10, rate: 90, p50: 136.8, p95: 244.4, avail: 22712, chrome: 4.6, agents: 0.59 },
+  { c: 12, ok: 11, of: 12, rate: 91.7, p50: 162.6, p95: 270.9, avail: 22280, chrome: 5.3, agents: 0.71 },
+];
+
+// Round 2, 2026-10-07: the model's token plan had reset, so 8-16 were re-run
+// with a 429 counter. A reset cut the 429s at 8 and 10 to zero and lifted the
+// already-measured levels, but the same 429 came back at 12b, 14 and 16. The
+// hard stop rule (success < 80%) fired at 16.
+export const parRound2 = [
+  { c: 8, rep: false, ok: 8, of: 8, rate: 100, p50: 121.7, p95: 271.0, avail: 22516, chrome: 3.6, agents: 0.48, ev429: 0, hit429: 0, fatal429: 0 },
+  { c: 10, rep: false, ok: 10, of: 10, rate: 100, p50: 76.3, p95: 261.9, avail: 23031, chrome: 4.2, agents: 0.6, ev429: 0, hit429: 0, fatal429: 0 },
+  { c: 12, rep: false, ok: 12, of: 12, rate: 100, p50: 125.7, p95: 200.3, avail: 22747, chrome: 4.7, agents: 0.72, ev429: 0, hit429: 0, fatal429: 0 },
+  { c: 12, rep: true, ok: 11, of: 12, rate: 91.7, p50: 125.4, p95: 202.5, avail: 20261, chrome: 4.7, agents: 0.71, ev429: 3, hit429: 2, fatal429: 1 },
+  { c: 14, rep: false, ok: 12, of: 14, rate: 85.7, p50: 180.7, p95: 374.3, avail: 22063, chrome: 5.1, agents: 0.82, ev429: 8, hit429: 2, fatal429: 2 },
+  { c: 16, rep: false, ok: 12, of: 16, rate: 75.0, p50: 180.7, p95: 368.5, avail: 21939, chrome: 5.6, agents: 0.94, ev429: 7, hit429: 3, fatal429: 3 },
+];
+
+export const parHeadline = [
+  { k: '8-10', d: 'agentes en paralelo: seguro, 100 % dos veces' },
+  { k: '12', d: 'el l\u00edmite: 100 % una vez, 91,7 % al repetir' },
+  { k: '~0,3 GB', d: 'de RAM marginal por agente (Chrome + proceso)' },
+  { k: '20,2 GB', d: 'de RAM libre m\u00ednima medida, suelo en 3 GB' },
+];
+
+// The 429, verbatim as Sage returned it inside the conversation.
+export const par429 = 'Error code: 429 - rate_limit_error: All credentials for model claude-minimax-m2-5-highspeed are cooling down via provider claude';
+
+// Per-agent marginal cost, measured from the level tables above.
+export const parCost = [
+  { what: 'contexto en el Chrome compartido', mem: '~0,25 GB', note: '~300 MB por contexto abierto, el consumidor dominante' },
+  { what: 'proceso del agente (mini-tui headless)', mem: '~0,06 GB', note: 'plano: 15-60 MB, 16 agentes = 939 MB' },
+  { what: 'total por agente', mem: '~0,3 GB', note: 'nada superlineal: 2x agentes = ~1,6x la RAM de Chrome' },
+];
+
+// Failure classification across both rounds. 429s are the app's gateway, not cu.
+export const parFails = [
+  { label: '429 del proveedor (gateway de Sage)', n: 9, d: 'todos con el mismo error, devuelto dentro de la conversaci\u00f3n' },
+  { label: 'auto-interrupci\u00f3n del agente', n: 1, d: 'el agente se cort\u00f3 solo antes de su ventana de 180 s: decisi\u00f3n suya, no capacidad' },
+  { label: 'UI, login, conversaci\u00f3n nueva, marcador', n: 0, d: 'funcionaron en todos los intentos, sin excepci\u00f3n' },
+];

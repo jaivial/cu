@@ -69,6 +69,17 @@
   match what came back.
 - `bench/cu_bench.py`, which times start, navigate, snapshot and screenshot
   against a real Chromium over the loopback API.
+- A "Parallel agents" section in the README and the landing: two rounds of
+  real agent sessions (1 to 16 at once, MiniMax-M3.1-Flash-Preview driving
+  `cu` against a production chat app, one `cu` context each inside the one
+  shared Chrome) with the measured success rate, p50/p95, minimum available
+  RAM, shared-Chrome and agent RSS, and 429 counts per level. The finding is
+  that the bottleneck was the app's LLM provider rate limit and not RAM
+  (available memory never fell below ~20 GB against a 3 GB floor): 8-10 agents
+  are safe, 12 is the limit, 14+ is not recommended with that provider, and the
+  marginal cost is ~0.3 GB per agent (~0.25 GB in the shared Chrome, ~0.06 GB
+  for the agent process). Measured and extrapolated numbers are labelled apart;
+  nothing above 16 agents was measured.
 
 ### Changed
 

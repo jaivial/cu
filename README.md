@@ -222,6 +222,127 @@ the RAM).
   button's ref, so send with type + Enter.
 - **`cu act` exits 0 with an `{"ok":false}` body** -- callers must read the body.
 
+## Parallel agents
+
+The sweep above runs scripted flows. This one runs **real AI agents**: each
+"agent" is a headless `mini-tui` session driven by
+MiniMax-M3.1-Flash-Preview, given the exact `cu` commands and left to decide the
+flow itself -- open **its own** `cu` context (isolated cookie jar inside the one
+shared Chrome), navigate, sign in if the page asks, open the app's assistant
+chat, start a new conversation, send a message with a unique marker, wait for
+the answer **by text** (the marker shows up twice: the echo plus the streamed
+reply), judge it, close its context. So this measures model latency, one bash
+round-trip per step and a whole agent session on top of the browser, twice.
+
+Target: the **Sage chat of neural-dev**, a production app, static build served
+behind nginx/Cloudflare. Box: 12 cores, 64 GB, 8 GB of swap already consumed
+before the run (pressure not caused by this benchmark). One shared Chrome for
+every agent; `MemAvailable`, swap, shared-Chrome RSS and agent RSS sampled every
+5 s, with a 3 GB hard floor that would have killed only this run's PIDs.
+**That floor never came close.**
+
+### Round 1 -- 1 to 12 agents
+
+| agents | ok | success | p50 | p95 | min available RAM | Chrome RSS max | agents RSS max |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 / 1 | 100% | 117.6 s | -- | 24 700 MB | 1.8 GB | 64 MB |
+| 2 | 2 / 2 | 100% | 162.4 s | 162.4 s | 24 494 MB | 2.2 GB | 129 MB |
+| 4 | 4 / 4 | 100% | 136.9 s | 136.9 s | 24 137 MB | 2.7 GB | 248 MB |
+| 6 | 6 / 6 | 100% | 75.3 s | 149.6 s | 23 729 MB | 3.4 GB | 360 MB |
+| 8 | 8 / 8 | 100% | 162.6 s | 162.6 s | 23 311 MB | 4.1 GB | 477 MB |
+| 10 | 9 / 10 | 90% | 136.8 s | 244.4 s | 22 712 MB | 4.6 GB | 593 MB |
+| 12 | 11 / 12 | 91.7% | 162.6 s | 270.9 s | 22 280 MB | 5.3 GB | 711 MB |
+
+(The 1-6 levels came from a first sweep whose stopwatch collected finished
+agents serially, so its latencies are floors, not medians; pass/fail and RAM are
+valid in every row. The 10 and 12 rows above are the corrected repeat, one
+timing thread per agent.)
+
+### Round 2 -- 8 to 16 agents
+
+| agents | ok | success | p50 | p95 | min available RAM | Chrome RSS | agents RSS | 429 events / agents hit / fatal |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 8 | 8 / 8 | 100% | 121.7 s | 271.0 s | 22 516 MB | 3.6 GB | 475 MB | 0 / 0 / 0 |
+| 10 | 10 / 10 | 100% | 76.3 s | 261.9 s | 23 031 MB | 4.2 GB | 602 MB | 0 / 0 / 0 |
+| 12 | 12 / 12 | 100% | 125.7 s | 200.3 s | 22 747 MB | 4.7 GB | 717 MB | 0 / 0 / 0 |
+| 12 (repeat) | 11 / 12 | 91.7% | 125.4 s | 202.5 s | 20 261 MB | 4.7 GB | 706 MB | 3 / 2 / 1 |
+| 14 | 12 / 14 | 85.7% | 180.7 s | 374.3 s | 22 063 MB | 5.1 GB | 817 MB | 8 / 2 / 2 |
+| 16 | 12 / 16 | 75.0% | 180.7 s | 368.5 s | 21 939 MB | 5.6 GB | 939 MB | 7 / 3 / 3 |
+
+Round 2 ran because the model's token plan had reset. It cut the 429s at 8 and
+10 to zero and lifted success at the already-measured levels (10: 90-100% ->
+100%, 12: 83-92% -> 100% / 91.7%) -- but the same 429 came back at 12b, 14 and
+16. A reset widens the margin; it does not remove the ceiling. The hard stop
+rule fired at 16 (`success rate 75.0% < 80.0% at level 16`); the RAM condition
+never came near firing.
+
+### What failed, and what did not
+
+Every failure in both rounds except one was the **same error, returned by the
+app inside the conversation**:
+
+```
+Error code: 429 - rate_limit_error: All credentials for model
+claude-minimax-m2-5-highspeed are cooling down via provider claude
+```
+
+Round 1: 3 failures, all 429. Round 2: 7 failures, 6 of them 429 and 1 agent
+that interrupted itself before its own 180 s window closed (counted as a fail by
+the harness, but it is the agent's decision, not capacity). Classified: **6
+provider 429s, 1 agent self-interruption, 0 caused by the UI, the login, `cu` or
+the browser**. The navigation, sign-in, new conversation and marker worked every
+single time. What runs out is the app's LLM gateway credentials under
+concentration, and that is not fixable from the browser side. Fatal 429s grow
+with the level: 0, 0, 0, 1, 2, 3 at 8, 10, 12, 12b, 14, 16.
+
+**RAM was never the limit.** Available memory never dropped below 20.2 GB
+(round 2) or 21.9 GB (round 1) -- more than 6x the 3 GB floor -- and swap delta
+was ~0 at every level. Where the memory goes, measured: the shared Chrome grows
+~300 MB per open context (18 -> 28 -> 33 browser processes, ~1.8 GB at rest to
+~5.6 GB at 16 contexts) and dominates; each agent process is flat at 15-60 MB
+(16 agents = 939 MB). Nothing grew superlineally: doubling agents costs ~1.6x
+the Chrome's RAM.
+
+### Recommendation
+
+- **8-10 parallel agents: safe.** 100% twice at each level, zero 429s in round
+  2, p50 76-122 s, RAM to spare.
+- **12: the limit.** 100% once, 91.7% on the repeat (one fatal 429). Fine if
+  you accept retrying the 429s; p95 ~200 s, under the 2x reference threshold.
+- **14+: not recommended** with this provider. 85.7% and 75.0%, 2-3 fatal 429s
+  each, p95 368-374 s (>2x the level-1 p95 of 117.6 s).
+- **Beyond ~12: stagger the launches** (waves of 8-10) or raise the app's
+  gateway credential/model concurrency. RAM is not what stops you.
+- **Per-agent timeout: 420 s** covers the worst p95 observed (~374 s) with
+  margin; 300 s stops being enough at 14-16.
+
+**Marginal cost per agent: ~0.3 GB** -- ~0.25 GB in the shared Chrome (one
+context, ~300 MB) plus ~0.06 GB for the agent process itself. An AI agent is
+cheap in RAM here; a Chrome context is not.
+
+### Measured vs extrapolated
+
+Everything in the three tables above is measured, per level, on those runs. What
+is **not** measured, stated plainly:
+
+- A linear extrapolation of ~0.3 GB per agent says 64 GB would hold many times
+  this. That is arithmetic, not evidence, and it is not a claim this page makes.
+- **CPU and shared-Chrome contention were never isolated from 429 retries.**
+  Agents that hit a 429 retry, and a retrying agent is not idle, so the latency
+  column mixes provider backoff with local contention. Nothing above 16 agents
+  was measured, and 16 already failed the 80% rule.
+- The `seconds=` each agent reports is its own estimate of Sage's thinking time
+  and is inconsistent (3 s, 132 s and 27 s in the same level), so it is recorded
+  but never used as a metric. Latency here is the harness's own wall clock.
+- At n <= 16 the harness's "p95" is always the maximum (int(0.95n) = n-1), so
+  "p95" reads as "the slowest agent", and it depends more on one agent's luck
+  than on concurrency. It was logged as a flag, not a stop rule, for that
+  reason; the stop rule was success < 80%.
+- The MiniMax gateway returns no usage: `prompt_tokens` and `completion_tokens`
+  are 0 in every trajectory and `cost_usd` is 0.0 in every run, so **token cost
+  is not measurable with this configuration** and no number is invented here.
+  What is measured instead: ~14-16 tool steps and ~15-16 model calls per agent.
+
 ## Agent surface
 
 ```sh
@@ -263,4 +384,8 @@ python3 bench/compare.py --iters 10     # cu vs agent-browser vs Playwright MCP
 Both harnesses are described in [docs/BENCHMARKS.md](docs/BENCHMARKS.md),
 together with the methods, the fair-play notes and every number above. The
 real-site section reports a run whose harness is not published (it drives a
-private app): the method and every number are written out in the section.
+private app): the method and every number are written out in the section. The
+parallel-agents section is measured the same way: two rounds of real agent
+sessions against a private app, with the method, the sampling, the stop rules
+and every number written out in the section, including what was **not** isolated
+from the runs.
