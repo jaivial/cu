@@ -106,6 +106,16 @@
 
 ### Fixed
 
+- The landing page no longer scrolls sideways. The screen-reader-only spans in
+  the comparison tables were absolutely positioned with no positioned ancestor,
+  so their `nowrap` text was laid out against the initial containing block and
+  widened the document to a constant 1135 px at every viewport below that: at
+  390 px the page could be dragged ~745 px to the right into empty space. The
+  table wrapper is now `position: relative`, so each of those spans is anchored
+  inside the table that owns it and clipped by that table's own horizontal
+  scroller. The skip link is hidden with a clipped 1x1 box instead of
+  `left: -999px`, which sat in negative overflow. The wide tables keep their
+  own `overflow-x: auto` containers; no global `overflow-x: hidden`.
 - The DevTools websocket handshake is read to its blank line; one `read()`
   could return only the status line under load and the action failed with
   "Chromium rejected CDP websocket handshake" (the load-sensitive flake in

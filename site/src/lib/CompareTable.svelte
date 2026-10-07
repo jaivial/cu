@@ -42,7 +42,14 @@
 </div>
 
 <style>
-  .ct-wrap { overflow-x: auto; }
+  /* The table is allowed to be wider than the viewport, so this wrapper is the
+     only thing that scrolls: `min-width: 0` keeps it shrinkable when it sits in
+     a grid or flex track, and `max-width: 100%` keeps it from outgrowing its
+     parent. `position: relative` gives the screen-reader-only `.sr` spans inside
+     the table a local containing block -- without it they fell back to the
+     initial containing block and their nowrap text widened the whole document
+     to ~1135px, which is what produced the page-wide horizontal scroll. */
+  .ct-wrap { overflow-x: auto; max-width: 100%; min-width: 0; position: relative; }
   .ct { width: 100%; border-collapse: collapse; min-width: 640px; }
   .ct caption {
     caption-side: top; text-align: left; padding: 0 0 0.9rem;
@@ -70,9 +77,15 @@
   .bar i { display: block; height: 100%; border-radius: 4px; opacity: 0.55; }
   td.best .bar i { opacity: 1; box-shadow: 0 0 14px -2px var(--cu); }
   .note { margin: 0.9rem 0 0; color: var(--dim); font-size: 0.82rem; max-width: 52rem; }
+  /* Screen-reader-only text. `position: absolute` alone would make the nearest
+     positioned ancestor the containing block; there is none inside the table, so
+     these fell back to the initial containing block and their `nowrap` text
+     widened the document to ~1135px, giving the whole page a horizontal scroll.
+     Clipping them to the 1px box they already occupy keeps the text in the
+     accessibility tree without letting it escape. */
   .sr {
     position: absolute; width: 1px; height: 1px; overflow: hidden;
-    clip: rect(0 0 0 0); white-space: nowrap;
+    clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
   }
   tr:last-child th, tr:last-child td { border-bottom: 0; }
 </style>

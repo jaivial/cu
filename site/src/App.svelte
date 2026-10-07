@@ -838,8 +838,18 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
 <style>
   .wrap { width: min(var(--w), 100% - 2.5rem); margin-inline: auto; }
 
-  .skip { position: absolute; left: -999px; }
-  .skip:focus { left: 1rem; top: 1rem; z-index: 10; background: var(--cu); color: #000; padding: 0.4rem 0.7rem; }
+  /* Off-screen until focused, but kept inside the viewport box on purpose: the
+     usual `left: -999px` parks it in negative overflow, which is what some
+     browsers turn into a leftward-scrollable page. Clipping a 1x1 box at the
+     origin hides it just as well and can never add scroll. */
+  .skip {
+    position: absolute; left: 0; top: 0; width: 1px; height: 1px;
+    overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
+  }
+  .skip:focus {
+    left: 1rem; top: 1rem; width: auto; height: auto; overflow: visible;
+    clip: auto; clip-path: none; z-index: 10; background: var(--cu); color: #000; padding: 0.4rem 0.7rem;
+  }
 
   /* header */
   .top {
