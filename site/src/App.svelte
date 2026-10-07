@@ -1,7 +1,8 @@
 <script>
   import CompareTable from './lib/CompareTable.svelte';
   import { tools, tasks, tokens, speed, actionCosts, contexts, resources, sweep, sweepHeadline,
-    realLevels, realHeadline, realWaits, realBlock, realVsAb } from './lib/data.js';
+    realLevels, realHeadline, realWaits, realBlock, realVsAb,
+    parRound1, parRound2, parHeadline, par429, parCost, parFails } from './lib/data.js';
 
   let tab = $state('cli');
 
@@ -11,6 +12,7 @@
   const fmt = (v) => (v < 10 ? v.toLocaleString('es-ES', { maximumFractionDigits: 1 }) : grp(Math.round(v).toLocaleString('es-ES')));
   const secs = (v) => v.toFixed(2).replace('.', ',') + ' s';
   const dec = (v, d) => v.toLocaleString('es-ES', { minimumFractionDigits: d, maximumFractionDigits: d });
+  const mb = (v) => String(v).replace(/\B(?=(\d{3})+(?!\d))/g, '\u202f') + ' MB';
 
   const snapshotLines = [
     ['- url: ', 'https://shop.test/'],
@@ -204,6 +206,37 @@
       { text: `${dec(v.rss, 1)} GB`, frac: v.rss / 12.8, best: v.tool === 'cu' },
     ],
   }));
+  // Parallel-agent rows. Bars are relative to the worst value of each column of
+  // the round. RAM columns are deliberately unscaled (plain values, no bar):
+  // the point of the section is that available RAM never fell, and a bar would
+  // imply a ceiling that was never reached.
+  const parRate = (r) => r.ok / r.of;
+  // "safe" = 8-10 in round 2 (100% twice, zero 429s). In round 1 the 10 level
+  // was 90%: it worked, but it was already on the edge, so it is not flagged.
+  const parRows = (list, with429, safeMax) => list.map((r) => ({
+    label: `${r.c} agentes`,
+    sub: r.rep ? 'la repetici\u00f3n del nivel, misma configuraci\u00f3n' : undefined,
+    cells: [
+      { text: `${r.ok} / ${r.of}`, frac: parRate(r), best: r.c <= safeMax, color: 'var(--cu)' },
+      { text: `${dec(r.rate, 1)} %`, frac: parRate(r), best: r.c <= safeMax, color: 'var(--cu)' },
+      { text: `${dec(r.p50, 1)} s`, frac: r.p50 / Math.max(...list.map((x) => x.p95 || x.p50)), color: 'var(--ab)' },
+      { text: r.p95 ? `${dec(r.p95, 1)} s` : '\u2014', frac: r.p95 ? r.p95 / Math.max(...list.map((x) => x.p95 || x.p50)) : null },
+      { text: mb(r.avail), frac: null },
+      { text: `${dec(r.chrome, 1)} GB`, frac: null },
+      { text: `${dec(r.agents, 2)} GB`, frac: null },
+      ...(with429
+        ? [{ text: `${r.ev429} / ${r.hit429} / ${r.fatal429}`, frac: r.fatal429 / 3, best: r.fatal429 === 0, color: r.fatal429 ? 'var(--pw)' : 'var(--cu)' }]
+        : []),
+    ],
+  }));
+  const parRows1 = parRows(parRound1, false, 8);
+  const parRows2 = parRows(parRound2, true, 10);
+
+  const parCostRows = parCost.map((c) => ({
+    label: c.what,
+    sub: c.note,
+    cells: [{ text: c.mem, frac: null, best: c.what.startsWith('total'), color: 'var(--cu)' }],
+  }));
 </script>
 
 <a class="skip" href="#main">Saltar al contenido</a>
@@ -218,6 +251,7 @@
       <a href="#tokens">Tokens</a>
       <a href="#recursos">Recursos</a>
       <a href="#real">Sitio real</a>
+      <a href="#par">Agentes</a>
     </nav>
     <span class="local">local · sin nube</span>
   </div>
@@ -644,6 +678,155 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
         cuerpo.</li>
     </ul>
   </section>
+
+  <section class="wrap section" id="par">
+    <header class="sec-head">
+      <p class="num">07</p>
+      <h2>Agentes de IA en paralelo</h2>
+      <p class="sub">
+        Todo lo anterior son flujos guionizados. Esto son <strong>agentes de IA de verdad</strong>: cada "agente" es una
+        sesión headless de <code>mini-tui</code> con <strong>MiniMax-M3.1-Flash-Preview</strong>, que recibe los comandos
+        exactos de <code>cu</code> y decide el flujo el mismo: abrir <strong>su propio contexto</strong>
+        <code>cu</code> (tarro de cookies aislado dentro del <em>único</em> Chrome compartido), navegar, iniciar sesión si
+        hace falta, abrir el chat del asistente, conversación nueva, enviar un marcador y esperar la respuesta
+        <strong>por texto</strong> (el marcador aparece dos veces: el eco más la respuesta en streaming), validar y cerrar
+        su contexto. Aquí se pagan la latencia del modelo, un viaje de ida y vuelta por bash por paso y una sesión
+        completa de agente, encima del navegador. Objetivo: el <strong>chat Sage de neural-dev</strong>, una app real de
+        producción con build estático detrás de nginx/Cloudflare. Caja de 12 cores y 64 GB, con 8 GB de swap ya ocupados
+        antes de empezar (presión ajena a la prueba).
+      </p>
+    </header>
+
+    <p class="flow-desc">
+      Vigilancia en todas las corridas: <code>MemAvailable</code>, swap usado, RSS del Chrome compartido y RSS de los
+      procesos agente, muestreados cada 5 s, con un <strong>suelo duro de 3 GB</strong> que habría matado por PID
+      (SIGTERM y luego SIGKILL) sólo a los procesos lanzados por la prueba. El suelo no se acercó ni una vez.
+    </p>
+
+    <dl class="stats wide">
+      {#each parHeadline as h}
+        <div><dt>{h.d}</dt><dd>{h.k}</dd></div>
+      {/each}
+    </dl>
+
+    <h3 class="sub-h">Ronda 1 &middot; de 1 a 12 agentes</h3>
+    <CompareTable
+      caption="Barrido de 1 a 12 agentes reales · p50/p95 por agente, cronómetro del harness · todo medido"
+      first="agentes"
+      columns={[
+        { label: 'ok' },
+        { label: 'tasa' },
+        { label: 'p50' },
+        { label: 'p95' },
+        { label: 'RAM libre mín.' },
+        { label: 'RSS Chrome' },
+        { label: 'RSS agentes' },
+      ]}
+      rows={parRows1}
+      bestSr="nivel sin 429 y 100 %"
+      note="Los niveles de 1 a 6 vienen de un barrido cuyo cronómetro recogía los agentes terminados en serie, así que sus latencias son suelos, no medianas; el pass/fail y la RAM valen en todas las filas. Las filas de 10 y 12 son la repetición corregida, con un hilo por agente cronometrando su propia salida."
+    />
+
+    <h3 class="sub-h">Ronda 2 &middot; de 8 a 16 agentes, con contador de 429</h3>
+    <p class="lever">
+      Se repitió porque se había reiniciado el plan de tokens del modelo. Bajó los 429 a cero en 8 y 10 y subió el éxito
+      en los niveles ya medidos, pero el mismo 429 volvió en la repetición de 12, en 14 y en 16. Reiniciar el plan ensancha
+      el margen; no quita el techo.
+    </p>
+    <CompareTable
+      caption="De 8 a 16 agentes reales, tras el reinicio de tokens · el mismo Chrome para todos · todo medido"
+      first="agentes"
+      columns={[
+        { label: 'ok' },
+        { label: 'tasa' },
+        { label: 'p50' },
+        { label: 'p95' },
+        { label: 'RAM libre mín.' },
+        { label: 'RSS Chrome' },
+        { label: 'RSS agentes' },
+        { label: '429 ev/afect/fat' },
+      ]}
+      rows={parRows2}
+      bestSr="nivel sin 429 y 100 %"
+      note="429 ev/afect/fat = eventos de 429 distintos / agentes que vieron al menos uno / fallos fatales. La regla dura de parada (tasa &lt; 80 %) se disparó en el nivel 16: 75,0 %; la condición de RAM ni se acercó. Torneos totales de la ronda: 18 eventos, 7 agentes afectados, 6 fallos fatales."
+    />
+
+    <h3 class="sub-h">El cuello de botella no fue la RAM</h3>
+    <ul class="fair">
+      <li>
+        <strong>Todos los fallos menos uno fueron el mismo 429 del proveedor de la app</strong>, devuelto por Sage
+        dentro de la conversación:
+      </li>
+    </ul>
+    <pre class="quote429">{par429}</pre>
+    <ul class="fair">
+      <li>
+        Ronda 1: 3 fallos, los 3 de 429. Ronda 2: 7 fallos, 6 de 429 y 1 agente que se interrumpió él mismo antes de
+        cerrar su ventana de 180 s (el harness lo cuenta como fallo, pero es una decisión del agente, no capacidad).
+        Clasificación de los diez fallos de las dos rondas: <strong>9 por 429 del proveedor, 1 auto-interrupción, 0 por
+        la UI, el login, <code>cu</code> o el navegador</strong>. La navegación, el login, la conversación nueva y el
+        marcador funcionaron todas las veces.
+      </li>
+      <li>
+        <strong>Los 429 fatales crecen con el nivel: 0, 0, 0, 1, 2, 3</strong> en 8, 10, 12, 12b, 14 y 16. Lo que se
+        agota son las credenciales LLM del gateway de la app por concentración, y eso no se arregla desde el
+        navegador.
+      </li>
+      <li>
+        <strong>La RAM nunca fue el límite.</strong> La memoria disponible nunca bajó de 20,2 GB (ronda 2) ni de
+        21,9 GB (ronda 1): más de 6 veces el suelo de 3 GB. El delta de swap fue ~0 en todos los niveles.
+      </li>
+    </ul>
+
+    <h3 class="sub-h">Coste marginal por agente</h3>
+    <CompareTable
+      caption="Medido sobre las tablas de arriba · el Chrome compartido es el consumidor dominante y es compartido"
+      first="qué"
+      columns={[{ label: 'RAM por agente' }]}
+      rows={parCostRows}
+      bestSr="el total"
+    />
+
+    <h3 class="sub-h">Límite seguro recomendado</h3>
+    <ul class="fair">
+      <li><strong>8-10 agentes en paralelo: seguro.</strong> 100 % dos veces en cada nivel, cero 429 en la ronda 2, p50 76-122 s, RAM de sobra.</li>
+      <li><strong>12: el límite.</strong> 100 % en la primera repetición y 91,7 % en la segunda (1 429 fatal). Aceptable si se acepta reintentar los 429; p95 ~200 s, por debajo del umbral de 2x.</li>
+      <li><strong>14 o más: no recomendado</strong> con este proveedor. 85,7 % y 75,0 %, 2-3 429 fatales cada nivel y p95 de 368-374 s (&gt;2x el p95 de 117,6 s con un solo agente).</li>
+      <li><strong>Para pasar de ~12 simultáneos:</strong> escalonar los lanzamientos en oleadas de 8-10, o subir la concurrencia de credenciales/modelos del gateway LLM de la app. La RAM no es lo que frena.</li>
+      <li><strong>Timeout por agente: 420 s</strong>, que cubre el p95 más alto observado (~374 s) con margen; 300 s deja de bastar a 14-16.</li>
+    </ul>
+
+    <h3 class="sub-h">Medido contra extrapolado</h3>
+    <ul class="fair">
+      <li>
+        Los tres datos anteriores son <strong>medidos</strong>, nivel a nivel, en esas corridas. Una extrapolación lineal
+        de ~0,3 GB por agente diría que 64 GB darían para muchas veces más: eso es aritmética, no evidencia, y esta
+        página no lo afirma.
+      </li>
+      <li>
+        <strong>La contención de CPU y del Chrome compartido nunca se aisló de los reintentos por 429.</strong> Un agente
+        que recibe un 429 reintenta, y un agente reintentando no está ocioso, así que la columna de latencia mezcla
+        backoff del proveedor con contención local. No se midió nada por encima de 16 agentes, y 16 ya falló la regla
+        del 80 %.
+      </li>
+      <li>
+        Con n &le; 16, el "p95" del harness es siempre el máximo (<code>int(0.95n) = n-1</code>), así que aquí "p95" se
+        lee como "el agente más lento" y depende más de la suerte de un agente concreto que de la concurrencia. Por eso
+        se registró como aviso y no como parada.
+      </li>
+      <li>
+        El <code>seconds=</code> que reporta cada agente es su propia estimación del tiempo de Sage, inconsistente
+        (3 s, 132 s y 27 s en el mismo nivel): se recoge, pero no se usa como métrica. La latencia de referencia es el
+        reloj del harness.
+      </li>
+      <li>
+        El gateway de MiniMax <strong>no devuelve uso</strong>: <code>prompt_tokens</code> y
+        <code>completion_tokens</code> salen a 0 y <code>cost_usd</code> a 0,0 en todas las corridas, así que el coste en
+        tokens <strong>no es medible con esta configuración</strong> y aquí no se inventa ninguna cifra. Lo que sí se mide:
+        ~14-16 pasos de herramienta y ~15-16 llamadas al modelo por agente.
+      </li>
+    </ul>
+  </section>
 </main>
 
 <footer class="wrap foot-site">
@@ -844,6 +1027,14 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
     margin: 3rem 0 1rem; font-size: 1.15rem; letter-spacing: -0.015em; font-weight: 650;
   }
   .lever { color: var(--dim); font-size: 0.9rem; max-width: 52rem; margin: 0 0 1rem; }
+
+  /* parallel agents: the 429 the app returns, verbatim */
+  .quote429 {
+    margin: 0.9rem 0 1rem; padding: 0.9rem 1.1rem; max-width: 52rem;
+    border-left: 2px solid var(--pw); border-radius: 0 10px 10px 0;
+    background: var(--panel); color: var(--dim);
+    font-size: 0.78rem; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+  }
 
   .foot-site { border-top: 1px solid var(--line); padding: 2rem 0 3rem; color: var(--faint); font-size: 0.84rem; }
   .foot-site code { color: var(--dim); }
