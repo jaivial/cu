@@ -4,6 +4,12 @@
 
 ### Added
 
+- Screenshot control: `GET /v1/screenshot` takes `width`, `height` (viewport
+  in CSS pixels), `scale` (device scale factor, e.g. `2` for retina-sharp),
+  `ref` or `selector` (clip to one element) and `padding`; `cu shot` takes the
+  same as `--width`, `--height`, `--scale`, `--ref`, `--selector`,
+  `--padding`, plus `--png` and `--quality`. The override is cleared after
+  the capture.
 - Actions by snapshot ref: `POST /v1/click`, `POST /v1/type` and the batch
   `POST /v1/act` (`cu click`, `cu type`, `cu act`; `Client::click`,
   `Client::act`). A batch runs on one DevTools connection and ends with a

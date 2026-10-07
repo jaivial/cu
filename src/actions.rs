@@ -773,6 +773,7 @@ if (!window.__cu) {
   };
   Object.defineProperty(window, '__cu', { enumerable: false, value: {
     next() { return next; },
+    element(ref) { return get(ref); },
     ref(el) {
       let r = ids.get(el);
       if (!r) { r = 'e' + (++next); ids.set(el, r); byRef.set(r, new WeakRef(el)); }
