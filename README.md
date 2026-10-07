@@ -19,6 +19,7 @@ Benchmarks: [docs/BENCHMARKS.md](docs/BENCHMARKS.md) · Skill: [SKILL.md](SKILL.
 cargo run -- start          # one daemon per machine; answers before the browser is up
 cargo run -- navigate https://example.com
 cargo run -- snapshot       # the page in a few hundred bytes, ref-addressable
+cargo run -- shot card.png --width 600 --scale 2 --selector '.card'   # sharp 2x clip of one element
 cargo run -- click e3
 cargo run -- batch 'type e2 "Ada"' 'click e5'   # many actions, one call
 ```

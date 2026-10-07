@@ -47,8 +47,10 @@ fn main() {
             .map(|s| println!("{s}")),
             None => Err("usage: cu navigate <url> [--tab ID]".into()),
         },
-        Some("shot") => request("GET", &on_tab("/v1/screenshot?format=jpeg"), None)
-            .and_then(|s| write_screenshot(&s, args.get(1).map(String::as_str))),
+        Some("shot" | "screenshot") => shot_query(&args[1..]).and_then(|(query, file)| {
+            request("GET", &on_tab(&format!("/v1/screenshot?{query}")), None)
+                .and_then(|s| write_screenshot(&s, file.as_deref()))
+        }),
         Some("snapshot") => request("GET", &on_tab("/v1/snapshot"), None).map(|s| println!("{s}")),
         Some("text") => request("GET", &on_tab("/v1/text"), None).map(|s| println!("{s}")),
         Some("downloads") => request("GET", "/v1/downloads", None).map(|s| println!("{s}")),
@@ -126,7 +128,7 @@ fn main() {
 }
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR]\n  cu status\n  cu navigate URL\n  cu shot [FILE]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR]\n  cu status\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
     );
 }
 
@@ -206,6 +208,66 @@ fn request(method: &str, path: &str, body: Option<&str>) -> Result<String, Strin
         .read_to_string(&mut response)
         .map_err(|e| e.to_string())?;
     Ok(response.split("\r\n\r\n").nth(1).unwrap_or("").into())
+}
+/// `cu shot [FILE] [--png] [--quality N] [--width N] [--height N] [--scale F]
+/// [--ref REF | --selector CSS] [--padding N]` as a `/v1/screenshot` query and
+/// the file to write. A FILE ending in `.png` asks for PNG.
+fn shot_query(args: &[String]) -> Result<(String, Option<String>), String> {
+    const USAGE: &str = "usage: cu shot [FILE] [--png] [--quality N] [--width N] [--height N] [--scale F] [--ref REF | --selector CSS] [--padding N]";
+    let mut file = None;
+    let mut png = false;
+    let mut pairs: Vec<(&str, String)> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let key = match args[i].as_str() {
+            "--png" => {
+                png = true;
+                i += 1;
+                continue;
+            }
+            "--quality" => "quality",
+            "--width" => "width",
+            "--height" => "height",
+            "--scale" => "scale",
+            "--ref" => "ref",
+            "--selector" => "selector",
+            "--padding" => "padding",
+            flag if flag.starts_with("--") => {
+                return Err(format!("unknown option {flag}; {USAGE}"));
+            }
+            path if file.is_none() => {
+                file = Some(path.to_string());
+                i += 1;
+                continue;
+            }
+            _ => return Err(USAGE.into()),
+        };
+        let value = args
+            .get(i + 1)
+            .ok_or_else(|| format!("{} needs a value; {USAGE}", args[i]))?;
+        pairs.push((key, url_encode(value)));
+        i += 2;
+    }
+    png |= file
+        .as_deref()
+        .is_some_and(|f| f.to_ascii_lowercase().ends_with(".png"));
+    let mut query = format!("format={}", if png { "png" } else { "jpeg" });
+    for (key, value) in pairs {
+        query.push_str(&format!("&{key}={value}"));
+    }
+    Ok((query, file))
+}
+
+/// Percent-encode a query value (a CSS selector has `#`, `&`, spaces...).
+fn url_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 fn write_screenshot(response: &str, path: Option<&str>) -> Result<(), String> {
     // The format is chosen by the server, so the client just saves what came

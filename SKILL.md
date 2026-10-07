@@ -11,6 +11,9 @@ Use `cu` when an agent needs a persistent local browser session.
 4. Read pages with `cu snapshot`, not `cu shot`: it is a few hundred bytes of
    `ref`-addressable elements instead of an image, so the model gets what it
    needs and pays almost nothing for it. Use `cu shot` only when pixels matter.
+   For images people will see, shape the capture: `cu shot out.png --width 600
+   --scale 2 --selector '.card' --padding 12` (or `--ref eN`) is a sharp 2x clip
+   of one element; the viewport is restored afterwards.
    Lines under `- frame: <url>` are inside an iframe; their refs work like any
    other -- click and type reach into the frame. When the answer is words
    rather than something to act on (prose, an API response, a message), read

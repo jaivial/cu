@@ -1253,32 +1253,42 @@ pub fn login_page() -> String {
 /// model reads a lossy frame just as well and the capture, encode and transfer
 /// all shrink, which is most of the latency of `Page.captureScreenshot`. PNG
 /// is still available with `format=png`.
+///
+/// Pixels for people (slides, docs, social posts) need more control:
+/// - `width`, `height`: the viewport in CSS pixels for this capture;
+/// - `scale`: the device scale factor (`2` gives a retina-sharp image);
+/// - `ref` (a snapshot ref) or `selector` (CSS): clip to that element, with
+///   `padding` CSS pixels around it.
+///
+/// The viewport is overridden through `Emulation.setDeviceMetricsOverride`
+/// for this one capture and cleared afterwards, so later actions see the page
+/// as before.
 fn screenshot(tab: &Tab, query: &str) -> (&'static str, &'static str, String) {
-    let png = form_value(query, "format") == "png";
-    let quality = form_value(query, "quality")
-        .parse::<u32>()
-        .ok()
-        .filter(|q| (1..=100).contains(q))
-        .unwrap_or(60);
-    let (format, extra) = if png {
-        ("png", String::new())
-    } else {
-        (
-            "jpeg",
-            format!(",\"quality\":{quality},\"optimizeForSpeed\":true"),
-        )
+    let options = match ShotOptions::parse(query) {
+        Ok(options) => options,
+        Err(error) => {
+            return (
+                "400 Bad Request",
+                "application/json",
+                format!("{{\"error\":{}}}", json_string(&error)),
+            );
+        }
     };
-    match tab.command(
-        "Page.captureScreenshot",
-        &format!("{{\"format\":\"{format}\"{extra}}}"),
-    ) {
-        Ok(result) => {
+    let png = options.png;
+    let format = if png { "png" } else { "jpeg" };
+    let result = capture(tab, &options);
+    if options.emulates() {
+        // Restore the browser's own viewport even if the capture failed.
+        let _ = tab.command("Emulation.clearDeviceMetricsOverride", "{}");
+    }
+    match result {
+        Ok((result, size)) => {
             let field = if png { "png_base64" } else { "jpeg_base64" };
             (
                 "200 OK",
                 "application/json",
                 format!(
-                    "{{\"format\":\"{format}\",\"{field}\":{}}}",
+                    "{{\"format\":\"{format}\",{size}\"{field}\":{}}}",
                     json_value(&result, "data")
                         .map(|v| format!("\"{v}\""))
                         .unwrap_or_else(|| "null".into())
@@ -1291,6 +1301,215 @@ fn screenshot(tab: &Tab, query: &str) -> (&'static str, &'static str, String) {
             format!("{{\"error\":\"{}\"}}", json_escape(&error)),
         ),
     }
+}
+
+/// What `GET /v1/screenshot` was asked for.
+#[derive(Debug, Default, PartialEq)]
+pub struct ShotOptions {
+    pub png: bool,
+    pub quality: u32,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub scale: Option<f64>,
+    pub reference: Option<String>,
+    pub selector: Option<String>,
+    pub padding: f64,
+}
+
+/// Largest viewport side accepted, in CSS pixels.
+const MAX_VIEWPORT: u32 = 8192;
+/// Largest device scale factor accepted.
+const MAX_SCALE: f64 = 4.0;
+
+impl ShotOptions {
+    pub fn parse(query: &str) -> Result<Self, String> {
+        let get = |key: &str| Some(form_value(query, key)).filter(|v| !v.is_empty());
+        let side = |key: &str| -> Result<Option<u32>, String> {
+            get(key)
+                .map(|v| {
+                    v.parse::<u32>()
+                        .ok()
+                        .filter(|n| (1..=MAX_VIEWPORT).contains(n))
+                        .ok_or_else(|| {
+                            format!("{key} must be 1..{MAX_VIEWPORT} CSS pixels, got {v}")
+                        })
+                })
+                .transpose()
+        };
+        let scale = get("scale")
+            .map(|v| {
+                v.parse::<f64>()
+                    .ok()
+                    .filter(|s| *s > 0.0 && *s <= MAX_SCALE)
+                    .ok_or_else(|| {
+                        format!("scale must be a number above 0 and up to {MAX_SCALE}, got {v}")
+                    })
+            })
+            .transpose()?;
+        let padding = get("padding")
+            .map(|v| {
+                v.parse::<f64>()
+                    .ok()
+                    .filter(|p| *p >= 0.0 && *p <= MAX_VIEWPORT as f64)
+                    .ok_or_else(|| format!("padding must be 0..{MAX_VIEWPORT} CSS pixels, got {v}"))
+            })
+            .transpose()?
+            .unwrap_or(0.0);
+        let options = Self {
+            png: form_value(query, "format") == "png",
+            quality: form_value(query, "quality")
+                .parse::<u32>()
+                .ok()
+                .filter(|q| (1..=100).contains(q))
+                .unwrap_or(60),
+            width: side("width")?,
+            height: side("height")?,
+            scale,
+            reference: get("ref"),
+            selector: get("selector"),
+            padding,
+        };
+        if options.reference.is_some() && options.selector.is_some() {
+            return Err("give ref or selector, not both".into());
+        }
+        Ok(options)
+    }
+
+    /// Whether the capture changes the viewport (and must restore it).
+    pub fn emulates(&self) -> bool {
+        self.width.is_some() || self.height.is_some() || self.scale.is_some()
+    }
+}
+
+/// Run the capture: override the viewport, measure the clip, take the shot.
+/// Returns the CDP reply and a `"width":..,"height":..,` fragment with the
+/// size of the image in pixels.
+fn capture(tab: &Tab, options: &ShotOptions) -> Result<(String, String), String> {
+    let scale = options.scale.unwrap_or(1.0);
+    if options.emulates() {
+        // 0 keeps the browser's own value for a side that was not given.
+        tab.command(
+            "Emulation.setDeviceMetricsOverride",
+            &format!(
+                "{{\"width\":{},\"height\":{},\"deviceScaleFactor\":{},\"mobile\":false}}",
+                options.width.unwrap_or(0),
+                options.height.unwrap_or(0),
+                options.scale.unwrap_or(0.0)
+            ),
+        )?;
+    }
+    let target = match (&options.reference, &options.selector) {
+        (Some(reference), _) => Some(format!(
+            "window.__cu&&window.__cu.element?window.__cu.element({}):undefined",
+            json_string(reference)
+        )),
+        (None, Some(selector)) => {
+            Some(format!("document.querySelector({})", json_string(selector)))
+        }
+        (None, None) => None,
+    };
+    // Measuring also waits two frames, so the new viewport has been laid out
+    // and painted (responsive images, layout transitions) before the capture.
+    let what = options
+        .reference
+        .clone()
+        .or_else(|| options.selector.clone())
+        .unwrap_or_default();
+    let expression = format!(
+        "(async()=>{{const err=(m)=>JSON.stringify({{error:m}});{}\
+         await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));\
+         {}}})()",
+        match &target {
+            Some(target) => format!(
+                "const el=({target});\
+                 if(el===undefined)return err('this page has no refs yet; take a snapshot first');\
+                 if(!el)return err({}+' is not on the page');\
+                 el.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}});",
+                json_string(&what)
+            ),
+            None => String::new(),
+        },
+        match &target {
+            Some(_) => format!(
+                "const r=el.getBoundingClientRect();\
+                 if(r.width<1||r.height<1)return err({}+' is not visible');\
+                 return JSON.stringify({{x:r.left+scrollX,y:r.top+scrollY,w:r.width,h:r.height,vw:innerWidth,vh:innerHeight}});",
+                json_string(&what)
+            ),
+            None => "return JSON.stringify({vw:innerWidth,vh:innerHeight});".into(),
+        }
+    );
+    let reply = tab.command(
+        "Runtime.evaluate",
+        &format!(
+            "{{\"expression\":{},\"awaitPromise\":true,\"returnByValue\":true}}",
+            json_string(&expression)
+        ),
+    )?;
+    if reply.contains("\"exceptionDetails\"") {
+        return Err(json_string_value(&reply, "description")
+            .unwrap_or_else(|| "measuring the page failed".into()));
+    }
+    let measured = evaluated_string(&reply).unwrap_or_default();
+    if let Some(error) = json_string_value(&measured, "error") {
+        return Err(error);
+    }
+    let number = |key: &str| json_number(&measured, key);
+    let mut params = if options.png {
+        "{\"format\":\"png\"".to_string()
+    } else {
+        format!(
+            "{{\"format\":\"jpeg\",\"quality\":{},\"optimizeForSpeed\":true",
+            options.quality
+        )
+    };
+    let (css_w, css_h) = if target.is_some() {
+        let (x, y, w, h) = match (number("x"), number("y"), number("w"), number("h")) {
+            (Some(x), Some(y), Some(w), Some(h)) => (x, y, w, h),
+            _ => return Err(format!("could not measure {what}")),
+        };
+        let pad = options.padding;
+        let (x, y) = ((x - pad).max(0.0), (y - pad).max(0.0));
+        let (w, h) = (w + 2.0 * pad, h + 2.0 * pad);
+        // `captureBeyondViewport` would relayout the whole page to its full
+        // height and the clip measured here would land somewhere else; the
+        // element was scrolled into view instead, and one taller or wider
+        // than the viewport is captured from the full page only then.
+        let fits = w <= number("vw").unwrap_or(0.0) && h <= number("vh").unwrap_or(0.0);
+        params.push_str(&format!(
+            ",\"clip\":{{\"x\":{x},\"y\":{y},\"width\":{w},\"height\":{h},\"scale\":1}},\"captureBeyondViewport\":{}",
+            !fits
+        ));
+        (w, h)
+    } else {
+        (number("vw").unwrap_or(0.0), number("vh").unwrap_or(0.0))
+    };
+    params.push('}');
+    let result = tab.command("Page.captureScreenshot", &params)?;
+    // Without an override the real device scale factor is unknown here, so
+    // the size is only reported when it is known.
+    let size = if options.scale.is_some() {
+        format!(
+            "\"width\":{},\"height\":{},\"scale\":{scale},",
+            (css_w * scale).round() as u64,
+            (css_h * scale).round() as u64
+        )
+    } else {
+        String::new()
+    };
+    Ok((result, size))
+}
+
+/// A number field of a flat JSON object, fractions and sign included
+/// ([`json_value`] keeps only the leading digits).
+pub fn json_number(input: &str, key: &str) -> Option<f64> {
+    let needle = format!("\"{key}\"");
+    let start = input.find(&needle)? + needle.len();
+    let rest = input[start..].trim_start().strip_prefix(':')?.trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E')))
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 /// The query string of a request path, without the `?`.

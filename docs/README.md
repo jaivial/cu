@@ -50,7 +50,36 @@ shadow roots.
 Screenshots are JPEG by default because a model reads a lossy frame just as
 well and the capture, encode and transfer all shrink. `GET
 /v1/screenshot?format=png` gives a lossless PNG back; `cu shot FILE` writes
-either, naming the file to match.
+either, naming the file to match (a FILE ending in `.png`, or `--png`, asks for
+PNG).
+
+When the pixels are for people (docs, slides, social posts) the capture can be
+shaped:
+
+| query | `cu shot` flag | what it does |
+|---|---|---|
+| `width=N`, `height=N` | `--width N`, `--height N` | viewport in CSS pixels for this capture (1-8192); a side left out keeps the browser's |
+| `scale=F` | `--scale F` | device scale factor, above 0 and up to 4: `2` is a retina-sharp image with twice the pixels per side |
+| `ref=eN` | `--ref eN` | clip to the element behind a snapshot ref |
+| `selector=CSS` | `--selector CSS` | clip to the first element matching a CSS selector |
+| `padding=N` | `--padding N` | CSS pixels kept around a clipped element |
+| `quality=N` | `--quality N` | JPEG quality, 1-100 (default 60) |
+
+```bash
+cu shot page.png --width 1200 --height 1200 --scale 2       # 2400x2400 PNG
+cu shot card.png --width 560 --scale 2 --selector '#pricing .card' --padding 12
+cu shot button.jpg --ref e7 --scale 3
+```
+
+The viewport and scale go through `Emulation.setDeviceMetricsOverride` for
+that one capture and are cleared afterwards, so later actions and snapshots
+see the page as before. The page gets two animation frames to lay out at the
+new size before it is measured. A clipped element is scrolled into view and
+captured with `Page.captureScreenshot`'s `clip`; one larger than the viewport
+is taken from the full page. With `scale` the reply also carries the image
+size: `{"format":"png","width":2400,"height":2400,"scale":2,"png_base64":...}`.
+`ref` and `selector` together, an out-of-range value or an element that is not
+on the page (or has no size) are a `400`/`502` with the reason.
 
 Navigation waits for the page to be interactive and stable before it answers,
 bounded to three seconds, and reports what it spent in `settled_ms`. A page
