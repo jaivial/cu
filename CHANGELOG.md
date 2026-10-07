@@ -16,6 +16,39 @@
   `GET /v1/contexts`, `DELETE /v1/contexts/NAME`.
 - `bench/compare.py`: cu against agent-browser and Playwright MCP on the same
   tasks, with snapshot token counts. Results in `docs/BENCHMARKS.md`.
+- Tabs and popups: `GET /v1/tabs` (`cu tabs`) lists every tab with the default
+  flagged, any page command takes `?tab=ID` (`--tab ID`) to work in another
+  tab, and `DELETE /v1/tabs/ID` (`cu tabs close ID`) closes one (the last is
+  refused). The default tab is pinned, so a popup and the browser's target
+  ordering cannot move the page under the agent; a click that opens a window
+  reports `"popup":true`.
+- Downloads land in `<data>/downloads` instead of the user's real Downloads
+  folder, through one persistent browser-level session (Chromium 145 honours
+  a custom path only while such a session is attached). `GET /v1/downloads`
+  (`cu downloads`) lists finished files, and the click that started a
+  download reports `"download":"name"` with `navigated:false`. A download
+  started from `?context=NAME` goes to `<data>/downloads/NAME`, because the
+  browser-wide behaviour governs the default context only; `GET /v1/downloads`
+  labels those entries with their `"context"`.
+- Iframes are part of the snapshot and of the actions: every frame of the
+  page is walked (subframes in their own isolated world), rendered under
+  `- frame: <url>`, and a ref resolves to its frame, so click, type and
+  select reach into embedded documents with the iframe's offset applied.
+  `[contenteditable]` regions snapshot as textboxes.
+- Open shadow roots are walked too, in the snapshot and in `/v1/text`. A web
+  component renders its controls inside its shadow root, where a document
+  query cannot see them, so a widget-heavy page used to snapshot as a page
+  with nothing on it. Refs work there as well: the hit test descends through
+  the host to the element really painted at that point. A closed shadow root
+  is unreadable from any script and stays unread.
+- `GET /v1/navigate` reports `settled:true|false`: false means the three
+  second budget ran out on a page still loading.
+- `GET /v1/text` (`cu text`, `Client::text`): the page's visible text for the
+  reading a snapshot deliberately does not do -- prose, API responses,
+  messages -- capped at 16 000 characters with a `truncated` flag. It reads
+  every frame, each named under a `- frame: <url>` line, and reaches into open
+  shadow roots, whose text no `innerText` alone returns.
+- SDK: `tabs`, `close_tab`, `downloads`, `load_session`.
 
 - Speed for agents, measured in `docs/BENCHMARKS.md`. Cold start went from
   431 ms to 6 ms (71x), and the new compact snapshot answers in about 2 ms.
@@ -39,6 +72,12 @@
 
 ### Changed
 
+- `navigated` in an action result means the frame committed a navigation
+  (`Page.frameNavigated`); a download or an aborted load schedules and starts
+  loading without committing and now reports `navigated:false`.
+- A navigation Chromium cannot perform (unresolved name, refused connection)
+  is a `502` with `navigation failed: net::...` instead of a `200` carrying
+  `errorText` inside the CDP result.
 - Navigate awaits `DOMContentLoaded` in the page in one round trip instead of
   polling `readyState` every 25 ms; navigate p95 went from ~59 ms to ~50 ms and
   median from ~45 ms to ~26 ms, interleaved against the previous binary.
@@ -56,6 +95,18 @@
 
 ### Fixed
 
+- The DevTools websocket handshake is read to its blank line; one `read()`
+  could return only the status line under load and the action failed with
+  "Chromium rejected CDP websocket handshake" (the load-sensitive flake in
+  `a_client_that_stops_sending_is_released`).
+- The browser readiness probe tries both loopback stacks (`127.0.0.1` and
+  `[::1]`): with the IPv4 port held by a browser still shutting down,
+  Chromium binds `::1` only and an IPv4-only probe never saw its own
+  browser. The launched pid is recorded before readiness, so even a failed
+  launch is closed on shutdown instead of orphaning a whole Chromium tree,
+  and a slow start gets repeated watch windows instead of one final failure.
+- `cu shot` shows the server's error instead of a generic "server did not
+  return an image".
 - Stopping `cu` closes its browser (`Browser.close`, then SIGTERM). Every
   daemon used to leave its whole Chromium tree running.
 - CDP replies are matched on their top-level `id`; a nested frame `id` (as in

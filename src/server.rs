@@ -204,7 +204,33 @@ pub fn spawn_browser_thread(
             // tree running for ever, because only a successful launch stored
             // the pid that shutdown closes.
             BROWSER_PID.store(child.id(), Ordering::SeqCst);
-            match wait_for_browser(cdp_port, BROWSER_START_TIMEOUT, Some(&mut child)) {
+            // One window is not enough when the predecessor browser is still
+            // letting go of the profile and the port (a restart under load):
+            // the new Chromium then takes longer than the window to answer,
+            // and declaring the daemon browserless for ever is worse than
+            // waiting. While the child lives it is still coming up, so the
+            // watch is repeated -- up to five windows, then it is a failure.
+            let mut result = wait_for_browser(cdp_port, BROWSER_START_TIMEOUT, Some(&mut child));
+            let mut windows = 1;
+            while result.is_err() && windows < 5 {
+                match child.try_wait() {
+                    // A browser that exited is the real error, reported as-is.
+                    Ok(Some(status)) => {
+                        result = Err(format!(
+                            "Chromium exited immediately ({status}); set CU_BROWSER to a working binary"
+                        ));
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        result = Err(format!("could not check on Chromium: {e}"));
+                        break;
+                    }
+                }
+                windows += 1;
+                result = wait_for_browser(cdp_port, BROWSER_START_TIMEOUT, Some(&mut child));
+            }
+            match result {
                 Ok(()) => {
                     // Downloads land in the session's own directory (see
                     // `spawn_browser_control`), before readiness so the first
@@ -612,6 +638,7 @@ pub fn route(
             | ("POST", "/v1/type")
             | ("GET", "/v1/contexts")
             | ("GET", "/v1/tabs")
+            | ("GET", "/v1/text")
     ) || (method == "DELETE"
         && (path.starts_with("/v1/contexts/") || path.starts_with("/v1/tabs/")));
     if needs_browser {
@@ -639,7 +666,7 @@ pub fn route(
             );
         }
         if !context.is_empty() {
-            match context_tab(state.cdp_port, &context) {
+            match context_tab(state.cdp_port, &context, &state.data_dir) {
                 Ok(tab) => tab,
                 Err(e) => {
                     return (
@@ -716,6 +743,11 @@ pub fn route(
             "application/json",
             "{\"running\":true,\"browser\":\"chromium\"}".into(),
         ),
+        // Visible text of the page, for the reading a snapshot deliberately
+        // does not do: prose, API responses, error messages. Every frame is
+        // read, each one named, capped in the page so a huge document cannot
+        // flood the socket.
+        ("GET", "/v1/text") => text_response(|method, params| tab.command(method, params)),
         // Pure file listing: works whether or not the browser is up, because
         // the files outlive the session that downloaded them.
         ("GET", "/v1/downloads") => (
@@ -781,7 +813,7 @@ pub fn route(
         ("POST", "/v1/act") => act(&tab, crate::actions::parse_batch(body)),
         ("POST", "/v1/click") => act(&tab, single("click", body)),
         ("POST", "/v1/type") => act(&tab, single("type", body)),
-        ("GET", "/v1/snapshot") => match snapshot_tab(&tab, true) {
+        ("GET", "/v1/snapshot") => match snapshot_tab(&tab) {
             Ok(text) => ("200 OK", "application/json", text),
             Err(error) => (
                 "502 Bad Gateway",
@@ -958,38 +990,186 @@ pub fn close_tab(cdp_port: u16, id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Characters `GET /v1/text` returns before truncating: enough for an API
+/// response or several screens of prose, small enough that one reply stays
+/// a tool-sized payload.
+const TEXT_LIMIT: usize = 16_000;
+
+/// Visible text of one document, capped in the page so a huge document cannot
+/// flood the socket however big it is.
+///
+/// `body.innerText` is what the user would read (layout-aware, no scripts or
+/// styles). A page that hands its content to a web component shows nothing
+/// there, so every open shadow root is read as well. A `ShadowRoot` has no
+/// `innerText` of its own in Chromium, so its words are collected from the
+/// visible leaves inside it; that is also what keeps a `display:none` control
+/// out of the answer, because `innerText` degrades to `textContent` for a
+/// subtree that is not rendered. A closed shadow root is invisible to every
+/// script, so it is not read -- exactly what a page itself would see.
+/// `n` is how many characters came back and `full` how many there were, which
+/// is what `truncated` is computed from.
+const READ_TEXT_JS: &str = r#"JSON.stringify((function(){
+  const shown = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 1 && r.height < 1) return false;
+    const s = getComputedStyle(el);
+    return s.visibility !== 'hidden' && s.display !== 'none';
+  };
+  // Chromium gives a ShadowRoot no innerText at all, so its words are read
+  // from the visible leaves inside it -- which is also what keeps a
+  // display:none control out of the answer, since innerText degrades to
+  // textContent for a subtree that is not rendered.
+  const root = (r) => {
+    const out = [];
+    for (const el of r.querySelectorAll('*')) {
+      // A host renders its shadow root rather than its own children: read
+      // that instead, or the same words come back twice.
+      if (el.shadowRoot) { out.push(root(el.shadowRoot)); continue; }
+      if (el.children.length) continue;
+      if (!shown(el)) continue;
+      const t = (el.innerText || '').trim();
+      if (t) out.push(t);
+    }
+    return out.filter(Boolean).join('\n');
+  };
+  // Only shadow hosts are collected. Everything else is in body.innerText
+  // already, and walking the document for leaves as well would double it.
+  let shadow = '';
+  for (const el of document.querySelectorAll('*')) if (el.shadowRoot) shadow += (shadow ? '\n' : '') + root(el.shadowRoot);
+  let t = document.body ? document.body.innerText : '';
+  if (shadow) t += (t ? '\n' : '') + shadow;
+  const s = t.slice(0,16001);
+  return {n:s.length,full:t.length,text:s};
+})())"#;
+
+/// Line that names a frame whose text could not be read.
+///
+/// Same wording the snapshot uses for a frame it could not walk: the words are
+/// missing because the frame moved or the browser would not expose it, which
+/// a new snapshot may fix, and the rest of the page is still worth reading.
+fn unreadable_frame(url: &str) -> String {
+    format!("- frame: {url} (unreadable right now; take a new snapshot)")
+}
+
+/// The `GET /v1/text` body: the visible text of every frame of the page.
+///
+/// The frames are the ones a snapshot walks, so text and snapshot agree on
+/// what a page is made of. The main document comes first and each iframe under
+/// a `- frame: <url>` line, so the words never claim to be the page's own.
+/// A frame that cannot be read is named, not fatal: the answer an agent wants
+/// is the prose, and half of it beats an error.
+fn text_response<F>(mut cmd: F) -> (&'static str, &'static str, String)
+where
+    F: FnMut(&str, &str) -> Result<String, String>,
+{
+    // The main document first: it is the frame an action lands on, and a page
+    // that fails here is a page that cannot be read at all.
+    let tree = cmd("Page.getFrameTree", "{}");
+    let tree = match tree {
+        Ok(tree) => tree,
+        Err(e) => {
+            return (
+                "502 Bad Gateway",
+                "application/json",
+                format!("{{\"error\":{}}}", json_string(&e)),
+            );
+        }
+    };
+    let mut frames = flatten_frame_tree(&tree);
+    if frames.is_empty() {
+        frames.push(Frame {
+            id: String::new(),
+            parent: None,
+            url: String::new(),
+        });
+    }
+    let mut text = String::new();
+    let mut truncated = false;
+    for (index, frame) in frames.iter().enumerate() {
+        // Subframes are read in an isolated world of their own, so a
+        // cross-origin frame is read without touching its scripts -- the same
+        // move the snapshot makes.
+        let context = if index == 0 {
+            String::new()
+        } else {
+            let isolated = cmd(
+                "Page.createIsolatedWorld",
+                &format!(
+                    "{{\"frameId\":{},\"worldName\":\"cu-text\"}}",
+                    json_string(&frame.id)
+                ),
+            );
+            match isolated
+                .as_deref()
+                .ok()
+                .and_then(|r| json_value(r, "executionContextId"))
+                .and_then(|v| v.parse::<i64>().ok())
+            {
+                // Trailing comma: the format below puts one comma between the
+                // expression and this fragment and none after it.
+                Some(id) => format!("\"contextId\":{id},"),
+                // The frame went away between the tree walk and here.
+                None => {
+                    text.push('\n');
+                    text.push_str(&unreadable_frame(&frame.url));
+                    continue;
+                }
+            }
+        };
+        let params = format!(
+            "{{\"expression\":{},{}\"returnByValue\":true}}",
+            json_string(READ_TEXT_JS),
+            context
+        );
+        let value = match cmd("Runtime.evaluate", &params) {
+            Ok(reply) => evaluated_string(&reply),
+            Err(_) => None,
+        };
+        let Some(value) = value else {
+            if index == 0 {
+                return (
+                    "502 Bad Gateway",
+                    "application/json",
+                    "{\"error\":\"page did not return its text\"}".into(),
+                );
+            }
+            text.push('\n');
+            text.push_str(&unreadable_frame(&frame.url));
+            continue;
+        };
+        let (full, n) = (
+            json_string_value(&value, "full").and_then(|f| f.parse::<usize>().ok()),
+            json_string_value(&value, "n").and_then(|n| n.parse::<usize>().ok()),
+        );
+        truncated |= full.zip(n).is_some_and(|(full, n)| full > n);
+        if index > 0 {
+            text.push('\n');
+            text.push_str(&format!("- frame: {}", frame.url));
+        }
+        text.push('\n');
+        text.push_str(&json_string_value(&value, "text").unwrap_or_default());
+    }
+    let text: String = text.chars().take(TEXT_LIMIT).collect();
+    (
+        "200 OK",
+        "application/json",
+        format!(
+            "{{\"text\":{},\"truncated\":{}}}",
+            json_string(&text),
+            truncated
+        ),
+    )
+}
+
 /// Finished downloads in `dir`, newest first, as the `/v1/downloads` body.
 ///
 /// A file Chromium is still writing carries the `.crdownload` suffix, so an
-/// entry here is complete and safe for the agent to read.
+/// entry here is complete and safe for the agent to read. A file that belongs
+/// to a named context also carries its `"context"`, because that context
+/// downloads into a subdirectory of its own.
 pub fn downloads_json(dir: &Path) -> String {
     let mut files: Vec<(SystemTime, String)> = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(meta) = fs::metadata(&path) else {
-                continue;
-            };
-            if !meta.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if name.ends_with(".crdownload") {
-                continue;
-            }
-            let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
-            files.push((
-                mtime,
-                format!(
-                    "{{\"name\":{},\"bytes\":{}}}",
-                    json_string(name),
-                    meta.len()
-                ),
-            ));
-        }
-    }
+    collect_downloads(dir, None, &mut files, 0);
     files.sort_by(|a, b| b.0.cmp(&a.0));
     format!(
         "{{\"downloads\":[{}]}}",
@@ -999,6 +1179,68 @@ pub fn downloads_json(dir: &Path) -> String {
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+/// One level of the download tree, newest file first.
+///
+/// A named context downloads into its own subdirectory, so the listing walks
+/// those too and each entry says which context it came from -- two contexts
+/// downloading `report.pdf` are two different files, and an agent has to be
+/// able to tell them apart. `context` is `None` for the browser-wide
+/// directory. The depth guard keeps a stray nested directory from turning one
+/// listing into a filesystem crawl.
+fn collect_downloads(
+    dir: &Path,
+    context: Option<&str>,
+    files: &mut Vec<(SystemTime, String)>,
+    depth: usize,
+) {
+    const MAX_DEPTH: usize = 2;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            // One more level is a context's directory; deeper is not ours.
+            if depth < MAX_DEPTH {
+                let name = path.file_name().and_then(|n| n.to_str());
+                if let Some(name) = name {
+                    collect_downloads(&path, Some(name), files, depth + 1);
+                }
+            }
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".crdownload") {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+        files.push((
+            mtime,
+            match context {
+                Some(context) => format!(
+                    "{{\"name\":{},\"bytes\":{},\"context\":{}}}",
+                    json_string(name),
+                    meta.len(),
+                    json_string(context)
+                ),
+                None => format!(
+                    "{{\"name\":{},\"bytes\":{}}}",
+                    json_string(name),
+                    meta.len()
+                ),
+            },
+        ));
+    }
 }
 
 pub fn login_page() -> String {
@@ -1056,37 +1298,229 @@ fn query(path: &str) -> &str {
     path.split_once('?').map(|(_, q)| q).unwrap_or("")
 }
 
-/// Build a `GET /v1/snapshot` response body.
-///
-/// The walk runs in the page, so this is one CDP round trip returning a few
-/// hundred bytes instead of a DOM dump the daemon then has to shrink.
-pub fn snapshot_pages(state: &AppState, compact: bool) -> Result<String, String> {
-    snapshot_tab(&Tab::default_for(state.cdp_port), compact)
+/// One frame of the page as `Page.getFrameTree` describes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame {
+    pub id: String,
+    /// The frame this one is embedded in; `None` for the main document.
+    pub parent: Option<String>,
+    pub url: String,
 }
 
-fn snapshot_tab(tab: &Tab, compact: bool) -> Result<String, String> {
-    let result = tab.command(
-        "Runtime.evaluate",
-        &format!(
-            "{{\"expression\":{},\"returnByValue\":true}}",
-            json_string(&snapshot::script())
-        ),
-    )?;
-    let value =
-        evaluated_string(&result).ok_or_else(|| "page did not return a snapshot".to_string())?;
-    let snap = parse_snapshot(&value)?;
-    snapshot::saw_refs_up_to(&value);
-    Ok(if compact {
-        format!("{{\"snapshot\":{}}}", json_string(&snap.render()))
-    } else {
-        format!(
-            "{{\"snapshot\":{},\"url\":{},\"title\":{},\"nodes\":{}}}",
-            json_string(&snap.render()),
-            json_string(&snap.url),
-            json_string(&snap.title),
-            value
-        )
-    })
+/// The object bound to `key` at the top of `input`, as a string slice.
+/// The mirror of [`json_array`] for objects.
+fn json_object<'a>(input: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\"");
+    let start = input.find(&needle)?.checked_add(needle.len())?;
+    let rest = input[start..].trim_start().strip_prefix(':')?.trim_start();
+    let bytes = rest.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, byte) in bytes.iter().enumerate() {
+        if in_string {
+            match byte {
+                b'\\' => escaped = !escaped,
+                b'"' if !escaped => in_string = false,
+                _ => {}
+            }
+            if *byte != b'\\' {
+                escaped = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&rest[..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Depth-first flatten of a `Page.getFrameTree` reply: the main document
+/// first, then each child under its parent.
+pub fn flatten_frame_tree(tree: &str) -> Vec<Frame> {
+    let mut out = Vec::new();
+    if let Some(root) = json_object(tree, "frameTree") {
+        flatten_frame_node(root, None, &mut out);
+    }
+    out
+}
+
+fn flatten_frame_node(node: &str, parent: Option<String>, out: &mut Vec<Frame>) {
+    let Some(frame) = json_object(node, "frame") else {
+        return;
+    };
+    let id = json_string_value(frame, "id").unwrap_or_default();
+    let url = json_string_value(frame, "url").unwrap_or_default();
+    // Pre-order: the main document must come first, because position zero is
+    // what marks the frame walked in its own default world.
+    out.push(Frame {
+        id: id.clone(),
+        parent,
+        url,
+    });
+    if let Some(children) = json_array(node, "childFrames") {
+        for child in json_objects(&children) {
+            flatten_frame_node(&child, Some(id.clone()), out);
+        }
+    }
+}
+
+/// The ref -> frameId map of each tab's last snapshot, so an action can walk
+/// straight to the frame that owns its ref instead of probing frames one by
+/// one. Rebuilt wholesale by every snapshot.
+fn ref_frames() -> &'static Mutex<HashMap<Tab, HashMap<String, String>>> {
+    static REF_FRAMES: OnceLock<Mutex<HashMap<Tab, HashMap<String, String>>>> = OnceLock::new();
+    REF_FRAMES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record which frame each ref of this snapshot lives in.
+pub fn note_ref_frames(tab: &Tab, pairs: &[(String, String)]) {
+    let map: HashMap<String, String> = pairs.iter().cloned().collect();
+    ref_frames()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(tab.clone(), map);
+}
+
+/// The frame a snapshot ref lives in, if the last snapshot named one.
+pub fn frame_for_ref(tab: &Tab, reference: &str) -> Option<String> {
+    ref_frames()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(tab)
+        .and_then(|map| map.get(reference))
+        .cloned()
+}
+
+/// Build a `GET /v1/snapshot` response body.
+///
+/// The walk runs in the page: a few hundred bytes instead of a DOM dump the
+/// daemon then has to shrink.
+pub fn snapshot_pages(state: &AppState) -> Result<String, String> {
+    snapshot_tab(&Tab::default_for(state.cdp_port))
+}
+
+fn snapshot_tab(tab: &Tab) -> Result<String, String> {
+    let (text, pairs) = walk_snapshot(tab, |method, params| tab.command(method, params))?;
+    note_ref_frames(tab, &pairs);
+    Ok(format!("{{\"snapshot\":{}}}", json_string(&text)))
+}
+
+/// Walk every frame of the page, fetching the frame tree first.
+pub fn walk_snapshot<F>(tab: &Tab, cmd: F) -> Result<(String, Vec<(String, String)>), String>
+where
+    F: FnMut(&str, &str) -> Result<String, String>,
+{
+    let mut cmd = cmd;
+    let tree = cmd("Page.getFrameTree", "{}")?;
+    let frames = flatten_frame_tree(&tree);
+    walk_frames(tab, frames, cmd)
+}
+
+/// Walk every frame of the page and merge the result.
+///
+/// Returns the snapshot text and the (ref, frameId) of every element. The
+/// main document is walked in its default world -- that is where the actions
+/// look for the registry -- and each iframe in an isolated world of its own,
+/// so a cross-origin frame is read without ever touching its scripts.
+/// Isolated worlds persist per frame (created with the fixed name `cu`), so
+/// the registry the walk installs is the one the later action finds.
+pub fn walk_frames<F>(
+    tab: &Tab,
+    frames: Vec<Frame>,
+    mut cmd: F,
+) -> Result<(String, Vec<(String, String)>), String>
+where
+    F: FnMut(&str, &str) -> Result<String, String>,
+{
+    let mut text = String::new();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (index, frame) in frames.iter().enumerate() {
+        let expression = snapshot::script_with_base(snapshot::base_for(tab.cdp_port, &frame.id));
+        let context = if index == 0 {
+            String::new()
+        } else {
+            let reply = cmd(
+                "Page.createIsolatedWorld",
+                &format!(
+                    "{{\"frameId\":{},\"worldName\":\"cu\"}}",
+                    json_string(&frame.id)
+                ),
+            )?;
+            match json_value(&reply, "executionContextId").and_then(|v| v.parse::<i64>().ok()) {
+                // Trailing comma: the format below puts one comma between the
+                // expression and this fragment and none after it.
+                Some(id) => format!("\"contextId\":{id},"),
+                // The frame went away between the tree walk and here; its
+                // section says so rather than failing the whole snapshot.
+                None => {
+                    text.push_str(&format!(
+                        "- frame: {} (unreadable right now; take a new snapshot)\n",
+                        frame.url
+                    ));
+                    continue;
+                }
+            }
+        };
+        let params = format!(
+            "{{\"expression\":{},{}\"returnByValue\":true}}",
+            json_string(&expression),
+            context
+        );
+        let Ok(result) = cmd("Runtime.evaluate", &params) else {
+            if index == 0 {
+                return Err("page did not return a snapshot".into());
+            }
+            text.push_str(&format!(
+                "- frame: {} (unreadable right now; take a new snapshot)\n",
+                frame.url
+            ));
+            continue;
+        };
+        let Some(value) = evaluated_string(&result) else {
+            if index == 0 {
+                return Err("page did not return a snapshot".into());
+            }
+            text.push_str(&format!(
+                "- frame: {} (unreadable right now; take a new snapshot)\n",
+                frame.url
+            ));
+            continue;
+        };
+        snapshot::saw_refs_up_to(&value);
+        let Ok(snap) = parse_snapshot(&value) else {
+            if index == 0 {
+                return Err("page did not return a snapshot".into());
+            }
+            text.push_str(&format!(
+                "- frame: {} (unreadable right now; take a new snapshot)\n",
+                frame.url
+            ));
+            continue;
+        };
+        if index == 0 {
+            text.push_str(&snap.render());
+        } else {
+            text.push_str(&format!("- frame: {}\n", frame.url));
+            text.push_str(&snap.render_content());
+        }
+        for node in &snap.nodes {
+            pairs.push((node.ref_id.clone(), frame.id.clone()));
+        }
+    }
+    Ok((text, pairs))
 }
 
 /// Parse the JSON the in-page walk produced.
@@ -1407,6 +1841,9 @@ impl Tab {
 struct Context {
     browser_context: String,
     target: String,
+    /// Where this context's downloads are directed, once `cu` has told the
+    /// browser. `None` until then, and left `None` if the browser refused.
+    downloads: Option<PathBuf>,
 }
 
 /// Named contexts per browser.
@@ -1472,7 +1909,7 @@ fn page_target_ids_and_sockets(discovery: &str, cdp_port: u16) -> Vec<(String, S
 }
 
 /// The tab of context `name`, created on first use.
-pub fn context_tab(cdp_port: u16, name: &str) -> Result<Tab, String> {
+pub fn context_tab(cdp_port: u16, name: &str, data: &Path) -> Result<Tab, String> {
     if !valid_name(name) {
         return Err("invalid context name".into());
     }
@@ -1506,16 +1943,64 @@ pub fn context_tab(cdp_port: u16, name: &str) -> Result<Tab, String> {
         return Err("Chromium did not open a tab in the new context".into());
     };
     all.insert(
-        key,
+        key.clone(),
         Context {
             browser_context,
             target: target.clone(),
+            downloads: None,
         },
     );
+    // Drop the map lock before the CDP round trip below: it is a browser-level
+    // command, and holding the lock would serialise every other context.
+    drop(all);
+    if let Err(error) = direct_context_downloads(cdp_port, &key, data) {
+        // Not fatal: the context still works, and its downloads fall back to
+        // the browser-wide directory, which `GET /v1/downloads` still lists.
+        eprintln!("cu: downloads for context {name} stay browser-wide: {error}");
+    }
     Ok(Tab {
         cdp_port,
         target: Some(target),
     })
+}
+
+/// Point a named context's downloads at `<data>/downloads/<name>`.
+///
+/// Without a `browserContextId`, `Browser.setDownloadBehavior` only governs
+/// the default context, so a download started from `?context=NAME` landed in
+/// the browser-wide directory and was indistinguishable from the persistent
+/// profile's own files. A context that has its own behaviour gets its own
+/// directory, and the browser-wide listing picks the subdirectories up, so
+/// `GET /v1/downloads` reports them under the context's name.
+fn direct_context_downloads(cdp_port: u16, key: &(u16, String), data: &Path) -> Result<(), String> {
+    let dir = context_download_dir(data, &key.1);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let browser_context = {
+        let all = contexts().lock().unwrap_or_else(|e| e.into_inner());
+        all.get(key).map(|c| c.browser_context.clone())
+    };
+    let Some(browser_context) = browser_context else {
+        return Err("the context went away".into());
+    };
+    cdp_browser_command(
+        cdp_port,
+        "Browser.setDownloadBehavior",
+        &format!(
+            "{{\"behavior\":\"allow\",\"downloadPath\":{},\"eventsEnabled\":true,\"browserContextId\":{}}}",
+            json_string(&dir.to_string_lossy()),
+            json_string(&browser_context)
+        ),
+    )?;
+    let mut all = contexts().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(context) = all.get_mut(key) {
+        context.downloads = Some(dir);
+    }
+    Ok(())
+}
+
+/// Where the downloads of context `name` are kept.
+fn context_download_dir(data: &Path, name: &str) -> PathBuf {
+    data.join("downloads").join(name)
 }
 
 /// A tab another tab named by id (`?tab=ID`), validated against discovery so
@@ -2350,6 +2835,9 @@ mod snapshot_tests {
 }
 
 pub mod snapshot {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
     /// One element worth telling the model about.
     pub struct Node {
         /// Stable handle the agent uses to act on this element.
@@ -2380,6 +2868,14 @@ pub mod snapshot {
             if !self.title.is_empty() {
                 out.push_str(&format!("- page: {}\n", self.title));
             }
+            out.push_str(&self.render_content());
+            out
+        }
+
+        /// Headings and element lines without the page header: what a
+        /// subframe contributes under its own `- frame:` line.
+        pub fn render_content(&self) -> String {
+            let mut out = String::new();
             for heading in &self.headings {
                 out.push_str(&format!("- heading \"{heading}\"\n"));
             }
@@ -2403,11 +2899,40 @@ pub mod snapshot {
     /// the counter over from the daemon makes a stale ref miss instead.
     static REF_BASE: AtomicU64 = AtomicU64::new(0);
 
-    /// The full in-page script: ref registry, then the walk.
-    pub fn script() -> String {
+    /// Refs one frame may use before the next frame's band begins.
+    ///
+    /// A snapshot walks several frames (the document and its iframes); each
+    /// frame numbers its refs from its own band so two frames can never hand
+    /// out the same `e7`. The walk caps nodes at 200, so 10 000 leaves room
+    /// for documents far bigger than any real page.
+    pub const BAND: u64 = 10_000;
+
+    /// First ref number a frame's document starts from: every ref ever handed
+    /// out is below `REF_BASE`, so a fresh document in any frame begins above
+    /// them all and an old ref misses instead of naming a new element.
+    pub fn base_for(cdp_port: u16, frame_id: &str) -> u64 {
+        REF_BASE.load(Ordering::Relaxed) + frame_slot(cdp_port, frame_id) * BAND
+    }
+
+    /// A stable slot per frame: the band an iframe's refs live in must not
+    /// move between snapshots, or its persisted registry and the daemon's
+    /// ref-to-frame map would disagree.
+    fn frame_slot(cdp_port: u16, frame_id: &str) -> u64 {
+        static SLOTS: OnceLock<Mutex<HashMap<u16, HashMap<String, u64>>>> = OnceLock::new();
+        let mut all = SLOTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ports = all.entry(cdp_port).or_default();
+        let next = ports.len() as u64;
+        *ports.entry(frame_id.to_string()).or_insert(next)
+    }
+
+    /// The full in-page script: ref registry, then the walk, numbered from
+    /// `base`.
+    pub fn script_with_base(base: u64) -> String {
         format!(
-            "window.__cuBase={};{}{}",
-            REF_BASE.load(Ordering::Relaxed),
+            "window.__cuBase={base};{}{}",
             crate::actions::REGISTRY_JS,
             SNAPSHOT_JS
         )
@@ -2425,10 +2950,17 @@ pub mod snapshot {
     /// Everything happens in the page, so only the small result crosses CDP --
     /// that is the whole point of a snapshot: one round trip, a few hundred
     /// bytes, instead of a full DOM dump.
+    ///
+    /// The walk descends into open shadow roots, because a web component
+    /// renders its controls there and they are otherwise invisible: a
+    /// widget-heavy page would snapshot as a page with nothing on it. A closed
+    /// root hides its contents from every script and stays unread, which is
+    /// what the page itself sees.
     pub const SNAPSHOT_JS: &str = r#"
 /* cuAgentSnapshot */
 (() => {
-  const INTERACTIVE = 'a[href],button,input,select,textarea,[role=button],[role=link],[role=checkbox],[role=tab],[role=menuitem]';
+  const INTERACTIVE = 'a[href],button,input,select,textarea,[role=button],[role=link],[role=checkbox],[role=tab],[role=menuitem],[contenteditable]:not([contenteditable=false])';
+  const HEADINGS = 'h1,h2,h3,[role=heading]';
   const visible = (el) => {
     const r = el.getBoundingClientRect();
     if (r.width < 2 || r.height < 2) return false;
@@ -2451,27 +2983,42 @@ pub mod snapshot {
     if (img) return img.alt;
     return clean(el.textContent) || clean(el.getAttribute('placeholder')) || clean(el.value) || '';
   };
+  const roleOf = (el) => el.getAttribute('role')
+    || ({A:'link',BUTTON:'button',SELECT:'combobox',TEXTAREA:'textbox'})
+      [el.tagName]
+    || (el.tagName === 'INPUT'
+      ? ({text:'textbox',search:'searchbox',email:'textbox',password:'textbox',
+          number:'spinbutton',checkbox:'checkbox',radio:'radio',file:'button'})[el.type] || 'textbox'
+      : el.isContentEditable ? 'textbox'
+      : 'generic');
   const nodes = [];
-  for (const el of document.querySelectorAll(INTERACTIVE)) {
-    if (!visible(el)) continue;
-    if (el.closest('[aria-hidden=true]')) continue;
-    const role = el.getAttribute('role')
-      || ({A:'link',BUTTON:'button',SELECT:'combobox',TEXTAREA:'textbox'})
-        [el.tagName]
-      || (el.tagName === 'INPUT'
-        ? ({text:'textbox',search:'searchbox',email:'textbox',password:'textbox',
-            number:'spinbutton',checkbox:'checkbox',radio:'radio',file:'button'})[el.type] || 'textbox'
-        : 'generic');
-    nodes.push({ ref: window.__cu.ref(el), role, name: name(el).slice(0, 120) });
-    if (nodes.length >= 200) break;
-  }
   const headings = [];
-  for (const h of document.querySelectorAll('h1,h2,h3,[role=heading]')) {
-    if (!visible(h)) continue;
-    const t = clean(h.textContent).slice(0, 120);
-    if (t) headings.push(t);
-    if (headings.length >= 20) break;
-  }
+  // One root at a time: the document, then every open shadow root below it.
+  // `querySelectorAll` does not pierce a shadow root, so each one has to be
+  // asked for its own -- and a host is skipped in its parent's pass, because
+  // the root renders it, not the children it also happens to have.
+  const walk = (root) => {
+    for (const el of root.querySelectorAll(INTERACTIVE)) {
+      if (el.shadowRoot) continue;
+      if (!visible(el)) continue;
+      if (el.closest('[aria-hidden=true]')) continue;
+      nodes.push({ ref: window.__cu.ref(el), role: roleOf(el), name: name(el).slice(0, 120) });
+      if (nodes.length >= 200) return;
+    }
+    for (const el of root.querySelectorAll('*')) if (el.shadowRoot) walk(el.shadowRoot);
+  };
+  walk(document);
+  const outline = (root) => {
+    for (const h of root.querySelectorAll(HEADINGS)) {
+      if (!visible(h)) continue;
+      const t = clean(h.textContent).slice(0, 120);
+      if (t) headings.push(t);
+      if (headings.length >= 20) return true;
+    }
+    for (const el of root.querySelectorAll('*')) if (el.shadowRoot && outline(el.shadowRoot)) return true;
+    return false;
+  };
+  outline(document);
   return JSON.stringify({
     url: location.href,
     title: document.title,
@@ -2544,5 +3091,179 @@ mod pool_tests {
             .local_addr()
             .expect("addr")
             .port()
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    #[test]
+    fn a_frame_tree_flattens_main_first_then_children() {
+        let tree = r#"{"id":1,"result":{"frameTree":{"frame":{"id":"M","url":"https://a.test/"},
+            "childFrames":[{"frame":{"id":"C1","url":"https://b.test/"},
+                "childFrames":[{"frame":{"id":"C2","url":"https://c.test/"}}]}]}}}"#;
+        let frames = flatten_frame_tree(tree);
+        let ids: Vec<&str> = frames.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, ["M", "C1", "C2"], "main document must come first");
+        assert_eq!(frames[0].parent, None);
+        assert_eq!(frames[1].parent.as_deref(), Some("M"));
+        assert_eq!(frames[2].parent.as_deref(), Some("C1"));
+        assert_eq!(frames[2].url, "https://c.test/");
+    }
+
+    #[test]
+    fn a_tree_with_no_children_is_one_frame() {
+        let tree = r#"{"id":1,"result":{"frameTree":{"frame":{"id":"M","url":"about:blank"}}}}"#;
+        assert_eq!(flatten_frame_tree(tree).len(), 1);
+        assert_eq!(flatten_frame_tree("not json").len(), 0);
+    }
+
+    #[test]
+    fn the_walk_descends_into_shadow_roots() {
+        let js = snapshot::SNAPSHOT_JS;
+        // A document query cannot see a shadow root, so the walk has to ask
+        // each root for itself and recurse. Without this the controls of a
+        // web component are invisible and the page snapshots as empty.
+        assert!(
+            js.contains("el.shadowRoot"),
+            "the walk must recurse into shadow roots: {js}"
+        );
+        // ...and a host is skipped in its parent's pass, or the same element
+        // would be listed twice.
+        assert!(
+            js.contains("if (el.shadowRoot) continue;"),
+            "a shadow host must not also be listed from its parent: {js}"
+        );
+        // The heading outline gets the same treatment, or a component's
+        // headings never appear.
+        assert!(
+            js.matches("shadowRoot").count() >= 3,
+            "headings must be walked too: {js}"
+        );
+    }
+
+    #[test]
+    fn the_hit_test_sees_past_a_shadow_host() {
+        let js = crate::actions::REGISTRY_JS;
+        // `document.elementFromPoint` reports the host at the centre of a
+        // control inside it, which reads as "covered" and refuses the click.
+        assert!(
+            js.contains("at.shadowRoot.elementFromPoint"),
+            "the hit test must descend into the shadow root: {js}"
+        );
+    }
+
+    #[test]
+    fn the_text_read_reaches_open_shadow_roots_too() {
+        let js = READ_TEXT_JS;
+        assert!(
+            js.contains("el.shadowRoot"),
+            "text must include what a web component renders: {js}"
+        );
+        // Chromium gives a ShadowRoot no innerText, so the words come from
+        // the visible leaves inside it rather than from the root itself.
+        assert!(
+            !js.contains("r.innerText"),
+            "a ShadowRoot has no innerText in Chromium: {js}"
+        );
+        // And a subtree that is not rendered must not leak: innerText
+        // degrades to textContent there.
+        assert!(js.contains("display"), "visibility is not checked: {js}");
+    }
+
+    #[test]
+    fn frames_number_their_refs_in_stable_bands() {
+        let port = 64_001;
+        let first = snapshot::base_for(port, "FRAME-A");
+        let second = snapshot::base_for(port, "FRAME-B");
+        assert_eq!(first + snapshot::BAND, second, "bands must not overlap");
+        // The same frame always gets the same band, or its persisted
+        // registry and the daemon's ref map would disagree.
+        assert_eq!(snapshot::base_for(port, "FRAME-A"), first);
+    }
+
+    #[test]
+    fn a_walk_reads_every_frame_and_records_where_each_ref_lives() {
+        let tab = Tab::default_for(64_002);
+        let frames = vec![
+            Frame {
+                id: "M".into(),
+                parent: None,
+                url: "https://main.test/".into(),
+            },
+            Frame {
+                id: "C".into(),
+                parent: Some("M".into()),
+                url: "https://child.test/".into(),
+            },
+        ];
+        let main_walk = r#"{"url":"https://main.test/","title":"Main","nodes":[{"ref":"e1","role":"link","name":"go"}],"headings":[],"next":1}"#;
+        let child_walk = r#"{"url":"https://child.test/","title":"Child","nodes":[{"ref":"e9","role":"textbox","name":"inner"}],"headings":[],"next":9}"#;
+        let (text, pairs) = walk_frames(&tab, frames, |method, params| match method {
+            "Page.createIsolatedWorld" => {
+                assert!(params.contains("\"frameId\":\"C\""), "entered {params}");
+                Ok(r#"{"result":{"executionContextId":7}}"#.to_string())
+            }
+            "Runtime.evaluate" if params.contains("contextId") => Ok(format!(
+                "{{\"result\":{{\"result\":{{\"type\":\"string\",\"value\":{}}}}}}}",
+                json_string(child_walk)
+            )),
+            "Runtime.evaluate" => Ok(format!(
+                "{{\"result\":{{\"result\":{{\"type\":\"string\",\"value\":{}}}}}}}",
+                json_string(main_walk)
+            )),
+            other => Err(format!("unexpected {other}")),
+        })
+        .expect("walk");
+        assert!(text.contains("- url: https://main.test/"), "{text}");
+        assert!(text.contains("- ref=e1 link \"go\""), "{text}");
+        assert!(text.contains("- frame: https://child.test/"), "{text}");
+        assert!(text.contains("- ref=e9 textbox \"inner\""), "{text}");
+        assert_eq!(
+            pairs,
+            vec![
+                ("e1".to_string(), "M".to_string()),
+                ("e9".to_string(), "C".to_string())
+            ]
+        );
+        // And the map is what an action will consult later.
+        note_ref_frames(&tab, &pairs);
+        assert_eq!(frame_for_ref(&tab, "e9").as_deref(), Some("C"));
+        assert_eq!(frame_for_ref(&tab, "e1").as_deref(), Some("M"));
+        assert_eq!(frame_for_ref(&tab, "e404"), None);
+    }
+
+    #[test]
+    fn a_child_frame_that_cannot_be_walked_is_named_not_fatal() {
+        let tab = Tab::default_for(64_003);
+        let frames = vec![
+            Frame {
+                id: "M".into(),
+                parent: None,
+                url: "https://main.test/".into(),
+            },
+            Frame {
+                id: "GONE".into(),
+                parent: Some("M".into()),
+                url: "https://gone.test/".into(),
+            },
+        ];
+        let main_walk =
+            r#"{"url":"https://main.test/","title":"Main","nodes":[],"headings":[],"next":0}"#;
+        let (text, pairs) = walk_frames(&tab, frames, |method, params| match method {
+            "Page.createIsolatedWorld" => Ok(r#"{"result":{}}"#.to_string()),
+            "Runtime.evaluate" => Ok(format!(
+                "{{\"result\":{{\"result\":{{\"type\":\"string\",\"value\":{}}}}}}}",
+                json_string(main_walk)
+            )),
+            other => Err(format!("unexpected {other} in {params}")),
+        })
+        .expect("walk");
+        assert!(
+            text.contains("- frame: https://gone.test/ (unreadable right now"),
+            "{text}"
+        );
+        assert!(pairs.is_empty());
     }
 }

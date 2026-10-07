@@ -641,6 +641,16 @@ fn input_log(server: &TestServer) -> String {
     server::http_get(&format!("127.0.0.1:{}", server.cdp_port), "/input-log").expect("input log")
 }
 
+/// Every `Browser.setDownloadBehavior` the daemon sent, as the fake browser saw
+/// them: what decides where a download from `?context=NAME` lands.
+fn download_behaviour(server: &TestServer) -> String {
+    server::http_get(
+        &format!("127.0.0.1:{}", server.cdp_port),
+        "/download-behaviour",
+    )
+    .expect("download behaviour")
+}
+
 #[test]
 fn a_click_by_ref_is_a_real_mouse_click() {
     let server = TestServer::start("click-ref", true);
@@ -787,6 +797,145 @@ fn the_last_tab_cannot_be_closed_but_another_can() {
     );
     let response = server.fragmented(&request);
     assert_eq!(status_code(&response), "400", "got {}", body_of(&response));
+}
+
+#[test]
+fn iframe_contents_are_snapshotted_and_clickable() {
+    let server = TestServer::start("frames", true);
+    let response = server.post("/v1/navigate", r#"{"url":"https://example.test/frames"}"#);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+
+    // The snapshot reaches into the iframe: frame line, and its elements.
+    let response = server.get("/v1/snapshot");
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&response);
+    assert!(
+        body.contains("- frame: https://example.test/child"),
+        "got {body}"
+    );
+    assert!(body.contains("ref=e9"), "no iframe ref in {body}");
+
+    // Clicking an iframe ref enters the frame, adds the iframe's own offset
+    // and dispatches the mouse at main-document coordinates.
+    let response = server.post("/v1/click", r#"{"ref":"e9"}"#);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    assert!(
+        body_of(&response).contains("\"ok\":true"),
+        "got {}",
+        body_of(&response)
+    );
+    assert_eq!(
+        input_log(&server),
+        r#"["Input.dispatchMouseEvent", "Input.dispatchMouseEvent"]"#
+    );
+
+    // The closing snapshot of a batch sees the frame too, and an unknown
+    // ref is still the clear error an agent can act on.
+    let response = server.post("/v1/act", r#"{"actions":[{"do":"click","ref":"e9"}]}"#);
+    let body = body_of(&response);
+    assert!(body.contains("\"ok\":true"), "got {body}");
+    assert!(
+        body.contains("- frame: https://example.test/child"),
+        "got {body}"
+    );
+    let response = server.post("/v1/click", r#"{"ref":"e404"}"#);
+    assert!(
+        body_of(&response).contains("take a new snapshot"),
+        "got {}",
+        body_of(&response)
+    );
+}
+
+#[test]
+fn text_returns_the_pages_visible_words() {
+    let server = TestServer::start("text", true);
+    let response = server.get("/v1/text");
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&response);
+    assert!(body.contains("the quick brown fox"), "got {body}");
+    assert!(body.contains("\"truncated\":false"), "got {body}");
+}
+
+#[test]
+fn text_reads_the_frames_of_the_page_too() {
+    let server = TestServer::start("text-frames", true);
+    // A page with no frames: just the document, no frame lines.
+    let body = body_of(&server.get("/v1/text")).to_string();
+    assert!(body.contains("the quick brown fox"), "got {body}");
+    assert!(!body.contains("- frame:"), "no frames expected in {body}");
+
+    // With an iframe, its words come back named by the frame they came from,
+    // so the text never claims they are the page's own.
+    let response = server.post("/v1/navigate", r#"{"url":"https://example.test/frames"}"#);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&server.get("/v1/text")).to_string();
+    assert!(
+        body.contains("the quick brown fox"),
+        "main frame lost: {body}"
+    );
+    assert!(body.contains("words from inside the frame"), "got {body}");
+    assert!(
+        body.contains("- frame: https://example.test/child"),
+        "frame not named: {body}"
+    );
+    assert!(body.contains("\"truncated\":false"), "got {body}");
+}
+
+#[test]
+fn a_named_context_downloads_into_a_directory_of_its_own() {
+    let server = TestServer::start("context-downloads", true);
+    let response = server.post(
+        "/v1/navigate?context=alice",
+        r#"{"url":"https://example.test"}"#,
+    );
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+
+    // Without a browserContextId the browser-wide behaviour governs every
+    // context, so a download from one is indistinguishable from the default
+    // tab's. Each named context must be given its own directory.
+    let behaviour = download_behaviour(&server);
+    assert!(
+        behaviour.contains("CTX"),
+        "no context download behaviour: {behaviour}"
+    );
+    let alice = behaviour
+        .split("},")
+        .find(|p| p.contains("CTX"))
+        .unwrap_or("");
+    assert!(
+        alice.contains("browserContextId"),
+        "the context behaviour must name its browser context: {alice}"
+    );
+    // And it is the context's own directory, under the session's downloads.
+    let dir = server.data_dir.join("downloads").join("alice");
+    assert!(
+        alice.contains(&format!("downloads{}", std::path::MAIN_SEPARATOR)),
+        "not under the session downloads: {alice}"
+    );
+    assert!(
+        alice.contains("alice"),
+        "not the context's own name: {alice}"
+    );
+    assert!(dir.is_dir(), "{} was not created", dir.display());
+}
+
+#[test]
+fn downloads_from_named_contexts_are_listed_with_their_context() {
+    let server = TestServer::start("context-download-list", false);
+    assert_eq!(body_of(&server.get("/v1/downloads")), "{\"downloads\":[]}");
+    let dir = server.data_dir.join("downloads");
+    std::fs::create_dir_all(dir.join("alice")).expect("context dir");
+    std::fs::write(dir.join("report.pdf"), b"1234").expect("default file");
+    // Two contexts may download files of the same name; they are two files.
+    std::fs::write(dir.join("alice").join("report.pdf"), b"12345").expect("alice file");
+    std::fs::write(dir.join("alice").join("half.zip.crdownload"), b"1").expect("partial");
+    let body = body_of(&server.get("/v1/downloads")).to_string();
+    assert!(body.contains("\"name\":\"report.pdf\""), "got {body}");
+    // The context's copy is labelled with its context, and is a different size.
+    assert!(body.contains("\"context\":\"alice\""), "got {body}");
+    assert!(body.contains("\"bytes\":5"), "got {body}");
+    // A partial file inside a context directory is still not finished.
+    assert!(!body.contains("crdownload"), "partial listed: {body}");
 }
 
 #[test]

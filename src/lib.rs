@@ -47,6 +47,11 @@ impl Client {
     pub fn downloads(&self) -> Result<String, String> {
         self.request("GET", "/v1/downloads", "")
     }
+    /// Visible text of the page: what to read when the answer is prose,
+    /// an API response or a message rather than something to act on.
+    pub fn text(&self) -> Result<String, String> {
+        self.request("GET", "/v1/text", "")
+    }
     /// Click the element a snapshot named `reference` (`e3`).
     pub fn click(&self, reference: &str) -> Result<String, String> {
         self.request(
@@ -63,6 +68,11 @@ impl Client {
     }
     pub fn save_session(&self, name: &str) -> Result<String, String> {
         self.request("POST", &format!("/v1/session/{name}"), "{}")
+    }
+    /// Load a saved session back over the live profile (a profile copy;
+    /// works while the browser is down).
+    pub fn load_session(&self, name: &str) -> Result<String, String> {
+        self.request("POST", &format!("/v1/session/{name}/load"), "{}")
     }
     fn request(&self, method: &str, path: &str, body: &str) -> Result<String, String> {
         let address = self
