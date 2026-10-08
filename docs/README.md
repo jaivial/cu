@@ -132,6 +132,17 @@ isolated browser context of the same browser (own cookies and storage),
 created on first use. `GET /v1/contexts` lists them and `DELETE
 /v1/contexts/NAME` closes one. Stopping `cu` closes its browser.
 
+A context lives in memory only. `cu session save NAME --context CTX`
+(`POST /v1/session/NAME?context=CTX`) saves its cookie jar
+(`Storage.getCookies` for its `browserContextId`) to
+`sessions/NAME.ctx.cuse`, encrypted with the same key and format as profile
+sessions; `cu session load NAME --context CTX` (`.../NAME/load?context=CTX`)
+creates the context if needed and puts the cookies back into it live
+(`Storage.setCookies` with its `browserContextId`), in this or a later
+daemon. Context archives authenticate under their own name space, so one
+cannot be loaded as a profile session (or renamed) without failing. Only
+cookies: a context's localStorage/IndexedDB are not saved.
+
 ### Tabs and popups
 
 The one default tab is pinned: popups and the browser's own target order
