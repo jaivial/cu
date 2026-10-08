@@ -289,7 +289,8 @@ pub fn json() -> String {
         .map(launch_json)
         .unwrap_or_else(|| "null".into());
     format!(
-        "{{\"browser\":{launch},\"protocol\":{},\"origins\":{},\"note\":{}}}",
+        "{{\"browser\":{launch},\"session\":{},\"protocol\":{},\"origins\":{},\"note\":{}}}",
+        crate::session::json(),
         protocol_json(),
         crate::scheduler::json(),
         json_string("observations about this setup, not a measure of how sites will treat it")
