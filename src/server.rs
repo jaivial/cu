@@ -868,6 +868,7 @@ pub fn route(
         ("POST", "/v1/act") => act(&tab, crate::actions::parse_batch(body)),
         ("POST", "/v1/click") => act(&tab, single("click", body)),
         ("POST", "/v1/type") => act(&tab, single("type", body)),
+        ("POST", "/v1/upload") => act(&tab, single("upload", body)),
         ("GET", "/v1/snapshot") => match snapshot_tab(&tab) {
             Ok(text) => ("200 OK", "application/json", text),
             Err(error) => (

@@ -54,6 +54,13 @@ pub enum Action {
     Wait {
         ms: u64,
     },
+    /// Put local files on a file input. `reference` is the input or the
+    /// visible control that opens the picker (the input itself is usually
+    /// `display:none`); `None` means the page's only file input.
+    Upload {
+        reference: Option<String>,
+        files: Vec<String>,
+    },
 }
 
 /// A parsed `POST /v1/act` body.
@@ -118,8 +125,60 @@ pub fn parse_action(object: &str) -> Result<Action, String> {
                 .and_then(|v| v.parse().ok())
                 .ok_or("wait needs \"ms\"")?,
         },
+        "upload" => {
+            let reference = match json_string_value(object, "ref") {
+                Some(_) => Some(reference()?),
+                None => None,
+            };
+            let mut files = match json_array(object, "files") {
+                Some(list) => string_array(&list).ok_or("\"files\" must be an array of paths")?,
+                None => Vec::new(),
+            };
+            if let Some(file) = json_string_value(object, "file") {
+                files.push(file);
+            }
+            if files.is_empty() {
+                return Err("upload needs \"files\" (or \"file\")".into());
+            }
+            // Absolute and existing here, in the daemon: the browser reads
+            // the files from the same machine, and a missing one would
+            // otherwise reach the page as an empty or broken File.
+            let files = files
+                .iter()
+                .map(|f| {
+                    let path = std::fs::canonicalize(f).map_err(|e| format!("{f}: {e}"))?;
+                    if !path.is_file() {
+                        return Err(format!("{f}: not a file"));
+                    }
+                    path.into_os_string()
+                        .into_string()
+                        .map_err(|_| format!("{f}: path is not UTF-8"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Action::Upload { reference, files }
+        }
         other => return Err(format!("unknown action \"{other}\"")),
     })
+}
+
+/// The strings of a JSON array such as `["a","b"]`; `None` if anything in it
+/// is not a string.
+fn string_array(list: &str) -> Option<Vec<String>> {
+    let mut rest = list.trim().strip_prefix('[')?.strip_suffix(']')?.trim();
+    let mut out = Vec::new();
+    while !rest.is_empty() {
+        let body = rest.strip_prefix('"')?;
+        let mut escaped = false;
+        let end = body.char_indices().find_map(|(i, c)| {
+            let close = c == '"' && !escaped;
+            escaped = c == '\\' && !escaped;
+            close.then_some(i)
+        })?;
+        out.push(json_string_value(&format!("{{\"s\":\"{}\"}}", &body[..=end]), "s")?);
+        rest = body[end + 1..].trim_start();
+        rest = rest.strip_prefix(',').map(str::trim_start).unwrap_or(rest);
+    }
+    Some(out)
 }
 
 /// A boolean field of a JSON object.
@@ -536,6 +595,10 @@ impl Page {
                 std::thread::sleep(Duration::from_millis(*ms).min(MAX_WAIT));
                 false
             }
+            Action::Upload { reference, files } => {
+                self.upload(reference.as_deref(), files)?;
+                false
+            }
         };
         Ok(Outcome {
             navigated,
@@ -557,6 +620,125 @@ impl Page {
         }
         let context = self.enter(reference)?;
         self.registry_in(context, call)
+    }
+
+    /// Set `files` on the file input behind `reference` (or the page's only
+    /// one) with `DOM.setFileInputFiles`, which needs no visibility and
+    /// fires the `input` and `change` events a real pick does. The input is
+    /// resolved in cu's isolated world to a remote object; the world shares
+    /// the DOM with the page, so the node is the page's own.
+    fn upload(&mut self, reference: Option<&str>, files: &[String]) -> Result<(), String> {
+        let call = format!(
+            "fileInput({})",
+            reference.map(json_string).unwrap_or_else(|| "null".into())
+        );
+        let expression = format!(
+            "{REGISTRY}?{REGISTRY}.{call}:JSON.stringify({{error:'this page has no refs yet; take a snapshot first'}})"
+        );
+        let remote = reference.and_then(|r| self.remote_frame(r));
+        let command = |page: &mut Self, method: &str, params: &str| match &remote {
+            Some((_, target)) => target.command(method, params),
+            None => page.conn().call(method, params),
+        };
+        let context = match (&remote, reference) {
+            (Some((frame, target)), _) => {
+                crate::execution::isolated_context(&mut |m, p| target.command(m, p), frame)?
+            }
+            (None, Some(r)) => match self.enter(r)? {
+                Some(id) => id,
+                None => self.world(&self.frame.clone())?,
+            },
+            (None, None) => self.world(&self.frame.clone())?,
+        };
+        let reply = command(
+            self,
+            "Runtime.evaluate",
+            &format!(
+                "{{\"expression\":{},\"contextId\":{context}}}",
+                json_string(&expression)
+            ),
+        )?;
+        if reply.contains("\"exceptionDetails\"") {
+            return Err(json_string_value(&reply, "description")
+                .unwrap_or_else(|| "script failed in the page".into()));
+        }
+        let Some(object) = json_string_value(&reply, "objectId") else {
+            // The helper answers with a JSON string when there is no input.
+            let value = evaluated_string(&reply).unwrap_or_default();
+            return Err(json_string_value(&value, "error")
+                .unwrap_or_else(|| "no file input found".into()));
+        };
+        let multiple = command(
+            self,
+            "Runtime.callFunctionOn",
+            &format!(
+                "{{\"objectId\":{},\"functionDeclaration\":\"function(){{return this.multiple}}\",\"returnByValue\":true}}",
+                json_string(&object)
+            ),
+        )
+        .ok()
+        .and_then(|r| flag(&r, "value"))
+        .unwrap_or(false);
+        if files.len() > 1 && !multiple {
+            return Err(format!(
+                "that file input takes one file ({} given)",
+                files.len()
+            ));
+        }
+        let list = files.iter().map(|f| json_string(f)).collect::<Vec<_>>().join(",");
+        let reply = command(
+            self,
+            "DOM.setFileInputFiles",
+            &format!("{{\"files\":[{list}],\"objectId\":{}}}", json_string(&object)),
+        )?;
+        if let Some(message) = json_value(&reply, "message").filter(|_| reply.contains("\"error\"")) {
+            return Err(format!("DOM.setFileInputFiles: {message}"));
+        }
+        // The browser opens the files lazily: one it cannot read (a snap
+        // Chromium has a private /tmp) still lands in the FileList, with
+        // size 0. Compare against the size on disk and say so.
+        let sizes = command(
+            self,
+            "Runtime.callFunctionOn",
+            &format!(
+                "{{\"objectId\":{},\"functionDeclaration\":\"function(){{return [...this.files].map(f=>f.size).join(',')}}\",\"returnByValue\":true}}",
+                json_string(&object)
+            ),
+        )
+        .ok()
+        .and_then(|r| json_string_value(&r, "value"))
+        .unwrap_or_default();
+        let unreadable: Vec<&str> = files
+            .iter()
+            .zip(sizes.split(','))
+            .filter(|(f, size)| {
+                *size == "0" && std::fs::metadata(f).is_ok_and(|m| m.len() > 0)
+            })
+            .map(|(f, _)| f.as_str())
+            .collect();
+        if !unreadable.is_empty() {
+            // Do not leave empty Files for the page to submit.
+            let _ = command(
+                self,
+                "Runtime.callFunctionOn",
+                &format!(
+                    "{{\"objectId\":{},\"functionDeclaration\":\"function(){{this.value=''}}\"}}",
+                    json_string(&object)
+                ),
+            );
+        }
+        let _ = command(
+            self,
+            "Runtime.releaseObject",
+            &format!("{{\"objectId\":{}}}", json_string(&object)),
+        );
+        if !unreadable.is_empty() {
+            return Err(format!(
+                "the browser cannot read {} (sandboxed browser, e.g. snap Chromium with a private /tmp); put the file under your home directory",
+                unreadable.join(", ")
+            ));
+        }
+        Ok(())
     }
 
     /// The frame of `reference` and the out-of-process iframe target that
@@ -1262,6 +1444,32 @@ if (!window.__cu) {
         else if (el.isContentEditable) { document.getSelection().selectAllChildren(el); }
       }
       return JSON.stringify({ len });
+    },
+    fileInput(ref) {
+      // The file input a ref stands for: the input itself, the control a
+      // label points at, one inside the element, or the nearest one around
+      // it (a "Select from computer" button and its display:none input share
+      // a form or wrapper). Without a ref: the document's only file input.
+      const isFile = (e) => e && e.tagName === 'INPUT' && e.type === 'file';
+      const inputs = (root) => [...root.querySelectorAll('input[type=file]')];
+      if (ref === null) {
+        const all = inputs(document);
+        if (all.length === 1) return all[0];
+        return err(all.length ? all.length + ' file inputs on the page; pass the ref of the control next to the one you want'
+          : 'no file input on the page');
+      }
+      const el = get(ref);
+      if (!el) return err(ref + ' is not on the page any more; take a new snapshot');
+      if (isFile(el)) return el;
+      if (isFile(el.control)) return el.control;
+      const label = el.closest('label');
+      if (label && isFile(label.control)) return label.control;
+      let found = inputs(el);
+      for (let up = el.parentElement, n = 0; !found.length && up && n < 8; up = up.parentElement, n++)
+        found = inputs(up);
+      if (found.length === 1) return found[0];
+      if (found.length > 1) return err(found.length + ' file inputs around ' + ref + '; pass a ref closer to one');
+      return err('no file input at or around ' + ref);
     },
     select(ref, value) {
       const el = get(ref);

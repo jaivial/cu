@@ -354,7 +354,7 @@ cu tab close ID · cu tab renew ID [SECONDS] · cu tabs [close ID]
 cu context open NAME [--lease S] · cu context close NAME   # isolated cookie jar
 cu lease [KEY [SECONDS]]     # list held leases / extend one
 cu navigate URL · cu snapshot · cu text        # all take --tab ID / --context NAME
-cu click e3 · cu type e2 "text" [--submit]
+cu click e3 · cu type e2 "text" [--submit] · cu upload e5 photo.jpg
 cu act '[{"do":"type","ref":"e2","text":"Ada"},{"do":"click","ref":"e5"}]'
 cu batch 'snapshot --tab t1' 'click e3 --tab t1'   # many commands, one call
 cu shot [FILE.jpg] · cu downloads · cu login

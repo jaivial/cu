@@ -107,7 +107,14 @@ so a whole form is one call:
 
 Actions are `click`, `type` (`text`, `clear` default true, `submit`), `press`
 (`key`: Enter, Tab, Escape, arrows, ...), `select` (`value` or label),
-`navigate` (`url`) and `wait` (`ms`). `"snapshot":false` skips the closing
+`navigate` (`url`), `wait` (`ms`) and `upload` (`files`: paths; `ref`: the
+file input or the button that opens the picker -- file inputs are usually
+`display:none` and never get a ref of their own, so cu finds the input at,
+labelled by, inside or around that control; no `ref` = the page's only file
+input). `upload` uses `DOM.setFileInputFiles`, fires `input`/`change`, refuses
+several files on an input without `multiple`, and fails (leaving the input
+empty) when the browser cannot read a file -- snap Chromium has a private
+`/tmp`, keep uploads under `$HOME`. CLI: `cu upload [REF] FILE...`. `"snapshot":false` skips the closing
 snapshot. The reply reports `ok`, per-action `navigated` and `ms`, and on a
 failure the index that `failed` and why -- a stale ref says to take a new
 snapshot, a covered element names what covers it. Refs stay with their element
