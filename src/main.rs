@@ -99,6 +99,38 @@ fn main() {
             .map(|s| println!("{s}")),
             _ => Err("usage: cu type REF TEXT [--submit]".into()),
         },
+        // `cu upload [REF] FILE...`: REF is the file input or the control
+        // that opens the picker; without it, the page's only file input.
+        // Paths are made absolute here, against the caller's directory.
+        Some("upload") => {
+            let (reference, files) = match args.get(1) {
+                Some(r) if cu::actions::valid_ref(r) => (Some(r.clone()), &args[2..]),
+                _ => (None, &args[1..]),
+            };
+            if files.is_empty() {
+                Err("usage: cu upload [REF] FILE...".into())
+            } else {
+                let files = files
+                    .iter()
+                    .map(|f| {
+                        fs::canonicalize(f)
+                            .map(|p| server::json_string(&p.to_string_lossy()))
+                            .map_err(|e| format!("{f}: {e}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                files.and_then(|files| {
+                    let reference = reference
+                        .map(|r| format!("\"ref\":{},", server::json_string(&r)))
+                        .unwrap_or_default();
+                    request(
+                        "POST",
+                        &on_tab("/v1/upload"),
+                        Some(&format!("{{{reference}\"files\":[{}]}}", files.join(","))),
+                    )
+                    .map(|s| println!("{s}"))
+                })
+            }
+        }
         // `cu act '[{"do":"click","ref":"e3"}, ...]'`, or the JSON on stdin.
         Some("act") => {
             let actions = match args.get(1) {
@@ -139,7 +171,7 @@ fn main() {
 }
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
     );
 }
 
