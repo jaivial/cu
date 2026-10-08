@@ -2374,8 +2374,25 @@ pub fn json_string_value(object: &str, key: &str) -> Option<String> {
                 'b' => out.push('\u{8}'),
                 'f' => out.push('\u{c}'),
                 'u' => {
-                    let hex: String = (0..4).filter_map(|_| chars.next()).collect();
-                    let code = u32::from_str_radix(&hex, 16).ok()?;
+                    let code = hex4(&mut chars)?;
+                    // Characters outside the BMP (emoji) arrive as a UTF-16
+                    // surrogate pair, `\ud83e\udd16`: join the two halves.
+                    // Decoding each half alone gave two U+FFFD.
+                    let code = if (0xD800..0xDC00).contains(&code) {
+                        let mut ahead = chars.clone();
+                        match (ahead.next(), ahead.next()) {
+                            (Some('\\'), Some('u')) => match hex4(&mut ahead) {
+                                Some(low) if (0xDC00..0xE000).contains(&low) => {
+                                    chars = ahead;
+                                    0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                                }
+                                _ => code,
+                            },
+                            _ => code,
+                        }
+                    } else {
+                        code
+                    };
                     out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
                 }
                 other => out.push(other),
@@ -2384,6 +2401,12 @@ pub fn json_string_value(object: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Four hex digits of a `\u` escape.
+fn hex4(chars: &mut std::str::Chars) -> Option<u32> {
+    let hex: String = chars.take(4).collect();
+    u32::from_str_radix(&hex, 16).ok()
 }
 
 /// The objects of a JSON array, in order.
