@@ -3084,6 +3084,16 @@ fn tab_command(tab: &Tab, method: &str, params: &str) -> Result<String, String> 
     }
     unreachable!("the retry loop returns on its second attempt")
 }
+/// [`cdp_browser_command`] for other modules.
+pub fn browser_command(cdp_port: u16, method: &str, params: &str) -> Result<String, String> {
+    cdp_browser_command(cdp_port, method, params)
+}
+
+/// The page target the default tab is pinned to, if any.
+pub fn pinned_default_target(cdp_port: u16) -> Option<String> {
+    pinned_target(cdp_port)
+}
+
 /// Run one command on the browser-level DevTools endpoint (not a page).
 fn cdp_browser_command(cdp_port: u16, method: &str, params: &str) -> Result<String, String> {
     let version = http_get(&format!("127.0.0.1:{cdp_port}"), "/json/version")?;
