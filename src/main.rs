@@ -171,7 +171,7 @@ fn main() {
 }
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
     );
 }
 
@@ -350,12 +350,18 @@ fn session(args: &[String]) -> Result<(), String> {
     if !matches!(action, "save" | "load") {
         return Err("usage: cu session save|load NAME".into());
     }
-    let name = args.get(1).ok_or("usage: cu session save|load NAME")?;
-    let path = if action == "save" {
+    let name = args.get(1).ok_or("usage: cu session save|load NAME [--context CTX]")?;
+    let mut path = if action == "save" {
         format!("/v1/session/{name}")
     } else {
         format!("/v1/session/{name}/load")
     };
+    // `--context CTX`: the cookie jar of a named context (`?context=CTX`)
+    // instead of the persistent profile.
+    if let Some(i) = args.iter().position(|a| a == "--context") {
+        let context = args.get(i + 1).ok_or("--context needs a context name")?;
+        path.push_str(&format!("?context={context}"));
+    }
     request("POST", &path, Some("{}")).map(|s| println!("{s}"))
 }
 

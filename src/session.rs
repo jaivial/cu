@@ -862,6 +862,75 @@ pub fn save(
     Ok("encrypted")
 }
 
+// ── named contexts ──────────────────────────────────────────────────────
+
+/// The archive of a named context's saved state (`?context=NAME`): its own
+/// file, and its own AAD namespace (`ctx:` + name), so a profile archive
+/// cannot be loaded as a context or the other way round.
+pub fn context_archive_path(sessions: &Path, name: &str) -> PathBuf {
+    sessions.join(format!("{name}.ctx.cuse"))
+}
+
+/// Save a named context's cookie jar (`Storage.getCookies` for its
+/// `browserContextId`) as session `name`, encrypted like a profile
+/// session. A named context lives in memory only, so its jar is all the
+/// state it has that outlives the daemon.
+pub fn save_context(sessions: &Path, name: &str, cookies: &str) -> Result<usize, String> {
+    let cipher = key(true)?;
+    fs::create_dir_all(sessions).map_err(|e| e.to_string())?;
+    let _ = fs::set_permissions(sessions, fs::Permissions::from_mode(0o700));
+    let tmp = sessions.join(format!(".{name}.ctx.cuse.tmp"));
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|e| e.to_string())?;
+    out.write_all(MAGIC).map_err(|e| e.to_string())?;
+    let aad_name = format!("ctx:{name}");
+    let mut writer = Writer {
+        out,
+        cipher: &cipher,
+        name: &aad_name,
+        index: 0,
+    };
+    let result = writer
+        .put(&record(KIND_FILE, COOKIES_FILE, 0o600, cookies.as_bytes()))
+        .and_then(|_| {
+            let count = writer.index;
+            writer.put(&record(KIND_END, "", 0, &count.to_le_bytes()))?;
+            writer.out.sync_all().map_err(|e| e.to_string())
+        });
+    if let Err(e) = result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    fs::rename(&tmp, context_archive_path(sessions, name)).map_err(|e| e.to_string())?;
+    Ok(crate::server::json_objects(cookies).len())
+}
+
+/// The cookie jar saved by [`save_context`], verified and decrypted.
+pub fn load_context(sessions: &Path, name: &str) -> Result<String, String> {
+    let archive = context_archive_path(sessions, name);
+    if !archive.is_file() {
+        return Err(format!("no saved context session named {name}"));
+    }
+    let staging = sessions.join(format!(".{name}.ctx.loading"));
+    let _ = fs::remove_dir_all(&staging);
+    decrypt_into(&archive, &format!("ctx:{name}"), &staging)?;
+    let cookies = fs::read_to_string(staging.join(COOKIES_FILE));
+    let _ = fs::remove_dir_all(&staging);
+    cookies
+        .map_err(|_| "the archive holds no cookie jar".to_string())
+        .and_then(|c| {
+            c.trim_start()
+                .starts_with('[')
+                .then_some(c)
+                .ok_or_else(|| "the archive's cookie jar is malformed".to_string())
+        })
+}
+
 /// A relative archive path that stays inside the destination.
 fn safe_relative(path: &str) -> bool {
     !path.is_empty()

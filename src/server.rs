@@ -890,8 +890,12 @@ pub fn route(
                     "{\"error\":\"invalid session name\"}".into(),
                 );
             }
-            let profile = state.data_dir.join("profiles/default");
             let sessions = state.data_dir.join("sessions");
+            let context = form_value(query(full_path), "context");
+            if !context.is_empty() {
+                return context_session(state, &sessions, name, &context, load);
+            }
+            let profile = state.data_dir.join("profiles/default");
             // The browser owns the live profile and rewrites it constantly, so
             // step away from the page first and let the copy settle.
             let browser_up = state.browser.is_ready();
@@ -941,6 +945,92 @@ pub fn route(
             "application/json",
             "{\"error\":\"not found\"}".into(),
         ),
+    }
+}
+
+/// `POST /v1/session/NAME[/load]?context=CTX`: save the cookie jar of the
+/// named context `CTX` as session `NAME`, encrypted, or load such a session
+/// into `CTX` (created if it does not exist yet), live.
+fn context_session(
+    state: &AppState,
+    sessions: &Path,
+    name: &str,
+    context: &str,
+    load: bool,
+) -> (&'static str, &'static str, String) {
+    let error = |status, e: &str| (status, "application/json", format!("{{\"error\":{}}}", json_string(e)));
+    if !valid_name(context) {
+        return error("400 Bad Request", "invalid context name");
+    }
+    if let Err(e) = wait_until_ready(state) {
+        return error("503 Service Unavailable", &e);
+    }
+    let browser_context = |cdp_port: u16| {
+        contexts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(cdp_port, context.to_string()))
+            .map(|c| c.browser_context.clone())
+    };
+    if load {
+        let cookies = match crate::session::load_context(sessions, name) {
+            Ok(c) => c,
+            Err(e) => return error("400 Bad Request", &e),
+        };
+        if let Err(e) = context_tab(state.cdp_port, context, &state.data_dir) {
+            return error("502 Bad Gateway", &e);
+        }
+        let Some(id) = browser_context(state.cdp_port) else {
+            return error("502 Bad Gateway", "the context went away");
+        };
+        let set = cdp_browser_command(
+            state.cdp_port,
+            "Storage.setCookies",
+            &format!("{{\"cookies\":{cookies},\"browserContextId\":{}}}", json_string(&id)),
+        )
+        .and_then(|reply| match reply.contains("\"error\":{") {
+            true => Err(json_value(&reply, "message").unwrap_or(reply)),
+            false => Ok(()),
+        });
+        return match set {
+            Ok(()) => (
+                "200 OK",
+                "application/json",
+                format!(
+                    "{{\"loaded\":true,\"storage\":\"encrypted\",\"context\":{},\"cookies\":{}}}",
+                    json_string(context),
+                    json_objects(&cookies).len()
+                ),
+            ),
+            Err(e) => error("502 Bad Gateway", &format!("could not set the cookies: {e}")),
+        };
+    }
+    let Some(id) = browser_context(state.cdp_port) else {
+        return error(
+            "400 Bad Request",
+            &format!("no context named {context} is open in this daemon"),
+        );
+    };
+    let cookies = cdp_browser_command(
+        state.cdp_port,
+        "Storage.getCookies",
+        &format!("{{\"browserContextId\":{}}}", json_string(&id)),
+    )
+    .ok()
+    .and_then(|reply| json_array(&reply, "cookies"));
+    let Some(cookies) = cookies else {
+        return error("502 Bad Gateway", "could not read the context's cookies");
+    };
+    match crate::session::save_context(sessions, name, &cookies) {
+        Ok(count) => (
+            "200 OK",
+            "application/json",
+            format!(
+                "{{\"saved\":true,\"storage\":\"encrypted\",\"context\":{},\"cookies\":{count}}}",
+                json_string(context)
+            ),
+        ),
+        Err(e) => error("400 Bad Request", &e),
     }
 }
 
