@@ -813,7 +813,7 @@ pub fn metrics_json() -> String {
         "{{\"assessed\":{},\"states\":{{{}}},\"vendors\":{{{}}},\"challenge_rate\":{},\
          \"ready\":{},\"ready_contradicted\":{},\"false_success_rate\":{},\
          \"handoffs_cleared\":{},\"handoffs_released\":{},\
-         \"url_rechecks\":{},\"url_recheck_changes\":{},\
+         \"url_rechecks\":{},\"url_recheck_changes\":{},\"handoffs\":{},\
          \"note\":\"challenge_rate = defence verdicts / assessments; false_success_rate = ready verdicts whose next check on the same tab and origin found a defence / ready verdicts (a lower bound: only what a later check saw)\"}}",
         m.assessed,
         map(&m.by_state),
@@ -826,6 +826,7 @@ pub fn metrics_json() -> String {
         m.released,
         m.url_rechecks,
         m.url_recheck_changes,
+        handoff::json(),
     )
 }
 
@@ -861,6 +862,7 @@ pub fn record(tab: &Tab, assessment: &Assessment) {
 /// Log and remember an assessment without counting it: the gate's re-checks
 /// of a paused tab are not new navigations.
 fn store(tab: &Tab, assessment: &Assessment) {
+    let before = last(tab).map(|a| a.state);
     if assessment.state != ChallengeState::Ready {
         eprintln!(
             "cu: challenge: {} {} on {} ({})",
@@ -878,6 +880,12 @@ fn store(tab: &Tab, assessment: &Assessment) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(tab.clone(), Instant::now());
+    let held = assessment.state == ChallengeState::HumanRequired;
+    match (before == Some(ChallengeState::HumanRequired), held) {
+        (false, true) => handoff::begin(tab, assessment),
+        (true, false) => handoff::end(tab, assessment.state.name(), Some(assessment)),
+        _ => {}
+    }
 }
 
 /// When each tab's assessment was last stored, so a re-check scheduled by
@@ -1029,6 +1037,7 @@ pub fn last(tab: &Tab) -> Option<Assessment> {
 pub fn release(tab: &Tab) -> bool {
     if last(tab).is_some_and(|a| a.state == ChallengeState::HumanRequired) {
         metrics().lock().unwrap_or_else(|e| e.into_inner()).released += 1;
+        handoff::end(tab, "released", None);
     }
     states()
         .lock()
@@ -1082,4 +1091,320 @@ pub fn enabled() -> bool {
     std::env::var("CU_CHALLENGE")
         .map(|v| v != "0")
         .unwrap_or(true)
+}
+
+/// Human hand-off: what happens around a tab that turned `human_required`.
+///
+/// - With a headful browser the tab is brought to the front
+///   (`Page.bringToFront` + `Target.activateTarget`), so the person sees it.
+/// - The hand-off is announced on stderr and, if `CU_HANDOFF_NOTIFY` is set,
+///   by running that command through `sh -c` with `CU_HANDOFF_TAB`,
+///   `CU_HANDOFF_URL` (origin and path), `CU_HANDOFF_VENDOR` and
+///   `CU_HANDOFF_EVENT` (`begin` / `cleared` / `released` / ...) in its
+///   environment (e.g. `notify-send "cu: $CU_HANDOFF_EVENT" "$CU_HANDOFF_URL"`).
+///   Nothing is interpolated into the command.
+/// - A watcher re-checks the tab every second, exactly as the gate does, so
+///   the tab is released the moment the page reads ready -- without waiting
+///   for the agent's next action -- for up to `CU_HANDOFF_WATCH_S` (default
+///   900 s). After that the gate still re-checks on every action.
+/// - When it ends, the pass is recorded for diagnostics: vendor, signals,
+///   how long it took, how many re-checks, how it ended, and which cookies
+///   appeared for the page's URL meanwhile -- names, domain and expiry
+///   only, never values.
+pub mod handoff {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    use super::{Assessment, ChallengeState};
+    use crate::server::{Tab, json_objects, json_string, json_string_value};
+
+    struct Open {
+        id: u64,
+        started: Instant,
+        started_unix: u64,
+        url: String,
+        vendor: Option<&'static str>,
+        signals: Vec<String>,
+        cookies: Vec<String>,
+        rechecks: u64,
+        foreground: Option<String>,
+    }
+
+    struct Pass {
+        url: String,
+        vendor: Option<&'static str>,
+        signals: Vec<String>,
+        outcome: String,
+        final_url: String,
+        final_state: String,
+        started_unix: u64,
+        ms: u128,
+        rechecks: u64,
+        foreground: Option<String>,
+        new_cookies: Vec<String>,
+    }
+
+    #[derive(Default)]
+    struct Book {
+        open: HashMap<Tab, Open>,
+        done: VecDeque<Pass>,
+        next_id: u64,
+    }
+
+    const KEEP: usize = 20;
+
+    fn book() -> &'static Mutex<Book> {
+        static BOOK: OnceLock<Mutex<Book>> = OnceLock::new();
+        BOOK.get_or_init(Default::default)
+    }
+
+    fn watch_for() -> Duration {
+        Duration::from_secs(
+            std::env::var("CU_HANDOFF_WATCH_S")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(900),
+        )
+    }
+
+    /// `name@domain exp=...` for every cookie the browser would send to
+    /// the tab's current page. Values are never read out of the reply.
+    fn cookies(tab: &Tab) -> Vec<String> {
+        let Ok(reply) = tab.command("Network.getCookies", "{}") else {
+            return Vec::new();
+        };
+        let Some(list) = crate::server::json_array(&reply, "cookies") else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = json_objects(&list)
+            .iter()
+            .filter_map(|c| {
+                let name = json_string_value(c, "name")?;
+                let domain = json_string_value(c, "domain").unwrap_or_default();
+                Some(format!("{name}@{domain}"))
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn notify(event: &str, tab: &Tab, url: &str, vendor: Option<&str>) {
+        let tab_id = tab.target.clone().unwrap_or_else(|| "default".into());
+        eprintln!(
+            "cu: hand-off {event}: tab {tab_id} {url} ({})",
+            vendor.unwrap_or("-")
+        );
+        let Ok(command) = std::env::var("CU_HANDOFF_NOTIFY") else {
+            return;
+        };
+        if command.trim().is_empty() {
+            return;
+        }
+        let spawned = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .env("CU_HANDOFF_EVENT", event)
+            .env("CU_HANDOFF_TAB", &tab_id)
+            .env("CU_HANDOFF_URL", url)
+            .env("CU_HANDOFF_VENDOR", vendor.unwrap_or(""))
+            .stdin(std::process::Stdio::null())
+            .spawn();
+        match spawned {
+            // Reaped on a thread: a slow notifier never holds up cu.
+            Ok(mut child) => {
+                std::thread::spawn(move || child.wait());
+            }
+            Err(e) => eprintln!("cu: CU_HANDOFF_NOTIFY failed: {e}"),
+        }
+    }
+
+    /// Put the tab in front of the person, when there is a window to show.
+    fn foreground(tab: &Tab) -> Option<String> {
+        if !crate::diagnostics::headful() {
+            return Some("headless: no window to bring forward".into());
+        }
+        let page = tab.command("Page.bringToFront", "{}");
+        let target = tab
+            .target
+            .clone()
+            .or_else(|| crate::server::pinned_default_target(tab.cdp_port));
+        let activated = target.map(|id| {
+            crate::server::browser_command(
+                tab.cdp_port,
+                "Target.activateTarget",
+                &format!("{{\"targetId\":{}}}", json_string(&id)),
+            )
+        });
+        Some(match (page, activated) {
+            (Ok(_), Some(Ok(_))) => "brought to front".into(),
+            (Ok(_), _) => "brought to front (page only)".into(),
+            (Err(e), _) => format!("bringToFront failed: {e}"),
+        })
+    }
+
+    pub(super) fn begin(tab: &Tab, assessment: &Assessment) {
+        let id = {
+            let mut b = book().lock().unwrap_or_else(|e| e.into_inner());
+            if b.open.contains_key(tab) {
+                return;
+            }
+            b.next_id += 1;
+            let id = b.next_id;
+            b.open.insert(
+                tab.clone(),
+                Open {
+                    id,
+                    started: Instant::now(),
+                    started_unix: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    url: assessment.url.clone(),
+                    vendor: assessment.vendor,
+                    signals: assessment.signals.clone(),
+                    cookies: Vec::new(),
+                    rechecks: 0,
+                    foreground: None,
+                },
+            );
+            id
+        };
+        let tab = tab.clone();
+        let (url, vendor) = (assessment.url.clone(), assessment.vendor);
+        // Off the request thread: the reply that reported the challenge
+        // must not wait on window management or a notifier.
+        std::thread::spawn(move || {
+            let before = cookies(&tab);
+            let shown = foreground(&tab);
+            if let Some(open) = book()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .open
+                .get_mut(&tab)
+                .filter(|o| o.id == id)
+            {
+                open.cookies = before;
+                open.foreground = shown;
+            }
+            notify("begin", &tab, &url, vendor);
+            watch(&tab, id);
+        });
+    }
+
+    /// Re-check the tab every second while this hand-off is open.
+    fn watch(tab: &Tab, id: u64) {
+        let until = Instant::now() + watch_for();
+        while Instant::now() < until {
+            std::thread::sleep(Duration::from_secs(1));
+            {
+                let mut b = book().lock().unwrap_or_else(|e| e.into_inner());
+                match b.open.get_mut(tab) {
+                    Some(open) if open.id == id => open.rechecks += 1,
+                    _ => return,
+                }
+            }
+            // The gate's own re-check: it stores the fresh state, and a
+            // cleared one ends the hand-off through `store`.
+            if super::gate(tab).is_none() {
+                return;
+            }
+        }
+        eprintln!(
+            "cu: hand-off watch on {} expired after {} s; the gate still re-checks on every action",
+            tab.target.as_deref().unwrap_or("default"),
+            watch_for().as_secs()
+        );
+    }
+
+    pub(super) fn end(tab: &Tab, outcome: &str, fresh: Option<&Assessment>) {
+        let Some(open) = book()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .open
+            .remove(tab)
+        else {
+            return;
+        };
+        let after = cookies(tab);
+        let new_cookies = after
+            .into_iter()
+            .filter(|c| !open.cookies.contains(c))
+            .collect();
+        let pass = Pass {
+            url: open.url.clone(),
+            vendor: open.vendor,
+            signals: open.signals,
+            outcome: if outcome == ChallengeState::Ready.name() {
+                "cleared".into()
+            } else {
+                outcome.into()
+            },
+            final_url: fresh.map(|a| a.url.clone()).unwrap_or_default(),
+            final_state: fresh
+                .map(|a| a.state.name().to_string())
+                .unwrap_or_else(|| "released".into()),
+            started_unix: open.started_unix,
+            ms: open.started.elapsed().as_millis(),
+            rechecks: open.rechecks,
+            foreground: open.foreground,
+            new_cookies,
+        };
+        notify(&pass.outcome, tab, &open.url, open.vendor);
+        let mut b = book().lock().unwrap_or_else(|e| e.into_inner());
+        b.done.push_front(pass);
+        b.done.truncate(KEEP);
+    }
+
+    /// `challenge.handoffs` in diagnostics: open hand-offs and the last
+    /// passes, newest first.
+    pub fn json() -> String {
+        let b = book().lock().unwrap_or_else(|e| e.into_inner());
+        let strings = |v: &[String]| {
+            v.iter()
+                .map(|s| json_string(s))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let vendor = |v: Option<&str>| v.map(json_string).unwrap_or_else(|| "null".into());
+        let open = b
+            .open
+            .iter()
+            .map(|(tab, o)| {
+                format!(
+                    "{{\"tab\":{},\"url\":{},\"vendor\":{},\"open_ms\":{},\"rechecks\":{},\"foreground\":{}}}",
+                    json_string(tab.target.as_deref().unwrap_or("default")),
+                    json_string(&o.url),
+                    vendor(o.vendor),
+                    o.started.elapsed().as_millis(),
+                    o.rechecks,
+                    o.foreground.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let passes = b
+            .done
+            .iter()
+            .map(|p| {
+                format!(
+                    "{{\"url\":{},\"vendor\":{},\"signals\":[{}],\"outcome\":{},\"final_state\":{},\"final_url\":{},\"started_unix\":{},\"ms\":{},\"rechecks\":{},\"foreground\":{},\"new_cookies\":[{}]}}",
+                    json_string(&p.url),
+                    vendor(p.vendor),
+                    strings(&p.signals),
+                    json_string(&p.outcome),
+                    json_string(&p.final_state),
+                    json_string(&p.final_url),
+                    p.started_unix,
+                    p.ms,
+                    p.rechecks,
+                    p.foreground.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
+                    strings(&p.new_cookies),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("{{\"open\":[{open}],\"passes\":[{passes}]}}")
+    }
 }

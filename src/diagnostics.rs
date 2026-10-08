@@ -104,6 +104,15 @@ pub fn record_ready(
     let _ = std::fs::write(data.join("browser.json"), launch_json(&record) + "\n");
 }
 
+/// Whether the running browser has a window a person can use.
+pub fn headful() -> bool {
+    launch()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|r| !r.headless && !r.headless_shell)
+}
+
 /// Record that the launch failed, and why.
 pub fn record_failure(error: &str) {
     if let Some(record) = launch().lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
