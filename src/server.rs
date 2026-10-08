@@ -336,11 +336,23 @@ fn spawn_browser_control(cdp_port: u16, data: &Path) {
             eprintln!("cu: could not redirect downloads: {error}");
             return;
         }
+        // Target discovery on the same connection: every popup, iframe
+        // target and worker is announced here (observation only; nothing is
+        // attached), for `GET /v1/targets` (see `crate::targets`).
+        if let Err(error) =
+            connection.call_observed("Target.setDiscoverTargets", "{\"discover\":true}", &mut |e| {
+                crate::targets::see(e)
+            })
+        {
+            eprintln!("cu: target discovery is off: {error}");
+        }
         // Drain browser events (download progress, target changes) so the
         // socket buffer never fills up. A blocking read with no timeout: the
         // session must outlive hours between downloads.
         let _ = connection.stream.set_read_timeout(None);
-        while connection.next_message(MAX_CDP_MESSAGE).is_ok() {}
+        while let Ok(event) = connection.next_message(MAX_CDP_MESSAGE) {
+            crate::targets::see(&event);
+        }
     });
 }
 
@@ -816,6 +828,9 @@ pub fn route(
         // used. Answers before the browser is up too (`browser` is then the
         // launch decision without a version yet).
         ("GET", "/v1/diagnostics") => ("200 OK", "application/json", crate::diagnostics::json()),
+        // Popups, iframe targets and workers the browser is running, as
+        // target discovery reported them.
+        ("GET", "/v1/targets") => ("200 OK", "application/json", crate::targets::json()),
         ("GET", "/v1/status") => (
             "200 OK",
             "application/json",
@@ -825,7 +840,10 @@ pub fn route(
         // does not do: prose, API responses, error messages. Every frame is
         // read, each one named, capped in the page so a huge document cannot
         // flood the socket.
-        ("GET", "/v1/text") => text_response(|method, params| tab.command(method, params)),
+        ("GET", "/v1/text") => {
+            let (status, kind, body) = text_response(|method, params| tab.command(method, params));
+            (status, kind, with_oopif_text(&tab, body))
+        }
         // Pure file listing: works whether or not the browser is up, because
         // the files outlive the session that downloaded them.
         ("GET", "/v1/downloads") => (
@@ -1147,11 +1165,15 @@ pub fn tabs_json(cdp_port: u16) -> Result<String, String> {
         .filter_map(|o| {
             let id = json_string_value(&o, "id")?;
             Some(format!(
-                "{{\"id\":{},\"url\":{},\"title\":{},\"default\":{}}}",
+                "{{\"id\":{},\"url\":{},\"title\":{},\"default\":{},\"opener\":{}}}",
                 json_string(&id),
                 json_string(&json_string_value(&o, "url").unwrap_or_default()),
                 json_string(&json_string_value(&o, "title").unwrap_or_default()),
-                default_id.as_deref() == Some(id.as_str())
+                default_id.as_deref() == Some(id.as_str()),
+                // A popup names the tab that opened it (target discovery).
+                crate::targets::opener_of(&id)
+                    .map(|o| json_string(&o))
+                    .unwrap_or_else(|| "null".into())
             ))
         })
         .collect();
@@ -1831,6 +1853,164 @@ pub fn frame_for_ref(tab: &Tab, reference: &str) -> Option<String> {
         .cloned()
 }
 
+/// Out-of-process iframes of `tab`'s page, outermost first: with site
+/// isolation (the compatibility profile) a cross-site iframe is rendered by
+/// another process and is missing from the page's `Page.getFrameTree`; it is
+/// a target of its own (`type: iframe`, `parentId` = the target that embeds
+/// it) with its own DevTools endpoint. Each comes back as its root frame
+/// (whose id is the target id, parented to the embedding frame) and a
+/// [`Tab`] that drives that target.
+pub fn oopif_targets(tab: &Tab) -> Vec<(Frame, Tab)> {
+    let Some(page) = tab.target.clone().or_else(|| pinned_target(tab.cdp_port)) else {
+        return Vec::new();
+    };
+    let Ok(discovery) = http_get(&format!("127.0.0.1:{}", tab.cdp_port), "/json") else {
+        return Vec::new();
+    };
+    let iframes: Vec<(String, String, String)> = json_objects(&discovery)
+        .into_iter()
+        .filter(|o| json_string_value(o, "type").as_deref() == Some("iframe"))
+        .filter_map(|o| {
+            Some((
+                json_string_value(&o, "id")?,
+                json_string_value(&o, "parentId")?,
+                json_string_value(&o, "url").unwrap_or_default(),
+            ))
+        })
+        .collect();
+    // Breadth-first from the page, so a nested one follows its parent.
+    let mut owners = vec![page];
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < owners.len() {
+        for (id, parent, url) in &iframes {
+            if *parent == owners[i] && !owners.contains(id) {
+                owners.push(id.clone());
+                out.push((
+                    Frame {
+                        id: id.clone(),
+                        parent: Some(parent.clone()),
+                        url: url.clone(),
+                    },
+                    Tab {
+                        cdp_port: tab.cdp_port,
+                        target: Some(id.clone()),
+                    },
+                ));
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Which out-of-process iframe target each frame of each tab's last
+/// snapshot lives in (frames in the page's own process are absent).
+fn frame_targets() -> &'static Mutex<HashMap<Tab, HashMap<String, Tab>>> {
+    static FRAME_TARGETS: OnceLock<Mutex<HashMap<Tab, HashMap<String, Tab>>>> = OnceLock::new();
+    FRAME_TARGETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The out-of-process iframe target that renders `frame` of `tab`, if the
+/// last snapshot found it in one.
+pub fn target_for_frame(tab: &Tab, frame: &str) -> Option<Tab> {
+    frame_targets()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(tab)
+        .and_then(|m| m.get(frame))
+        .cloned()
+}
+
+/// Every frame the last snapshot of `tab` found in out-of-process iframes,
+/// with its parent, for actions that need the whole frame chain.
+pub fn oopif_frames(tab: &Tab) -> Vec<Frame> {
+    oopif_frame_list()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(tab)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn oopif_frame_list() -> &'static Mutex<HashMap<Tab, Vec<Frame>>> {
+    static LIST: OnceLock<Mutex<HashMap<Tab, Vec<Frame>>>> = OnceLock::new();
+    LIST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Walk every out-of-process iframe of `tab` in its own isolated world, the
+/// way in-process frames are walked, and record where each frame lives.
+/// A frame that cannot be read is named, not fatal.
+pub fn walk_oopifs(tab: &Tab, text: &mut String, pairs: &mut Vec<(String, String)>) {
+    let mut owners: HashMap<String, Tab> = HashMap::new();
+    let mut frames_seen: Vec<Frame> = Vec::new();
+    for (root, target) in oopif_targets(tab) {
+        let tree = target.command("Page.getFrameTree", "{}");
+        let mut frames = tree.map(|t| flatten_frame_tree(&t)).unwrap_or_default();
+        if frames.is_empty() {
+            text.push_str(&format!(
+                "- frame: {} (unreadable right now; take a new snapshot)\n",
+                root.url
+            ));
+            continue;
+        }
+        // The root of an OOPIF's own tree has no parent there; it is the
+        // child of the frame that embeds it.
+        frames[0].parent = root.parent.clone();
+        for frame in &frames {
+            owners.insert(frame.id.clone(), target.clone());
+        }
+        frames_seen.extend(frames.iter().cloned());
+        match walk_frames_nested(tab, frames, |m, p| target.command(m, p), true) {
+            Ok((t, p)) => {
+                text.push_str(&t);
+                pairs.extend(p);
+            }
+            Err(_) => text.push_str(&format!(
+                "- frame: {} (unreadable right now; take a new snapshot)\n",
+                root.url
+            )),
+        }
+    }
+    frame_targets()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(tab.clone(), owners);
+    oopif_frame_list()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(tab.clone(), frames_seen);
+}
+
+/// Add the text of `tab`'s out-of-process iframes to a `/v1/text` body,
+/// each under its `- frame:` line, within the same limit.
+fn with_oopif_text(tab: &Tab, body: String) -> String {
+    let Some(mut text) = json_string_value(&body, "text") else {
+        return body;
+    };
+    let mut truncated = body.contains("\"truncated\":true");
+    for (root, target) in oopif_targets(tab) {
+        let (_, _, part) = text_response(|m, p| target.command(m, p));
+        match json_string_value(&part, "text") {
+            Some(t) => {
+                truncated |= part.contains("\"truncated\":true");
+                text.push_str(&format!("\n- frame: {}", root.url));
+                text.push_str(&t);
+            }
+            None => {
+                text.push('\n');
+                text.push_str(&unreadable_frame(&root.url));
+            }
+        }
+    }
+    let text: String = text.chars().take(TEXT_LIMIT).collect();
+    format!(
+        "{{\"text\":{},\"truncated\":{}}}",
+        json_string(&text),
+        truncated
+    )
+}
+
 /// Build a `GET /v1/snapshot` response body.
 ///
 /// The walk runs in the page: a few hundred bytes instead of a DOM dump the
@@ -1840,7 +2020,8 @@ pub fn snapshot_pages(state: &AppState) -> Result<String, String> {
 }
 
 fn snapshot_tab(tab: &Tab) -> Result<String, String> {
-    let (text, pairs) = walk_snapshot(tab, |method, params| tab.command(method, params))?;
+    let (mut text, mut pairs) = walk_snapshot(tab, |method, params| tab.command(method, params))?;
+    walk_oopifs(tab, &mut text, &mut pairs);
     note_ref_frames(tab, &pairs);
     Ok(format!("{{\"snapshot\":{}}}", json_string(&text)))
 }
@@ -1867,7 +2048,22 @@ where
 pub fn walk_frames<F>(
     tab: &Tab,
     frames: Vec<Frame>,
+    cmd: F,
+) -> Result<(String, Vec<(String, String)>), String>
+where
+    F: FnMut(&str, &str) -> Result<String, String>,
+{
+    walk_frames_nested(tab, frames, cmd, false)
+}
+
+/// [`walk_frames`]; `nested` walks an out-of-process iframe's own tree,
+/// whose first frame is an iframe (a `- frame:` section, always in the
+/// isolated world) rather than the page.
+pub fn walk_frames_nested<F>(
+    tab: &Tab,
+    frames: Vec<Frame>,
     mut cmd: F,
+    nested: bool,
 ) -> Result<(String, Vec<(String, String)>), String>
 where
     F: FnMut(&str, &str) -> Result<String, String>,
@@ -1879,7 +2075,7 @@ where
         // The main document follows the helper policy (cu's isolated world
         // unless `CU_HELPER_WORLD=main`); an iframe is always read in its
         // isolated world, so a cross-origin frame's scripts are never touched.
-        let world = if index == 0 {
+        let world = if index == 0 && !nested {
             crate::execution::helper_world()
         } else {
             crate::execution::World::Isolated
@@ -1933,7 +2129,7 @@ where
             ));
             continue;
         };
-        if index == 0 {
+        if index == 0 && !nested {
             text.push_str(&snap.render());
         } else {
             text.push_str(&format!("- frame: {}\n", frame.url));

@@ -48,6 +48,7 @@ fn main() {
             )),
         },
         Some("diagnostics") => request("GET", "/v1/diagnostics", None).map(|s| println!("{s}")),
+        Some("targets") => request("GET", "/v1/targets", None).map(|s| println!("{s}")),
         Some("navigate") => match args.get(1) {
             Some(url) => request(
                 "POST",
@@ -138,7 +139,7 @@ fn main() {
 }
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat]\n  cu status\n  cu diagnostics\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
     );
 }
 
