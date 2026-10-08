@@ -331,6 +331,15 @@ pub fn classify(probe: &Probe) -> Verdict {
         );
     }
 
+    // The site's own account checkpoint ("suspicious login", "confirm it's
+    // you", a code sent by SMS/e-mail, 2FA): no vendor, a 200, and the
+    // gate used to call it ready. A checkpoint-shaped path plus a form or
+    // the wording, or a one-time-code form plus the wording, is a person's
+    // job; either signal alone is not proof, but it is not ready either.
+    if let Some(verdict) = first_party(probe) {
+        return verdict;
+    }
+
     // A widget on an otherwise normal page: it may pass invisibly or may need
     // a click before the form submits. Not an interstitial: no waiting.
     for (needle, vendor) in [
@@ -395,6 +404,103 @@ pub fn classify(probe: &Probe) -> Verdict {
     }
 }
 
+/// Path segments sites use for their own account checkpoints (Instagram
+/// `/challenge/`, Facebook `/checkpoint/`, `/auth_platform/codeentry/`,
+/// two-factor pages).
+const CHECKPOINT_PATHS: &[&str] = &[
+    "/challenge/",
+    "/checkpoint/",
+    "/auth_platform/",
+    "/two_factor",
+    "/two-factor",
+    "/twofactor",
+    "/2fa",
+    "/mfa/",
+    "/login/verify",
+    "/login/challenge",
+    "/account/verify",
+    "/accounts/suspended",
+    "/identity/verify",
+];
+
+/// Wording of account checkpoints, lower case (the probe lower-cases the
+/// text). English and Spanish; the language-independent signals are the
+/// path and the code form.
+const CHECKPOINT_TEXT: &[&str] = &[
+    "suspicious login",
+    "unusual login",
+    "unusual activity",
+    "unusual sign-in",
+    "confirm it's you",
+    "confirm it\u{2019}s you",
+    "confirm that it's you",
+    "confirm that it\u{2019}s you",
+    "verify it's you",
+    "verify it\u{2019}s you",
+    "help us confirm",
+    "enter the code",
+    "enter the 6-digit code",
+    "security code",
+    "verification code",
+    "confirmation code",
+    "login code",
+    "two-factor authentication",
+    "2-step verification",
+    "two-step verification",
+    "authenticator app",
+    "we sent a code",
+    "we've sent a code",
+    "confirma que eres t\u{fa}",
+    "confirmar que eres t\u{fa}",
+    "inicio de sesi\u{f3}n inusual",
+    "actividad inusual",
+    "c\u{f3}digo de seguridad",
+    "c\u{f3}digo de verificaci\u{f3}n",
+    "c\u{f3}digo de confirmaci\u{f3}n",
+    "introduce el c\u{f3}digo",
+    "verificaci\u{f3}n en dos pasos",
+];
+
+/// The site's own checkpoint, from the path, a verification-code form and
+/// the wording (see [`classify`]).
+fn first_party(probe: &Probe) -> Option<Verdict> {
+    use ChallengeState::*;
+    let path = {
+        let rest = probe.url.split_once("://").map(|(_, r)| r).unwrap_or("");
+        let path = rest.find('/').map(|i| &rest[i..]).unwrap_or("/");
+        let cut = path.find(['?', '#']).unwrap_or(path.len());
+        let mut path = path[..cut].to_lowercase();
+        if !path.ends_with('/') {
+            path.push('/');
+        }
+        path
+    };
+    // Hash-routed SPAs keep the route in the fragment (`#/challenge/...`).
+    let fragment = probe.url.split_once('#').map(|(_, f)| f.to_lowercase());
+    let by_path = CHECKPOINT_PATHS.iter().find(|p| {
+        path.contains(*p) || fragment.as_deref().is_some_and(|f| f.contains(&p[1..]))
+    });
+    let code_form = has(probe, "code-form");
+    let form = has(probe, "form-input");
+    let wording = text_has(probe, CHECKPOINT_TEXT);
+    let mut signals = vec![];
+    if let Some(p) = by_path {
+        signals.push(format!("checkpoint path {p}"));
+    }
+    if code_form {
+        signals.push("verification code form".into());
+    }
+    if let Some(w) = &wording {
+        signals.push(w.clone());
+    }
+    let state = match (by_path.is_some(), code_form, wording.is_some(), form) {
+        (true, _, _, true) | (true, _, true, _) | (false, true, true, _) => HumanRequired,
+        (true, _, _, _) | (false, true, false, _) => Unknown,
+        _ => return None,
+    };
+    Some(Verdict::new(state, Some("first-party"), signals))
+}
+
 /// The in-page half of the probe: DOM reads only, returned as JSON. Runs in
 /// cu's isolated world, so page scripts neither see it nor can fake its
 /// globals; nothing it touches is written.
@@ -430,6 +536,19 @@ pub const PROBE_JS: &str = r#"JSON.stringify((function(){
     }
   }
   mark('captcha', '[id*="captcha" i], [class*="captcha" i]', true);
+  // Account checkpoints: a visible one-time-code field (by autocomplete or
+  // by name/id/label), or a row of single-character boxes; and whether any
+  // form field is on screen at all.
+  const fields = [...document.querySelectorAll('input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=image]), textarea, select')].filter(shown);
+  if (fields.length) markers.push('form-input');
+  const codeName = /(^|[_\-\s])(otp|totp|passcode|2fa|mfa)([_\-\s]|$)|(security|verification|verify|confirmation|confirm|sms|email|login|auth|one.?time|two.?factor|approvals?)[_\-\s]?code/i;
+  const label = (f) => (f.name || '') + ' ' + (f.id || '') + ' ' + (f.getAttribute('aria-label') || '') + ' ' + (f.placeholder || '');
+  // A card's "security code" (CVV) is not an account checkpoint.
+  const card = (f) => (f.autocomplete || '').startsWith('cc-') || /cvv|cvc|csc|card/i.test(label(f));
+  const single = fields.filter((f) => f.tagName === 'INPUT' && f.maxLength === 1);
+  if (fields.some((f) => !card(f) && (f.autocomplete === 'one-time-code' || codeName.test(label(f))))
+      || (single.length >= 4 && single.length <= 8))
+    markers.push('code-form');
   const frames = [...document.querySelectorAll('iframe, frame')].map((f) => (shown(f) ? '!' : '') + (f.src || ''));
   let status = 0;
   try { const nav = performance.getEntriesByType('navigation')[0]; status = (nav && nav.responseStatus) || 0; } catch (e) {}
@@ -656,6 +775,11 @@ struct Metrics {
     released: u64,
     /// Hand-offs the gate's re-check found cleared.
     cleared: u64,
+    /// Re-checks run because the page changed its address without a
+    /// navigation (History API, hash change) or navigated by itself.
+    url_rechecks: u64,
+    /// Of those, how many changed the state on record.
+    url_recheck_changes: u64,
 }
 
 fn metrics() -> &'static Mutex<Metrics> {
@@ -689,6 +813,7 @@ pub fn metrics_json() -> String {
         "{{\"assessed\":{},\"states\":{{{}}},\"vendors\":{{{}}},\"challenge_rate\":{},\
          \"ready\":{},\"ready_contradicted\":{},\"false_success_rate\":{},\
          \"handoffs_cleared\":{},\"handoffs_released\":{},\
+         \"url_rechecks\":{},\"url_recheck_changes\":{},\
          \"note\":\"challenge_rate = defence verdicts / assessments; false_success_rate = ready verdicts whose next check on the same tab and origin found a defence / ready verdicts (a lower bound: only what a later check saw)\"}}",
         m.assessed,
         map(&m.by_state),
@@ -699,6 +824,8 @@ pub fn metrics_json() -> String {
         ratio(m.ready_contradicted, m.ready),
         m.cleared,
         m.released,
+        m.url_rechecks,
+        m.url_recheck_changes,
     )
 }
 
@@ -747,6 +874,146 @@ fn store(tab: &Tab, assessment: &Assessment) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(tab.clone(), assessment.clone());
+    stored_at()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(tab.clone(), Instant::now());
+}
+
+/// When each tab's assessment was last stored, so a re-check scheduled by
+/// an address change can see that a navigation already assessed the page.
+fn stored_at() -> &'static Mutex<HashMap<Tab, Instant>> {
+    static AT: OnceLock<Mutex<HashMap<Tab, Instant>>> = OnceLock::new();
+    AT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Pause between an address change and its re-check: a SPA pushes the new
+/// URL first and renders the new view after.
+const URL_RECHECK_DELAY: Duration = Duration::from_millis(400);
+
+/// Last full URL of every page target, as the browser announced it.
+fn target_urls() -> &'static Mutex<HashMap<String, String>> {
+    static URLS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    URLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Feed a browser-level target event. A page whose address changed --
+/// `history.pushState`/`replaceState`, a hash change, or a navigation cu
+/// did not make (a checkpoint redirecting into the feed, an interstitial
+/// reloading into the site) -- is re-checked after a short pause, so the
+/// state on record (and the gate) follows a single-page app instead of
+/// keeping the verdict of the page it was on before. Only tabs cu has
+/// assessed are followed. A check stored after the pause (a slow
+/// navigation's own assessment) wins; one stored before it (the immediate
+/// check after a click that pushed a route whose view renders later) does
+/// not.
+pub fn see_target_event(cdp_port: u16, event: &str) {
+    if !enabled() || !event.contains("\"Target.targetInfoChanged\"") {
+        return;
+    }
+    let Some(info) = crate::server::json_object(event, "targetInfo") else {
+        return;
+    };
+    if json_string_value(info, "type").as_deref() != Some("page") {
+        return;
+    }
+    let (Some(id), Some(url)) = (
+        json_string_value(info, "targetId"),
+        json_string_value(info, "url"),
+    ) else {
+        return;
+    };
+    let previous = target_urls()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.clone(), url.clone());
+    // Title changes and the like also fire this event; only a new address
+    // matters, and the first sighting has nothing to compare with.
+    if previous.is_none_or(|p| p == url) {
+        return;
+    }
+    let tabs: Vec<Tab> = crate::server::tabs_for_target(cdp_port, &id)
+        .into_iter()
+        .filter(|t| last(t).is_some())
+        .collect();
+    if tabs.is_empty() {
+        return;
+    }
+    let changed_at = Instant::now();
+    std::thread::spawn(move || {
+        std::thread::sleep(URL_RECHECK_DELAY);
+        for tab in tabs {
+            recheck_after_url_change(&tab, changed_at);
+        }
+    });
+}
+
+fn recheck_after_url_change(tab: &Tab, changed_at: Instant) {
+    let fresh_enough = stored_at()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(tab)
+        .is_some_and(|at| *at > changed_at + URL_RECHECK_DELAY);
+    let Some(before) = last(tab) else {
+        return;
+    };
+    if fresh_enough {
+        return;
+    }
+    let mut fresh = assess(|m, p| tab.command(m, p), Duration::ZERO);
+    if fresh.state == ChallengeState::Unknown
+        && (fresh.url.is_empty() || fresh.signals.iter().any(|s| s == "page still loading"))
+    {
+        // The probe failed (the page is mid-navigation); that navigation's
+        // own assessment, or the next address change, will tell.
+        return;
+    }
+    // Recorded by a later check while this one ran: keep that one.
+    if stored_at()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(tab)
+        .is_some_and(|at| *at > changed_at + URL_RECHECK_DELAY)
+    {
+        return;
+    }
+    // Nothing new (typically cu's own navigation, already assessed): leave
+    // the record and the counters alone.
+    if fresh.url == before.url && fresh.state == before.state {
+        return;
+    }
+    fresh.signals.push("re-checked after the address changed".into());
+    {
+        let mut m = metrics().lock().unwrap_or_else(|e| e.into_inner());
+        m.url_rechecks += 1;
+        if before.state != fresh.state {
+            m.url_recheck_changes += 1;
+        }
+        if before.state == ChallengeState::Ready && fresh.state.is_defence() {
+            // cu had said ready and the page turned out (or turned into) a
+            // defence: the false success the SPA used to hide.
+            m.ready_contradicted += 1;
+        }
+        if before.state == ChallengeState::HumanRequired && fresh.state == ChallengeState::Ready {
+            m.cleared += 1;
+        }
+    }
+    if before.state != fresh.state {
+        eprintln!(
+            "cu: challenge: {} -> {} on {} after an address change",
+            before.state.name(),
+            fresh.state.name(),
+            fresh.url
+        );
+    }
+    // A pending interstitial re-read without a wait on a tab a person is
+    // handling stays a hand-off, as in the gate.
+    if before.state == ChallengeState::HumanRequired
+        && fresh.state == ChallengeState::ChallengePending
+    {
+        fresh.state = ChallengeState::HumanRequired;
+    }
+    store(tab, &fresh);
 }
 
 /// The last assessment of a tab, if any.

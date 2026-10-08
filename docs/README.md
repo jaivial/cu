@@ -190,6 +190,10 @@ Batches observe the network around each `navigate` action too (`Network` on only
 
 `cu diagnostics` has a `challenge` block: assessments by state and vendor, `challenge_rate` (defence verdicts / assessments), `false_success_rate` (ready verdicts whose next check on the same tab and origin found a defence / ready verdicts -- a lower bound: only what a later check saw), and hand-offs cleared vs released. The gate's re-checks of a paused tab are not counted as new assessments.
 
+First-party account checkpoints (vendor `first-party`): a site's own "suspicious login" / "confirm it's you" / code-by-SMS-or-email / 2FA page has no vendor marker and answers 200, so it used to read as `ready`. Three signals now: a checkpoint path (`/challenge/`, `/checkpoint/`, `/auth_platform/`, `/two_factor`, `/2fa`, `/mfa/`, ... also in a `#/` hash route), a visible one-time-code form (`autocomplete=one-time-code`, a field named/labelled security/verification/confirmation/login code, OTP, or a row of 4-8 single-character boxes; card CVV fields excluded) and the wording (English and Spanish). Path + any form field, path + wording, or code form + wording is `human_required`; one signal alone is `unknown` (never `ready`, not gated).
+
+Single-page apps: the daemon's browser-level connection already sees `Target.targetInfoChanged` for every page; when a tab cu has assessed changes address without a cu navigation (`history.pushState`/`replaceState`, a hash change, a redirect the page made itself), it is re-checked 400 ms later (the view renders after the URL) and the state on record -- and so the gate -- follows: a feed that turns into a checkpoint becomes `human_required` (and counts as a contradicted `ready`), a checkpoint the person completed that routes back into the app releases the hand-off. A re-check that sees the same URL and state changes nothing. Counted in diagnostics as `url_rechecks` / `url_recheck_changes`.
+
 cu does not solve, click through or evade challenges; it reports them and stops.
 
 ### Helper isolation

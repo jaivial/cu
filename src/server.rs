@@ -352,6 +352,7 @@ fn spawn_browser_control(cdp_port: u16, data: &Path) {
         let _ = connection.stream.set_read_timeout(None);
         while let Ok(event) = connection.next_message(MAX_CDP_MESSAGE) {
             crate::targets::see(&event);
+            crate::challenge::see_target_event(cdp_port, &event);
         }
     });
 }
@@ -2519,6 +2520,19 @@ fn pinned_target(cdp_port: u16) -> Option<String> {
         .unwrap_or_else(|e| e.into_inner())
         .get(&cdp_port)
         .cloned()
+}
+
+/// The tabs a DevTools page target stands for: itself by id (`?tab=`, a
+/// named context's page) and the default tab when it is pinned to it.
+pub fn tabs_for_target(cdp_port: u16, id: &str) -> Vec<Tab> {
+    let mut tabs = vec![Tab {
+        cdp_port,
+        target: Some(id.to_string()),
+    }];
+    if pinned_target(cdp_port).is_some_and(|p| p == id) {
+        tabs.push(Tab::default_for(cdp_port));
+    }
+    tabs
 }
 
 /// Remember which page target the default tab is, so popups and `/json`
