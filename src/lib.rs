@@ -3,6 +3,7 @@ pub mod actions;
 pub mod challenge;
 pub mod diagnostics;
 pub mod execution;
+pub mod human;
 pub mod input;
 pub mod policy;
 pub mod scheduler;

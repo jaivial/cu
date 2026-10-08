@@ -163,6 +163,14 @@ pub fn key_event(key: &str) -> Option<(&'static str, &'static str, u32, &'static
     })
 }
 
+/// Where to click: the centre of an element's box and the box size.
+#[derive(Clone, Copy)]
+struct Target {
+    at: (f64, f64),
+    w: f64,
+    h: f64,
+}
+
 /// What one action did, as reported back to the agent.
 pub struct Outcome {
     pub navigated: bool,
@@ -337,9 +345,12 @@ impl Page {
         let (mut download, mut popup) = (None, false);
         let navigated = match action {
             Action::Click { reference } => {
-                let (x, y) = self.locate(reference, true)?;
                 let mut watch = NavWatch::new(&self.watch_frame(reference));
-                self.click_at((x, y), &mut watch)?;
+                if self.input_policy == InputPolicy::Paced {
+                    self.wheel_into_view(reference, &mut watch)?;
+                }
+                let target = self.locate(reference, true)?;
+                self.click_at(target, &mut watch)?;
                 let navigated = self.settle(&mut watch)?;
                 download = watch.download.take();
                 popup = watch.popup;
@@ -353,12 +364,26 @@ impl Page {
             } => {
                 let mut watch = NavWatch::new(&self.watch_frame(reference));
                 if self.input_policy == InputPolicy::Paced {
-                    // A person clicks into the field first; the focus call
-                    // then only clears it and confirms it took the focus.
-                    if let Ok(at) = self.locate(reference, true) {
-                        self.click_at(at, &mut watch)?;
+                    // A person reaches the field with Tab when it is the next
+                    // one, otherwise scrolls to it and clicks into it; the
+                    // focus call then only confirms it took the focus. Old
+                    // text is selected and deleted with keys, not wiped.
+                    let tab_next = self
+                        .registry_for(reference, &format!("tabNext({})", json_string(reference)))
+                        .is_ok_and(|v| v == "true");
+                    if tab_next {
+                        self.key("Tab", &mut watch)?;
+                    } else {
+                        self.wheel_into_view(reference, &mut watch)?;
+                        if let Ok(at) = self.locate(reference, true) {
+                            self.click_at(at, &mut watch)?;
+                        }
                     }
-                    self.focus(reference, *clear)?;
+                    let had = self.focus(reference, false)?;
+                    if *clear && had > 0 {
+                        self.select_all(&mut watch)?;
+                        self.key("Backspace", &mut watch)?;
+                    }
                     self.type_paced(text, &mut watch)?;
                 } else {
                     self.focus(reference, *clear)?;
@@ -515,7 +540,7 @@ impl Page {
 
     /// Centre of the element behind `reference`, scrolled into view, in the
     /// coordinates the mouse events are dispatched in.
-    fn locate(&mut self, reference: &str, hit_test: bool) -> Result<(f64, f64), String> {
+    fn locate(&mut self, reference: &str, hit_test: bool) -> Result<Target, String> {
         let subframe = self.subframe_of(reference);
         let context = match &subframe {
             None => self.main_world()?,
@@ -530,6 +555,8 @@ impl Page {
         let (mut x, mut y) = x
             .zip(y)
             .ok_or_else(|| format!("could not locate {reference}"))?;
+        let size = |k: &str| json_value(&value, k).and_then(|v| v.parse::<f64>().ok());
+        let (w, h) = (size("w").unwrap_or(1.0), size("h").unwrap_or(1.0));
         if let Some(frame) = subframe {
             // The frame-local point is in the iframe's own viewport; shift it
             // into the main document's, scrolling every iframe element into
@@ -553,7 +580,7 @@ impl Page {
                 }
             }
         }
-        Ok((x, y))
+        Ok(Target { at: (x, y), w, h })
     }
 
     /// Main-document coordinates of `frame`'s top-left corner: the sum of the
@@ -625,12 +652,103 @@ impl Page {
         server::frame_for_ref(&self.tab, reference).unwrap_or_else(|| self.frame.clone())
     }
 
-    fn focus(&mut self, reference: &str, clear: bool) -> Result<(), String> {
+    /// Focus `reference` (clearing it if asked) and return how many
+    /// characters it held before.
+    fn focus(&mut self, reference: &str, clear: bool) -> Result<usize, String> {
         self.registry_for(
             reference,
             &format!("focus({},{clear})", json_string(reference)),
         )
-        .map(|_| ())
+        .map(|v| {
+            json_value(&v, "len")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0)
+        })
+    }
+
+    /// Ctrl+A in the focused field, as a keyboard sends it.
+    fn select_all(&mut self, watch: &mut NavWatch) -> Result<(), String> {
+        let common = "\"key\":\"a\",\"code\":\"KeyA\",\"windowsVirtualKeyCode\":65,\"modifiers\":2";
+        let control = "\"key\":\"Control\",\"code\":\"ControlLeft\",\"windowsVirtualKeyCode\":17";
+        self.input(
+            "Input.dispatchKeyEvent",
+            &format!("{{\"type\":\"rawKeyDown\",{control},\"modifiers\":2}}"),
+            watch,
+        )?;
+        let (hold, gap) = crate::input::plan_typing(&self.tab, "aa")[0];
+        std::thread::sleep(gap / 2);
+        self.input(
+            "Input.dispatchKeyEvent",
+            &format!("{{\"type\":\"rawKeyDown\",{common},\"commands\":[\"selectAll\"]}}"),
+            watch,
+        )?;
+        std::thread::sleep(hold);
+        self.input(
+            "Input.dispatchKeyEvent",
+            &format!("{{\"type\":\"keyUp\",{common}}}"),
+            watch,
+        )?;
+        self.input(
+            "Input.dispatchKeyEvent",
+            &format!("{{\"type\":\"keyUp\",{control}}}"),
+            watch,
+        )?;
+        std::thread::sleep(gap);
+        Ok(())
+    }
+
+    /// Bring a main-frame target on screen with the mouse wheel, from
+    /// where the pointer is, in notches and flicks; a few rounds at most.
+    /// Whatever the wheel cannot reach (an inner scroller, a frame) is left
+    /// to `locate`'s instant scroll.
+    fn wheel_into_view(&mut self, reference: &str, watch: &mut NavWatch) -> Result<(), String> {
+        if self.subframe_of(reference).is_some() {
+            return Ok(());
+        }
+        for _ in 0..4 {
+            let Ok(rect) = self.registry_for(reference, &format!("rect({})", json_string(reference)))
+            else {
+                return Ok(());
+            };
+            let num = |k: &str| json_value(&rect, k).and_then(|v| v.parse::<f64>().ok());
+            let (Some(top), Some(bottom), Some(vw), Some(vh)) =
+                (num("top"), num("bottom"), num("vw"), num("vh"))
+            else {
+                return Ok(());
+            };
+            // Comfortably inside the viewport already: nothing to scroll.
+            if top >= 0.0 && bottom <= vh {
+                return Ok(());
+            }
+            let at = crate::input::pointer(&self.tab)
+                .unwrap_or_else(|| crate::input::origin(&self.tab, vw, vh));
+            let aim = vh * crate::human::Rng::new(top.to_bits(), "aim").uniform(0.35, 0.6);
+            let dy = (top + bottom) / 2.0 - aim;
+            let before = top;
+            for (delta, pause) in crate::input::plan_scroll(&self.tab, dy) {
+                std::thread::sleep(pause);
+                self.input(
+                    "Input.dispatchMouseEvent",
+                    &format!(
+                        "{{\"type\":\"mouseWheel\",\"x\":{:.1},\"y\":{:.1},\"deltaX\":0,\"deltaY\":{delta:.1}}}",
+                        at.0, at.1
+                    ),
+                    watch,
+                )?;
+            }
+            crate::input::set_pointer(&self.tab, at);
+            // Let a smooth scroll finish before reading the rect again.
+            std::thread::sleep(std::time::Duration::from_millis(180));
+            let moved = self
+                .registry_for(reference, &format!("rect({})", json_string(reference)))
+                .ok()
+                .and_then(|r| json_value(&r, "top").and_then(|v| v.parse::<f64>().ok()));
+            // The wheel did not move this element: not the document's scroll.
+            if moved.is_none_or(|t| (t - before).abs() < 1.0) {
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 
     fn key(&mut self, key: &str, watch: &mut NavWatch) -> Result<(), String> {
@@ -649,18 +767,27 @@ impl Page {
             &format!("{{\"type\":\"keyDown\",{common}{text}}}"),
             watch,
         )?;
+        let gap = if self.input_policy == InputPolicy::Paced {
+            let (hold, gap) = crate::input::plan_typing(&self.tab, "xx")[0];
+            std::thread::sleep(hold);
+            gap
+        } else {
+            Duration::ZERO
+        };
         self.input(
             "Input.dispatchKeyEvent",
             &format!("{{\"type\":\"keyUp\",{common}}}"),
             watch,
-        )
-        .map(|_| ())
+        )?;
+        std::thread::sleep(gap);
+        Ok(())
     }
 
-    /// A left click at `at`: press and release on the spot (`Instant`), or
-    /// a move there from where the pointer was, a landing near the point and
-    /// a held button (`Paced`).
-    fn click_at(&mut self, at: (f64, f64), watch: &mut NavWatch) -> Result<(), String> {
+    /// A left click on `target` (a box centre and its size): press and
+    /// release on the spot (`Instant`), or a move there from where the
+    /// pointer was along the session's human path, a landing inside the box
+    /// and a held button (`Paced`).
+    fn click_at(&mut self, target: Target, watch: &mut NavWatch) -> Result<(), String> {
         let mouse = |kind: &str, (x, y): (f64, f64), buttons: u8| {
             format!(
                 "{{\"type\":\"{kind}\",\"x\":{x:.1},\"y\":{y:.1},\"button\":\"{}\",\"buttons\":{buttons},\"clickCount\":{}}}",
@@ -670,64 +797,79 @@ impl Page {
         };
         if self.input_policy == InputPolicy::Instant {
             for kind in ["mousePressed", "mouseReleased"] {
-                self.input("Input.dispatchMouseEvent", &mouse(kind, at, 0), watch)?;
+                self.input("Input.dispatchMouseEvent", &mouse(kind, target.at, 0), watch)?;
             }
             return Ok(());
         }
-        let target = crate::input::near(at);
-        let from = crate::input::pointer(&self.tab);
-        for (point, pause) in crate::input::path(from, target) {
-            self.input("Input.dispatchMouseEvent", &mouse("mouseMoved", point, 0), watch)?;
+        let from = match crate::input::pointer(&self.tab) {
+            Some(at) => at,
+            None => {
+                let viewport = self
+                    .eval("innerWidth+'x'+innerHeight")
+                    .ok()
+                    .and_then(|v| {
+                        let (w, h) = v.split_once('x')?;
+                        Some((w.parse().ok()?, h.parse().ok()?))
+                    })
+                    .unwrap_or((1280.0, 720.0));
+                let start = crate::input::origin(&self.tab, viewport.0, viewport.1);
+                // The pointer is already there when the page first sees it.
+                self.input("Input.dispatchMouseEvent", &mouse("mouseMoved", start, 0), watch)?;
+                start
+            }
+        };
+        let plan = crate::input::plan_click(&self.tab, from, target.at, target.w, target.h);
+        for (point, pause) in plan.path {
             std::thread::sleep(pause);
+            self.input("Input.dispatchMouseEvent", &mouse("mouseMoved", point, 0), watch)?;
         }
         self.input(
             "Input.dispatchMouseEvent",
-            &mouse("mousePressed", target, 1),
+            &mouse("mousePressed", plan.point, 1),
             watch,
         )?;
-        std::thread::sleep(crate::input::hold());
+        std::thread::sleep(plan.hold);
         self.input(
             "Input.dispatchMouseEvent",
-            &mouse("mouseReleased", target, 0),
+            &mouse("mouseReleased", plan.point, 0),
             watch,
         )?;
-        crate::input::set_pointer(&self.tab, target);
+        crate::input::set_pointer(&self.tab, plan.point);
         Ok(())
     }
 
-    /// Type `text` key by key: keyDown (with the character), a hold, keyUp,
-    /// a gap. Exactly the given characters, in order; nothing is mistyped.
-    /// A line break is sent as Enter.
+    /// Type `text` key by key with the session typist's rhythm: keyDown
+    /// (with the character), a hold, keyUp, a gap. Exactly the given
+    /// characters, in order; nothing is mistyped. A line break is Enter.
     fn type_paced(&mut self, text: &str, watch: &mut NavWatch) -> Result<(), String> {
-        let mut previous = ' ';
-        for c in text.chars() {
+        let rhythm = crate::input::plan_typing(&self.tab, text);
+        for (c, (hold, gap)) in text.chars().zip(rhythm) {
             if c == '\n' {
                 self.key("Enter", watch)?;
-            } else {
-                let (key, code, vk) = crate::input::key_of(c);
-                let common = format!(
-                    "\"key\":{},\"code\":{},\"windowsVirtualKeyCode\":{vk}",
-                    json_string(&key),
-                    json_string(&code)
-                );
-                self.input(
-                    "Input.dispatchKeyEvent",
-                    &format!(
-                        "{{\"type\":\"keyDown\",{common},\"text\":{},\"unmodifiedText\":{}}}",
-                        json_string(&c.to_string()),
-                        json_string(&c.to_string())
-                    ),
-                    watch,
-                )?;
-                std::thread::sleep(crate::input::key_hold());
-                self.input(
-                    "Input.dispatchKeyEvent",
-                    &format!("{{\"type\":\"keyUp\",{common}}}"),
-                    watch,
-                )?;
+                continue;
             }
-            std::thread::sleep(crate::input::key_gap(previous));
-            previous = c;
+            let (key, code, vk) = crate::input::key_of(c);
+            let common = format!(
+                "\"key\":{},\"code\":{},\"windowsVirtualKeyCode\":{vk}",
+                json_string(&key),
+                json_string(&code)
+            );
+            self.input(
+                "Input.dispatchKeyEvent",
+                &format!(
+                    "{{\"type\":\"keyDown\",{common},\"text\":{},\"unmodifiedText\":{}}}",
+                    json_string(&c.to_string()),
+                    json_string(&c.to_string())
+                ),
+                watch,
+            )?;
+            std::thread::sleep(hold);
+            self.input(
+                "Input.dispatchKeyEvent",
+                &format!("{{\"type\":\"keyUp\",{common}}}"),
+                watch,
+            )?;
+            std::thread::sleep(gap);
         }
         Ok(())
     }
@@ -944,20 +1086,44 @@ if (!window.__cu) {
           return err(ref + ' is covered by ' + what);
         }
       }
-      return JSON.stringify({ x, y });
+      return JSON.stringify({ x, y, w: b.width, h: b.height });
+    },
+    rect(ref) {
+      const el = get(ref);
+      if (!el) return err(ref + ' is not on the page any more; take a new snapshot');
+      const b = el.getBoundingClientRect();
+      return JSON.stringify({ top: b.top, bottom: b.bottom, left: b.left, right: b.right,
+        vw: innerWidth, vh: innerHeight });
+    },
+    tabNext(ref) {
+      // Whether one Tab from the focused element lands on `ref`: both in the
+      // plain document order of focusable, visible, enabled controls, with
+      // no positive tabindex anywhere to reorder it.
+      const el = get(ref), from = document.activeElement;
+      if (!el || !from || from === document.body || from === el) return 'false';
+      const all = [...document.querySelectorAll(
+        'a[href],button,input,select,textarea,[tabindex],[contenteditable=""],[contenteditable="true"]')];
+      if (all.some((e) => e.tabIndex > 0)) return 'false';
+      const order = all.filter((e) => e.tabIndex >= 0 && !e.disabled &&
+        !(e.type === 'hidden') && e.getClientRects().length > 0);
+      const i = order.indexOf(from);
+      return String(i >= 0 && order[i + 1] === el);
     },
     focus(ref, clear) {
       const el = get(ref);
       if (!el) return err(ref + ' is not on the page any more; take a new snapshot');
-      el.scrollIntoView({ block: 'center', behavior: 'instant' });
-      el.focus();
+      const b = el.getBoundingClientRect();
+      if (b.bottom < 0 || b.top > innerHeight || b.right < 0 || b.left > innerWidth)
+        el.scrollIntoView({ block: 'center', behavior: 'instant' });
+      if (document.activeElement !== el) el.focus();
       if (document.activeElement !== el && !el.contains(document.activeElement))
         return err(ref + ' cannot take text');
+      const len = 'value' in el ? String(el.value).length : (el.textContent || '').length;
       if (clear) {
         if ('value' in el) { el.value = ''; }
         else if (el.isContentEditable) { document.getSelection().selectAllChildren(el); }
       }
-      return '{}';
+      return JSON.stringify({ len });
     },
     select(ref, value) {
       const el = get(ref);

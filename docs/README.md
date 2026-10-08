@@ -198,12 +198,14 @@ A 429/503 with `Retry-After` closes the origin until then (capped at one hour). 
 
 ### Input pacing
 
-`CU_INPUT=paced` makes clicks and typing look like real hardware input, structurally:
+`CU_INPUT=paced` makes clicks, scrolling and typing look like real hardware input, structurally. The model is Jaime's `human.rs` (from `feat/human-input`, ported from `invisible_playwright`'s behaviour layer):
 
-- the pointer moves to the target along a short eased, slightly curved path from where it was last left (`mouseMoved` steps, so hover and `mousemove` listeners fire), lands near the centre rather than exactly on it, and holds the button 55-130 ms;
-- a field is clicked before it is typed into, and every character is a `keyDown`/`keyUp` pair (`keydown`, `input`, `keyup` fire per character), with a gap between keys.
+- **one hand per session**: curvature, speed, tremor, overshoot, typing rhythm and click dwell are drawn from a seed -- the profile identity's seed (see *Sessions and identity*), mixed with the context name for `?context=` -- so a profile keeps its hand across restarts and two profiles differ. Every movement is still a fresh draw; `CU_SEED=N` replays a run exactly;
+- the pointer moves along a Bezier path walked by arc length with a bell-shaped speed profile, a Fitts-law duration, zero-mean tremor and an occasional overshoot pulled back, sampled no faster than a real mouse (8 ms); a fresh tab's pointer starts somewhere plausible (never 0,0); it lands inside the middle of the target box, and the button is held for a log-normal dwell;
+- a target off screen is scrolled to with the wheel (`mouseWheel` notches of 100 px in flicks), not teleported; an inner scroller or an iframe the wheel cannot move falls back to the instant scroll;
+- a field is reached with **Tab** when it is the next one after the focused element, otherwise with a click; old text is removed with Ctrl+A and Backspace; every character is a `keyDown`/`keyUp` pair with a per-key hold and a gap that is shorter across hands, longer on one hand or a repeated key, with occasional hesitations.
 
-Nothing is ever mistyped: the field receives exactly the given text, which matters for credentials. A 12-character field takes ~2-3 s instead of ~2 ms, so the default stays `instant` (one `Input.insertText`, press/release on the spot) for owned sites and CI. Plausible timing is not evidence of a person; it only removes the structural differences between cu's input and a real user's.
+Nothing is ever mistyped: the field receives exactly the given text, which matters for credentials. A 12-character field takes a few seconds instead of ~2 ms, so the default stays `instant` (one `Input.insertText`, press/release on the spot) for owned sites and CI. Plausible timing is not evidence of a person; it only removes the structural differences between cu's input and a real user's.
 
 ## Login
 
