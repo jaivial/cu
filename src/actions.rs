@@ -17,6 +17,8 @@
 //! longer.
 use std::time::{Duration, Instant};
 
+use crate::input::InputPolicy;
+
 use crate::server::{
     self, CdpConnection, Tab, checkin, checkout, evaluated_string, json_array, json_objects,
     json_string, json_string_value, json_value, open_connection,
@@ -285,6 +287,8 @@ struct Page {
     /// Set when a command left the connection mid-frame; it is then dropped
     /// instead of pooled.
     poisoned: bool,
+    /// Instant or paced pointer and keyboard input (`CU_INPUT`).
+    input_policy: InputPolicy,
 }
 
 impl Page {
@@ -309,6 +313,7 @@ impl Page {
             frames,
             dom_enabled: false,
             poisoned: false,
+            input_policy: InputPolicy::from_env(),
         })
     }
 
@@ -334,15 +339,7 @@ impl Page {
             Action::Click { reference } => {
                 let (x, y) = self.locate(reference, true)?;
                 let mut watch = NavWatch::new(&self.watch_frame(reference));
-                for kind in ["mousePressed", "mouseReleased"] {
-                    self.input(
-                        "Input.dispatchMouseEvent",
-                        &format!(
-                            "{{\"type\":\"{kind}\",\"x\":{x},\"y\":{y},\"button\":\"left\",\"clickCount\":1}}"
-                        ),
-                        &mut watch,
-                    )?;
-                }
+                self.click_at((x, y), &mut watch)?;
                 let navigated = self.settle(&mut watch)?;
                 download = watch.download.take();
                 popup = watch.popup;
@@ -354,13 +351,23 @@ impl Page {
                 clear,
                 submit,
             } => {
-                self.focus(reference, *clear)?;
                 let mut watch = NavWatch::new(&self.watch_frame(reference));
-                self.input(
-                    "Input.insertText",
-                    &format!("{{\"text\":{}}}", json_string(text)),
-                    &mut watch,
-                )?;
+                if self.input_policy == InputPolicy::Paced {
+                    // A person clicks into the field first; the focus call
+                    // then only clears it and confirms it took the focus.
+                    if let Ok(at) = self.locate(reference, true) {
+                        self.click_at(at, &mut watch)?;
+                    }
+                    self.focus(reference, *clear)?;
+                    self.type_paced(text, &mut watch)?;
+                } else {
+                    self.focus(reference, *clear)?;
+                    self.input(
+                        "Input.insertText",
+                        &format!("{{\"text\":{}}}", json_string(text)),
+                        &mut watch,
+                    )?;
+                }
                 if *submit {
                     self.key("Enter", &mut watch)?;
                 }
@@ -648,6 +655,81 @@ impl Page {
             watch,
         )
         .map(|_| ())
+    }
+
+    /// A left click at `at`: press and release on the spot (`Instant`), or
+    /// a move there from where the pointer was, a landing near the point and
+    /// a held button (`Paced`).
+    fn click_at(&mut self, at: (f64, f64), watch: &mut NavWatch) -> Result<(), String> {
+        let mouse = |kind: &str, (x, y): (f64, f64), buttons: u8| {
+            format!(
+                "{{\"type\":\"{kind}\",\"x\":{x:.1},\"y\":{y:.1},\"button\":\"{}\",\"buttons\":{buttons},\"clickCount\":{}}}",
+                if kind == "mouseMoved" { "none" } else { "left" },
+                if kind == "mouseMoved" { 0 } else { 1 }
+            )
+        };
+        if self.input_policy == InputPolicy::Instant {
+            for kind in ["mousePressed", "mouseReleased"] {
+                self.input("Input.dispatchMouseEvent", &mouse(kind, at, 0), watch)?;
+            }
+            return Ok(());
+        }
+        let target = crate::input::near(at);
+        let from = crate::input::pointer(&self.tab);
+        for (point, pause) in crate::input::path(from, target) {
+            self.input("Input.dispatchMouseEvent", &mouse("mouseMoved", point, 0), watch)?;
+            std::thread::sleep(pause);
+        }
+        self.input(
+            "Input.dispatchMouseEvent",
+            &mouse("mousePressed", target, 1),
+            watch,
+        )?;
+        std::thread::sleep(crate::input::hold());
+        self.input(
+            "Input.dispatchMouseEvent",
+            &mouse("mouseReleased", target, 0),
+            watch,
+        )?;
+        crate::input::set_pointer(&self.tab, target);
+        Ok(())
+    }
+
+    /// Type `text` key by key: keyDown (with the character), a hold, keyUp,
+    /// a gap. Exactly the given characters, in order; nothing is mistyped.
+    /// A line break is sent as Enter.
+    fn type_paced(&mut self, text: &str, watch: &mut NavWatch) -> Result<(), String> {
+        let mut previous = ' ';
+        for c in text.chars() {
+            if c == '\n' {
+                self.key("Enter", watch)?;
+            } else {
+                let (key, code, vk) = crate::input::key_of(c);
+                let common = format!(
+                    "\"key\":{},\"code\":{},\"windowsVirtualKeyCode\":{vk}",
+                    json_string(&key),
+                    json_string(&code)
+                );
+                self.input(
+                    "Input.dispatchKeyEvent",
+                    &format!(
+                        "{{\"type\":\"keyDown\",{common},\"text\":{},\"unmodifiedText\":{}}}",
+                        json_string(&c.to_string()),
+                        json_string(&c.to_string())
+                    ),
+                    watch,
+                )?;
+                std::thread::sleep(crate::input::key_hold());
+                self.input(
+                    "Input.dispatchKeyEvent",
+                    &format!("{{\"type\":\"keyUp\",{common}}}"),
+                    watch,
+                )?;
+            }
+            std::thread::sleep(crate::input::key_gap(previous));
+            previous = c;
+        }
+        Ok(())
     }
 
     /// Send an input command, feeding the events that precede its reply to

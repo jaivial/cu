@@ -190,6 +190,15 @@ Every navigation cu starts (`cu navigate`, `navigate` actions in a batch) takes 
 
 A 429/503 with `Retry-After` closes the origin until then (capped at one hour). A challenge, block or rate-limit page without the header backs the origin off exponentially (2 s, 4 s, ... up to 5 min), and a ready page resets it. Challenges and blocks are never retried automatically. A navigation that would have to wait longer than the max-wait fails at once with `429` and `retry_in_ms`, so the agent is never left blocking. The navigate reply adds `status`, `retries`, `queued_ms` and `origin_closed_ms` when they apply, and `GET /v1/diagnostics` lists every origin's state. Only the main document's status and `Retry-After` are read from the response; no other header and no cookie.
 
+### Input pacing
+
+`CU_INPUT=paced` makes clicks and typing look like real hardware input, structurally:
+
+- the pointer moves to the target along a short eased, slightly curved path from where it was last left (`mouseMoved` steps, so hover and `mousemove` listeners fire), lands near the centre rather than exactly on it, and holds the button 55-130 ms;
+- a field is clicked before it is typed into, and every character is a `keyDown`/`keyUp` pair (`keydown`, `input`, `keyup` fire per character), with a gap between keys.
+
+Nothing is ever mistyped: the field receives exactly the given text, which matters for credentials. A 12-character field takes ~2-3 s instead of ~2 ms, so the default stays `instant` (one `Input.insertText`, press/release on the spot) for owned sites and CI. Plausible timing is not evidence of a person; it only removes the structural differences between cu's input and a real user's.
+
 ## Login
 
 `POST /login` takes `username` and `password` form fields. The daemon types them into the page the browser is showing and submits the form, which is how the credentials reach the site without ever passing through an agent. The password is not written to disk, not logged and not included in the response; the reply only says whether it could be typed. Navigate to the sign-in page first, or the submission has nowhere to go.
