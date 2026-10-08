@@ -162,6 +162,17 @@ The browser executable defaults to `chromium`; set `CU_BROWSER` to an alternate 
 
 The daemon logs the executable it spawned (and where the symlink points), the product version, the headless mode and the GL renderer, plus plain notes such as "the User-Agent says HeadlessChrome" or "software rendering". The same record is written to `DATA/browser.json` and served, with DevTools protocol counters (commands, errors, latency, main-world vs isolated evaluations, `Runtime.enable` calls -- which should stay 0), at `GET /v1/diagnostics` (`cu diagnostics`). These are observations about the setup; neither mode guarantees how a site will treat the browser.
 
+### Challenge state
+
+After every navigation (`cu navigate`, and any batch action that navigated) cu reads the page from its isolated world and reports a `challenge` object: `state` is one of `ready`, `challenge_pending`, `human_required`, `blocked`, `rate_limited` or `unknown`, plus the `vendor` it recognised (Cloudflare interstitial/Turnstile/block pages, DataDome, PerimeterX, Imperva, Akamai, AWS WAF, reCAPTCHA, hCaptcha, Arkose), the HTTP `status`, the `signals` it rests on and a `next` hint. Only a 2xx/3xx http(s) page with no signal is `ready`; a bare 403/503, a page still loading or a probe that failed is `unknown`, never success. URLs are cut to origin and path (challenge URLs carry tokens), and no cookie or token is read.
+
+- An interstitial ("Just a moment...") is given `CU_CHALLENGE_WAIT_MS` (default 10000, max 60000) to clear by itself; one that does not becomes `human_required`.
+- `human_required` pauses automation on that tab: `navigate`, `act`, `click` and `type` answer `409` until a re-check shows the challenge gone (a person solved it, e.g. in a headful `CU_HEADLESS=0` browser), or `cu challenge release` hands the tab back. Reads (`snapshot`, `text`, `shot`) stay allowed.
+- A batch stops after a navigation that lands on `human_required`, `blocked` or `rate_limited`, and names the action that was not run.
+- `cu challenge` (`GET /v1/challenge`) re-checks the current page on demand. `CU_CHALLENGE=0` turns the post-navigation check off for owned test sites.
+
+cu does not solve, click through or evade challenges; it reports them and stops.
+
 ## Login
 
 `POST /login` takes `username` and `password` form fields. The daemon types them into the page the browser is showing and submits the form, which is how the credentials reach the site without ever passing through an agent. The password is not written to disk, not logged and not included in the response; the reply only says whether it could be typed. Navigate to the sign-in page first, or the submission has nowhere to go.

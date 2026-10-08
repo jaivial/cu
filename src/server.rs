@@ -617,16 +617,17 @@ pub fn route(
             | ("GET", "/v1/contexts")
             | ("GET", "/v1/tabs")
             | ("GET", "/v1/text")
+            | ("GET", "/v1/challenge")
+            | ("POST", "/v1/challenge/release")
     ) || (method == "DELETE"
         && (path.starts_with("/v1/contexts/") || path.starts_with("/v1/tabs/")));
-    if needs_browser
-        && let Err(error) = wait_until_ready(state) {
-            return (
-                "503 Service Unavailable",
-                "application/json",
-                format!("{{\"error\":\"{}\"}}", json_escape(&error)),
-            );
-        }
+    if needs_browser && let Err(error) = wait_until_ready(state) {
+        return (
+            "503 Service Unavailable",
+            "application/json",
+            format!("{{\"error\":\"{}\"}}", json_escape(&error)),
+        );
+    }
     // `?context=NAME` runs a page action in an isolated browser context of
     // the same browser; `?tab=ID` runs it in another real tab (a popup, a
     // window a click opened). They are two ways of picking a page, so giving
@@ -670,7 +671,37 @@ pub fn route(
     } else {
         Tab::default_for(state.cdp_port)
     };
+    // A person is completing a challenge in this tab: no automatic
+    // interaction until a re-check shows it cleared (reads stay allowed, so
+    // the agent can still look).
+    if matches!(
+        (method, path),
+        ("POST", "/v1/navigate")
+            | ("POST", "/v1/act")
+            | ("POST", "/v1/click")
+            | ("POST", "/v1/type")
+    ) && let Some(blocking) = crate::challenge::gate(&tab)
+    {
+        return (
+            "409 Conflict",
+            "application/json",
+            format!(
+                "{{\"error\":\"human verification in progress on this tab; automatic actions are paused\",\"challenge\":{}}}",
+                blocking.json()
+            ),
+        );
+    }
     match (method, path) {
+        ("GET", "/v1/challenge") => {
+            let assessment = crate::challenge::assess(|m, p| tab.command(m, p), Duration::ZERO);
+            crate::challenge::record(&tab, &assessment);
+            ("200 OK", "application/json", assessment.json())
+        }
+        ("POST", "/v1/challenge/release") => (
+            "200 OK",
+            "application/json",
+            format!("{{\"released\":{}}}", crate::challenge::release(&tab)),
+        ),
         ("GET", "/v1/tabs") => match tabs_json(state.cdp_port) {
             Ok(body) => ("200 OK", "application/json", body),
             Err(e) => (
@@ -770,11 +801,24 @@ pub fn route(
                     // stream that stays open for ever. Whether the wait ended
                     // on a ready page or on the budget says `settled`.
                     let (waited, settled) = wait_for_page_on(&tab, SETTLE_MAX);
+                    // A page that loaded is not necessarily the page asked
+                    // for: say what it is, and never call a defence page
+                    // (or an undecided one) a plain success.
+                    let challenge = if crate::challenge::enabled() {
+                        let assessment = crate::challenge::assess(
+                            |m, p| tab.command(m, p),
+                            crate::challenge::wait_budget(),
+                        );
+                        crate::challenge::record(&tab, &assessment);
+                        format!(",\"challenge\":{}", assessment.json())
+                    } else {
+                        String::new()
+                    };
                     (
                         "200 OK",
                         "application/json",
                         format!(
-                            "{{\"result\":{},\"settled_ms\":{},\"settled\":{}}}",
+                            "{{\"result\":{},\"settled_ms\":{},\"settled\":{}{challenge}}}",
                             result.trim(),
                             waited.as_millis(),
                             settled
@@ -2680,9 +2724,10 @@ pub fn http_get(address: &str, path: &str) -> Result<String, String> {
             let head = String::from_utf8_lossy(&buf[..end]);
             if let Some(len) =
                 header_value(&head, "content-length").and_then(|v| v.trim().parse::<usize>().ok())
-                && buf.len() >= end + len {
-                    break;
-                }
+                && buf.len() >= end + len
+            {
+                break;
+            }
         }
         match stream.read(&mut chunk) {
             Ok(0) => break,
@@ -2895,9 +2940,7 @@ mod tests {
     #[test]
     fn json_strings_are_escaped_and_read_back() {
         let password = "quote\" backslash\\ newline\n";
-        assert!(
-            json_string_value(&json_string(password), "unused").is_none()
-        );
+        assert!(json_string_value(&json_string(password), "unused").is_none());
         assert_eq!(json_string_value(&json_string(password), ""), None);
         let encoded = format!("{{\"v\":{}}}", json_string(password));
         assert_eq!(json_string_value(&encoded, "v").as_deref(), Some(password));
@@ -3016,7 +3059,10 @@ mod snapshot_tests {
             "--disable-extensions",
             "--disable-background-networking",
         ] {
-            assert!(crate::policy::FAST_TEST_ARGS.contains(&flag), "{flag} missing");
+            assert!(
+                crate::policy::FAST_TEST_ARGS.contains(&flag),
+                "{flag} missing"
+            );
         }
         // One --disable-features: Chromium only honours the last one it sees.
         let features: Vec<_> = crate::policy::FAST_TEST_ARGS
