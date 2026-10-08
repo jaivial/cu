@@ -1111,30 +1111,21 @@ where
     let mut text = String::new();
     let mut truncated = false;
     for (index, frame) in frames.iter().enumerate() {
-        // Subframes are read in an isolated world of their own, so a
-        // cross-origin frame is read without touching its scripts -- the same
-        // move the snapshot makes.
-        let context = if index == 0 {
+        // Every frame is read in cu's isolated world -- the main document
+        // too, unless `CU_HELPER_WORLD=main` -- so a cross-origin frame is
+        // read without touching its scripts, the same move the snapshot makes.
+        let world = if index == 0 {
+            crate::execution::helper_world()
+        } else {
+            crate::execution::World::Isolated
+        };
+        let context = if frame.id.is_empty() {
             String::new()
         } else {
-            let isolated = cmd(
-                "Page.createIsolatedWorld",
-                &format!(
-                    "{{\"frameId\":{},\"worldName\":\"cu-text\"}}",
-                    json_string(&frame.id)
-                ),
-            );
-            match isolated
-                .as_deref()
-                .ok()
-                .and_then(|r| json_value(r, "executionContextId"))
-                .and_then(|v| v.parse::<i64>().ok())
-            {
-                // Trailing comma: the format below puts one comma between the
-                // expression and this fragment and none after it.
-                Some(id) => format!("\"contextId\":{id},"),
+            match crate::execution::context_fragment(&mut cmd, world, &frame.id) {
+                Ok(fragment) => fragment,
                 // The frame went away between the tree walk and here.
-                None => {
+                Err(_) => {
                     text.push('\n');
                     text.push_str(&unreadable_frame(&frame.url));
                     continue;
@@ -1464,12 +1455,11 @@ fn capture(tab: &Tab, options: &ShotOptions) -> Result<(String, String), String>
             None => "return JSON.stringify({vw:innerWidth,vh:innerHeight});".into(),
         }
     );
+    // In cu's isolated world: that is where the ref registry lives, and the
+    // page does not see the measure run.
     let reply = tab.command(
         "Runtime.evaluate",
-        &format!(
-            "{{\"expression\":{},\"awaitPromise\":true,\"returnByValue\":true}}",
-            json_string(&expression)
-        ),
+        &crate::execution::evaluate_params(&expression, &helper_context(tab)?, true),
     )?;
     if reply.contains("\"exceptionDetails\"") {
         return Err(json_string_value(&reply, "description")
@@ -1608,7 +1598,7 @@ fn flatten_frame_node(node: &str, parent: Option<String>, out: &mut Vec<Frame>) 
     let id = json_string_value(frame, "id").unwrap_or_default();
     let url = json_string_value(frame, "url").unwrap_or_default();
     // Pre-order: the main document must come first, because position zero is
-    // what marks the frame walked in its own default world.
+    // what marks the frame that follows the main-document helper policy.
     out.push(Frame {
         id: id.clone(),
         parent,
@@ -1675,10 +1665,10 @@ where
 
 /// Walk every frame of the page and merge the result.
 ///
-/// Returns the snapshot text and the (ref, frameId) of every element. The
-/// main document is walked in its default world -- that is where the actions
-/// look for the registry -- and each iframe in an isolated world of its own,
-/// so a cross-origin frame is read without ever touching its scripts.
+/// Returns the snapshot text and the (ref, frameId) of every element. Every
+/// frame, the main document included, is walked in cu's isolated world (see
+/// [`crate::execution`]), so the page's scripts never see the walk or the
+/// registry it installs.
 /// Isolated worlds persist per frame (created with the fixed name `cu`), so
 /// the registry the walk installs is the one the later action finds.
 pub fn walk_frames<F>(
@@ -1693,29 +1683,25 @@ where
     let mut pairs: Vec<(String, String)> = Vec::new();
     for (index, frame) in frames.iter().enumerate() {
         let expression = snapshot::script_with_base(snapshot::base_for(tab.cdp_port, &frame.id));
-        let context = if index == 0 {
-            String::new()
+        // The main document follows the helper policy (cu's isolated world
+        // unless `CU_HELPER_WORLD=main`); an iframe is always read in its
+        // isolated world, so a cross-origin frame's scripts are never touched.
+        let world = if index == 0 {
+            crate::execution::helper_world()
         } else {
-            let reply = cmd(
-                "Page.createIsolatedWorld",
-                &format!(
-                    "{{\"frameId\":{},\"worldName\":\"cu\"}}",
-                    json_string(&frame.id)
-                ),
-            )?;
-            match json_value(&reply, "executionContextId").and_then(|v| v.parse::<i64>().ok()) {
-                // Trailing comma: the format below puts one comma between the
-                // expression and this fragment and none after it.
-                Some(id) => format!("\"contextId\":{id},"),
+            crate::execution::World::Isolated
+        };
+        let context = match crate::execution::context_fragment(&mut cmd, world, &frame.id) {
+                Ok(fragment) => fragment,
+                Err(e) if index == 0 => return Err(e),
                 // The frame went away between the tree walk and here; its
                 // section says so rather than failing the whole snapshot.
-                None => {
+                Err(_) => {
                     text.push_str(&format!(
                         "- frame: {} (unreadable right now; take a new snapshot)\n",
                         frame.url
                     ));
                     continue;
-                }
             }
         };
         let params = format!(
@@ -1894,10 +1880,14 @@ fn wait_for_page_on(tab: &Tab, budget: Duration) -> (Duration, bool) {
     let mut settled = false;
     while started.elapsed() < budget {
         let left = budget.saturating_sub(started.elapsed());
-        let params = format!(
-            "{{\"expression\":{},\"awaitPromise\":true,\"returnByValue\":true}}",
-            json_string(&settle_script(left))
-        );
+        // A new document may not have its isolated world yet; that is the
+        // same "not ready, try again" as an evaluate that lost its context.
+        let Ok(context) = helper_context(tab) else {
+            thread::sleep(Duration::from_millis(2));
+            continue;
+        };
+        let params =
+            crate::execution::evaluate_params(&settle_script(left), &context, true);
         match tab.command("Runtime.evaluate", &params) {
             Ok(reply) if !reply.contains("\"exceptionDetails\"") => {
                 settled = evaluated_string(&reply).is_some_and(|state| state != "loading");
@@ -1926,15 +1916,24 @@ fn fill_login_form(user: &str, password: &str, state: &AppState) -> Result<(), S
         user = json_string(user),
         password = json_string(password)
     );
-    cdp_command(
-        state.cdp_port,
+    let tab = Tab::default_for(state.cdp_port);
+    tab.command(
         "Runtime.evaluate",
-        &format!(
-            "{{\"expression\":{},\"returnByValue\":true}}",
-            json_string(&script)
-        ),
+        &crate::execution::evaluate_params(&script, &helper_context(&tab)?, false),
     )?;
     Ok(())
+}
+
+/// The context fragment for a helper on `tab`'s main frame, per the helper
+/// world policy (see [`crate::execution`]).
+fn helper_context(tab: &Tab) -> Result<String, String> {
+    let world = crate::execution::helper_world();
+    if world == crate::execution::World::Main {
+        return Ok(String::new());
+    }
+    let mut cmd = |m: &str, p: &str| tab.command(m, p);
+    let frame = crate::execution::main_frame(&mut cmd)?;
+    crate::execution::context_fragment(&mut cmd, world, &frame)
 }
 /// Page shown after the human submitted the local login form.
 fn login_result_page(delivered: bool, user: &str) -> String {

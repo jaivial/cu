@@ -2,6 +2,7 @@
 pub mod actions;
 pub mod challenge;
 pub mod diagnostics;
+pub mod execution;
 pub mod policy;
 pub mod server;
 use std::io::{Read, Write};

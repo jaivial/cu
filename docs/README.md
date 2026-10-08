@@ -173,6 +173,10 @@ After every navigation (`cu navigate`, and any batch action that navigated) cu r
 
 cu does not solve, click through or evade challenges; it reports them and stops.
 
+### Helper isolation
+
+Every helper cu runs in a page (snapshot walk, ref registry, text read, settle wait, screenshot measure, challenge probe) evaluates in cu's own isolated world of the frame: a separate JavaScript global over the same DOM. The page's scripts do not see `window.__cu`, cannot observe the evaluations and cannot shadow the built-ins the helpers use; cu never sends `Runtime.enable`. The page's main world is used only for the batch's no-op barrier. `CU_HELPER_WORLD=main` puts the main-document helpers back in the page's world, if a page ever needs it.
+
 ## Login
 
 `POST /login` takes `username` and `password` form fields. The daemon types them into the page the browser is showing and submits the form, which is how the credentials reach the site without ever passing through an agent. The password is not written to disk, not logged and not included in the response; the reply only says whether it could be typed. Navigate to the sign-in page first, or the submission has nowhere to go.
