@@ -4,6 +4,7 @@ pub mod challenge;
 pub mod diagnostics;
 pub mod execution;
 pub mod policy;
+pub mod scheduler;
 pub mod server;
 use std::io::{Read, Write};
 use std::net::TcpStream;
