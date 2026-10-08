@@ -2,29 +2,46 @@
 //! and CI) or `Paced`, with `CU_INPUT=paced`.
 //!
 //! `Instant` is what cu has always done: a press and a release at the exact
-//! centre of the element, and text inserted in one `Input.insertText`.
+//! centre of the element, text inserted in one `Input.insertText`, and an
+//! instant `scrollIntoView` to bring a target on screen.
+//!
 //! `Paced` sends the events a person's hardware produces, in the order a
-//! browser expects them:
+//! browser expects them, shaped by the human model in [`crate::human`]
+//! (Jaime's, from `feat/human-input`):
 //!
-//! - the pointer **moves** to the target over a short eased path from where it
-//!   last was (`mouseMoved` steps, so hover, `pointerover/enter` and
-//!   `mousemove` listeners fire), lands near the centre rather than on it,
-//!   and the button is **held** for a moment between press and release;
-//! - a text field is **clicked** before it is typed into, and every character
-//!   is a **keyDown/keyUp** pair (the `keydown`, `keypress`, `input`, `keyup`
-//!   sequence), with a gap between keys.
+//! - **one hand per session**: every shape parameter (curvature, speed,
+//!   tremor, overshoot, typing rhythm, click dwell) is drawn from a seed, and
+//!   the seed is the profile's identity seed ([`crate::session`]) -- mixed
+//!   with the context name for a `?context=` jar -- so one profile keeps its
+//!   hand across restarts and two profiles have different ones, while each
+//!   movement is still a fresh draw (no restart replays a path). `CU_SEED`
+//!   replays a run exactly;
+//! - the pointer **moves** along a Bezier path walked by arc length with a
+//!   bell-shaped speed profile, Fitts-law duration, zero-mean tremor and an
+//!   occasional overshoot pulled back, never sampled faster than a real mouse
+//!   (8 ms); it starts from where it was left (a fresh tab: somewhere
+//!   plausible, never the origin), lands inside the middle of the target box
+//!   rather than on its centre, and the button is **held** for a log-normal
+//!   dwell;
+//! - a target off screen is **scrolled to with the wheel** (`mouseWheel`
+//!   notches in flicks), not teleported; the instant scroll stays as the
+//!   fallback when the wheel cannot reach it (an inner scroller);
+//! - a field is **focused the way a person would**: with Tab when it is the
+//!   next field after the focused one, otherwise with a click; every
+//!   character is a **keyDown/keyUp** pair with a per-key hold and a gap that
+//!   is shorter across hands, longer on one hand or a repeated key, with the
+//!   occasional hesitation.
 //!
-//! The timing is varied but nothing is ever mistyped: the text that arrives
-//! is exactly the text asked for, which is what matters for credentials and
-//! other data. Plausible timing is not evidence of a person and is not
-//! presented as such; it only stops cu's input from being structurally
-//! different from real input (no movement, zero-length clicks, text that
-//! appears without key events).
+//! Nothing is ever mistyped: the field receives exactly the given text,
+//! which is what matters for credentials. Plausible timing is not evidence
+//! of a person and is not presented as such; it only stops cu's input from
+//! being structurally different from real input.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::human::{self, MotionStyle, Persona, Rng, Waypoint};
 use crate::server::Tab;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,27 +60,56 @@ impl InputPolicy {
     }
 }
 
-/// A small xorshift generator: timing jitter only, never anything secret.
-fn next_random() -> f64 {
-    static STATE: AtomicU64 = AtomicU64::new(0);
-    let mut x = STATE.load(Ordering::Relaxed);
-    if x == 0 {
-        x = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9E37_79B9_7F4A_7C15)
-            | 1;
-    }
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    STATE.store(x, Ordering::Relaxed);
-    (x >> 11) as f64 / (1u64 << 53) as f64
+/// One session's hand: its motion style and its typist.
+struct Hand {
+    seed: u64,
+    style: MotionStyle,
+    persona: Persona,
 }
 
-/// Uniform in `[low, high)`.
-pub fn between(low: f64, high: f64) -> f64 {
-    low + (high - low) * next_random()
+/// The seed of the session `tab` belongs to: `CU_SEED`, else the profile
+/// identity's seed (mixed with the context name for a named context), else
+/// one fresh seed for the daemon's life.
+fn session_seed(tab: &Tab) -> u64 {
+    static FALLBACK: OnceLock<u64> = OnceLock::new();
+    let base = std::env::var("CU_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or_else(crate::session::seed)
+        .unwrap_or_else(|| *FALLBACK.get_or_init(human::random_seed));
+    match crate::server::context_of(tab) {
+        Some(name) => human::mix(base, &format!("context:{name}")),
+        None => base,
+    }
+}
+
+fn hand(tab: &Tab) -> &'static Hand {
+    static HANDS: OnceLock<Mutex<HashMap<u64, &'static Hand>>> = OnceLock::new();
+    let seed = session_seed(tab);
+    let mut hands = HANDS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    hands.entry(seed).or_insert_with(|| {
+        Box::leak(Box::new(Hand {
+            seed,
+            style: MotionStyle::from_seed(seed),
+            persona: Persona::from_seed(seed),
+        }))
+    })
+}
+
+/// Every movement, click, word and scroll gets its own random stream. The
+/// count starts at a fresh offset per daemon, so a profile keeps its hand
+/// (the style) but never replays the exact same path after a restart; with
+/// `CU_SEED` it starts at 0, so a run is reproducible.
+fn next_act() -> u64 {
+    static ACTS: OnceLock<AtomicU64> = OnceLock::new();
+    ACTS.get_or_init(|| {
+        let replay = std::env::var("CU_SEED").is_ok_and(|v| v.parse::<u64>().is_ok());
+        AtomicU64::new(if replay { 0 } else { human::random_seed() >> 1 })
+    })
+    .fetch_add(1, Ordering::Relaxed)
 }
 
 fn pointers() -> &'static Mutex<HashMap<Tab, (f64, f64)>> {
@@ -71,14 +117,13 @@ fn pointers() -> &'static Mutex<HashMap<Tab, (f64, f64)>> {
     POINTERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Where the pointer was left on `tab`; a fresh tab starts it somewhere in
-/// the upper part of the viewport rather than at the origin.
-pub fn pointer(tab: &Tab) -> (f64, f64) {
-    *pointers()
+/// Where the pointer was left on `tab`, if it has moved there yet.
+pub fn pointer(tab: &Tab) -> Option<(f64, f64)> {
+    pointers()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .entry(tab.clone())
-        .or_insert_with(|| (between(80.0, 400.0), between(60.0, 240.0)))
+        .get(tab)
+        .copied()
 }
 
 pub fn set_pointer(tab: &Tab, at: (f64, f64)) {
@@ -88,70 +133,102 @@ pub fn set_pointer(tab: &Tab, at: (f64, f64)) {
         .insert(tab.clone(), at);
 }
 
-/// A point near the centre of a target: within a few pixels, never on the
-/// exact centre every time.
-pub fn near(center: (f64, f64)) -> (f64, f64) {
-    (center.0 + between(-3.0, 3.0), center.1 + between(-2.0, 2.0))
+/// A plausible resting place for a tab's pointer before its first move, in
+/// a `width` x `height` viewport: never the origin.
+pub fn origin(tab: &Tab, width: f64, height: f64) -> (f64, f64) {
+    human::initial_pointer(hand(tab).seed, next_act(), width, height)
 }
 
-/// Points from `from` to `to` (excluding `from`, ending exactly on `to`) and
-/// the pause after each: a quadratic curve with a sideways bow, eased in
-/// and out, its step count growing with the distance.
-pub fn path(from: (f64, f64), to: (f64, f64)) -> Vec<((f64, f64), Duration)> {
-    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
-    let distance = (dx * dx + dy * dy).sqrt();
-    if distance < 1.0 {
-        return vec![(to, Duration::from_millis(8))];
-    }
-    let steps = ((distance / 25.0).ceil() as usize).clamp(4, 40);
-    // A control point off the straight line, so the path bows a little.
-    let bow = between(-0.15, 0.15) * distance;
-    let (nx, ny) = (-dy / distance, dx / distance);
-    let control = (
-        from.0 + dx * 0.5 + nx * bow,
-        from.1 + dy * 0.5 + ny * bow,
-    );
-    // Total duration roughly follows Fitts' law, 120-700 ms.
-    let total = (90.0 + 110.0 * (distance / 8.0 + 1.0).log2()).clamp(120.0, 700.0);
-    (1..=steps)
-        .map(|i| {
-            let t = i as f64 / steps as f64;
-            let e = t * t * (3.0 - 2.0 * t); // smoothstep: slow, fast, slow
-            let u = 1.0 - e;
-            let point = if i == steps {
-                to
-            } else {
-                (
-                    u * u * from.0 + 2.0 * u * e * control.0 + e * e * to.0,
-                    u * u * from.1 + 2.0 * u * e * control.1 + e * e * to.1,
-                )
-            };
-            let pause = (total / steps as f64 * between(0.8, 1.2)).max(8.0);
-            (point, Duration::from_micros((pause * 1000.0) as u64))
-        })
+/// A planned click: the path to the point, the point, the button hold.
+pub struct ClickPlan {
+    /// Waypoints after the start, each with the pause before it is sent.
+    pub path: Vec<((f64, f64), Duration)>,
+    pub point: (f64, f64),
+    pub hold: Duration,
+}
+
+fn ms(value: f64) -> Duration {
+    Duration::from_micros((value.max(0.0) * 1000.0) as u64)
+}
+
+fn waypoints(path: Vec<Waypoint>) -> Vec<((f64, f64), Duration)> {
+    // The first waypoint is the start itself; only a path of one point (a
+    // move under a pixel) has nothing else to send.
+    let skip = usize::from(path.len() > 1);
+    path.into_iter()
+        .skip(skip)
+        .map(|w| ((w.x, w.y), ms(w.dt_ms)))
         .collect()
 }
 
-/// How long the button stays down in a click.
-pub fn hold() -> Duration {
-    Duration::from_millis(between(55.0, 130.0) as u64)
+/// Plan a click on the `w` x `h` box centred at `centre`, from `from`.
+pub fn plan_click(tab: &Tab, from: (f64, f64), centre: (f64, f64), w: f64, h: f64) -> ClickPlan {
+    let hand = hand(tab);
+    let n = next_act();
+    let point = human::landing_point(
+        &mut Rng::new(hand.seed, &format!("land:{n}")),
+        centre.0,
+        centre.1,
+        w.max(1.0),
+        h.max(1.0),
+    );
+    let path = human::plan_path(
+        &mut Rng::new(hand.seed, &format!("move:{n}")),
+        from,
+        point,
+        &hand.style,
+        w.min(h).max(1.0),
+    );
+    ClickPlan {
+        path: waypoints(path),
+        point,
+        hold: ms(hand.persona.click_dwell_ms(n)),
+    }
 }
 
-/// How long a key stays down.
-pub fn key_hold() -> Duration {
-    Duration::from_millis(between(30.0, 90.0) as u64)
+/// Per-character `(hold, gap)` for `text`, from the session's typist.
+pub fn plan_typing(tab: &Tab, text: &str) -> Vec<(Duration, Duration)> {
+    hand(tab)
+        .persona
+        .plan_typing(text, next_act())
+        .into_iter()
+        .map(|(hold, gap)| (ms(hold), ms(gap)))
+        .collect()
 }
 
-/// The gap before the next key; a little longer after a space or
-/// punctuation, as typing goes.
-pub fn key_gap(previous: char) -> Duration {
-    let base = between(45.0, 140.0);
-    let extra = if previous == ' ' || previous.is_ascii_punctuation() {
-        between(20.0, 120.0)
-    } else {
-        0.0
-    };
-    Duration::from_millis((base + extra) as u64)
+/// Pixels one wheel notch scrolls (Chromium's default for a line-based
+/// wheel). A real wheel reports fixed notches, so the delta is not jittered;
+/// the rhythm is.
+pub const NOTCH_PX: f64 = 100.0;
+
+/// The wheel events for scrolling `dy` pixels: `(delta, pause before)`.
+/// Notches come in flicks of a few, close together, with a longer pause
+/// between flicks, as a finger rolls a wheel. The last notch carries the
+/// remainder so the total is exact.
+pub fn plan_scroll(tab: &Tab, dy: f64) -> Vec<(f64, Duration)> {
+    let hand = hand(tab);
+    let r = &mut Rng::new(hand.seed, &format!("scroll:{}", next_act()));
+    let sign = dy.signum();
+    let mut left = dy.abs();
+    let mut out = Vec::new();
+    let mut in_flick = 0u32;
+    let mut flick = r.randint(2, 6);
+    while left > 0.5 {
+        let delta = left.min(NOTCH_PX);
+        let pause = if out.is_empty() {
+            r.uniform(40.0, 140.0)
+        } else if in_flick < flick {
+            r.log_normal(38.0, 0.35)
+        } else {
+            in_flick = 0;
+            flick = r.randint(2, 6);
+            r.log_normal(260.0, 0.45)
+        };
+        in_flick += 1;
+        out.push((sign * delta, ms(pause)));
+        left -= delta;
+    }
+    out
 }
 
 /// The `Input.dispatchKeyEvent` key/code/keyCode of a typed character, for

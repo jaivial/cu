@@ -503,6 +503,8 @@ pub fn launch_browser(data: &Path, cdp_port: u16, policy: &BrowserPolicy) -> Res
 /// How often DevTools is probed while a browser is coming up. A loopback
 /// connect is a few microseconds, so this is pure responsiveness, not load.
 const CDP_POLL_INTERVAL: Duration = Duration::from_millis(2);
+/// Longest a loopback DevTools connect may take.
+const CDP_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 /// How long to wait for a DevTools HTTP response before using what arrived.
 const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum accepted request head and body. Guards against unbounded buffering.
@@ -2469,6 +2471,17 @@ fn dispose_context(cdp_port: u16, browser_context: &str) -> Result<(), String> {
     .map(|_| ())
 }
 
+/// The name of the context `tab` is the tab of, if it is one.
+pub fn context_of(tab: &Tab) -> Option<String> {
+    let target = tab.target.as_ref()?;
+    contexts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|((port, _), c)| *port == tab.cdp_port && &c.target == target)
+        .map(|((_, name), _)| name.clone())
+}
+
 /// Target ids that belong to a named context, so the default tab is never
 /// mistaken for one of them.
 fn context_targets(cdp_port: u16) -> Vec<String> {
@@ -2876,7 +2889,14 @@ fn read_frame(stream: &mut TcpStream, limit: usize) -> Result<Vec<u8>, String> {
 /// browser that kept the socket open, and the daemon stalled on its first
 /// navigate.
 pub fn http_get(address: &str, path: &str) -> Result<String, String> {
-    let mut stream = TcpStream::connect(address).map_err(|e| e.to_string())?;
+    // A bounded connect: a SYN dropped while the browser's small DevTools
+    // backlog is full (the start-up poll) otherwise sits in the kernel's
+    // retransmit backoff for up to two minutes, and the launch thread with it.
+    let mut stream = match address.parse::<std::net::SocketAddr>() {
+        Ok(addr) => TcpStream::connect_timeout(&addr, CDP_CONNECT_TIMEOUT),
+        Err(_) => TcpStream::connect(address),
+    }
+    .map_err(|e| e.to_string())?;
     let _ = stream.set_read_timeout(Some(CDP_HTTP_TIMEOUT));
     write!(
         stream,
