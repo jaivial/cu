@@ -7,6 +7,7 @@ pub mod input;
 pub mod policy;
 pub mod scheduler;
 pub mod server;
+pub mod session;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 

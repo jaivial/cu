@@ -250,6 +250,8 @@ pub fn spawn_browser_thread(
                         info.as_deref(),
                         launched.elapsed(),
                     );
+                    restore_cookies(cdp_port, &data.join("profiles/default"));
+                    observe_identity(cdp_port);
                 }
                 Err(e) => {
                     crate::diagnostics::record_failure(&e);
@@ -262,6 +264,47 @@ pub fn spawn_browser_thread(
             browser.mark_failed(e)
         }
     })
+}
+
+/// Put the cookies a loaded session captured back into the browser.
+fn restore_cookies(cdp_port: u16, profile: &Path) {
+    let Some(cookies) = crate::session::take_pending_cookies(profile) else {
+        return;
+    };
+    if let Err(e) = cdp_browser_command(
+        cdp_port,
+        "Storage.setCookies",
+        &format!("{{\"cookies\":{cookies}}}"),
+    )
+    .and_then(|reply| match reply.contains("\"error\":{") {
+        true => Err(json_value(&reply, "message").unwrap_or(reply)),
+        false => Ok(()),
+    }) {
+        eprintln!("cu: could not restore the saved session's cookies: {e}");
+    }
+}
+
+/// Read back, from cu's isolated world of the default tab, what a page sees
+/// of the identity (language, zone, platform, viewport), and note any
+/// disagreement with what the profile asked for.
+fn observe_identity(cdp_port: u16) {
+    let tab = Tab::default_for(cdp_port);
+    let mut cmd = |m: &str, p: &str| tab.command(m, p);
+    let observed = crate::execution::main_frame(&mut cmd)
+        .and_then(|frame| {
+            crate::execution::context_fragment(&mut cmd, crate::execution::World::Isolated, &frame)
+        })
+        .and_then(|fragment| {
+            cmd(
+                "Runtime.evaluate",
+                &crate::execution::evaluate_params(crate::session::OBSERVE_JS, &fragment, false),
+            )
+        })
+        .ok()
+        .and_then(|reply| evaluated_string(&reply));
+    if let Some(observed) = observed {
+        crate::session::record_observed(&observed);
+    }
 }
 
 /// One browser-level DevTools connection held for the daemon's whole life.
@@ -412,7 +455,18 @@ fn clear_stale_locks(data: &Path) {
 /// else and every navigate/screenshot failed with "connection refused".
 pub fn launch_browser(data: &Path, cdp_port: u16, policy: &BrowserPolicy) -> Result<Child, String> {
     clear_stale_locks(data);
-    let args = policy.args(&data.join("profiles/default"), cdp_port);
+    let profile = data.join("profiles/default");
+    let mut args = policy.args(&profile, cdp_port);
+    // The profile's identity (locale, time zone, window), from the host and
+    // stable across restarts; flags go before the start URL.
+    let (identity, notes) = crate::session::Identity::load_or_create(&profile);
+    let start_url = args.pop();
+    args.extend(identity.args(policy.headless));
+    args.extend(start_url);
+    for note in &notes {
+        eprintln!("cu: identity: {note}");
+    }
+    crate::session::set_current(&identity, notes);
     crate::diagnostics::record_launch(policy, &args);
     eprintln!(
         "cu: launching {} -> {} ({} mode, {})",
@@ -429,6 +483,7 @@ pub fn launch_browser(data: &Path, cdp_port: u16, policy: &BrowserPolicy) -> Res
     );
     let child = Command::new(&policy.executable)
         .args(&args)
+        .envs(identity.env())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -804,43 +859,51 @@ pub fn route(
                     "{\"error\":\"invalid session name\"}".into(),
                 );
             }
-            let (src, dest) = if load {
-                (
-                    state.data_dir.join("sessions").join(name),
-                    state.data_dir.join("profiles/default"),
-                )
-            } else {
-                (
-                    state.data_dir.join("profiles/default"),
-                    state.data_dir.join("sessions").join(name),
-                )
-            };
+            let profile = state.data_dir.join("profiles/default");
+            let sessions = state.data_dir.join("sessions");
             // The browser owns the live profile and rewrites it constantly, so
             // step away from the page first and let the copy settle.
-            if !load {
+            let browser_up = state.browser.is_ready();
+            let mut live_cookies = None;
+            if !load && browser_up {
                 let _ = cdp_command(state.cdp_port, "Page.navigate", "{\"url\":\"about:blank\"}");
+                live_cookies = cdp_browser_command(state.cdp_port, "Storage.getCookies", "{}")
+                    .ok()
+                    .and_then(|reply| json_array(&reply, "cookies"));
             }
-            let outcome = copy_dir(&src, &dest);
-            if let Err(e) = &outcome {
-                return (
-                    "400 Bad Request",
-                    "application/json",
-                    format!("{{\"error\":\"{}\"}}", json_escape(e)),
-                );
+            // Encrypted at rest (see `crate::session`); a plain directory
+            // saved before encryption still loads.
+            let outcome = if load {
+                crate::session::load(&profile, &sessions, name)
+            } else {
+                crate::session::save(&profile, &sessions, name, live_cookies.as_deref())
+            };
+            // A load under a running browser: its cookie jar is live, so the
+            // saved cookies go straight into it (otherwise at the next launch).
+            if load && browser_up && outcome.is_ok() {
+                restore_cookies(state.cdp_port, &profile);
             }
+            let storage = match outcome {
+                Ok(storage) => storage,
+                Err(e) => {
+                    return (
+                        "400 Bad Request",
+                        "application/json",
+                        format!("{{\"error\":{}}}", json_string(&e)),
+                    );
+                }
+            };
             // A note for the agent, without any secret: which session is live.
             let _ = fs::write(
-                state
-                    .data_dir
-                    .join("sessions")
-                    .join(format!("{name}.current")),
+                sessions.join(format!("{name}.current")),
                 if load { "loaded\n" } else { "saved\n" },
             );
-            if load {
-                ("200 OK", "application/json", "{\"loaded\":true}".into())
-            } else {
-                ("200 OK", "application/json", "{\"saved\":true}".into())
-            }
+            let verb = if load { "loaded" } else { "saved" };
+            (
+                "200 OK",
+                "application/json",
+                format!("{{\"{verb}\":true,\"storage\":\"{storage}\"}}"),
+            )
         }
         _ => (
             "404 Not Found",

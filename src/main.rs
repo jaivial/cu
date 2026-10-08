@@ -185,14 +185,17 @@ fn start(args: &[String]) -> Result<(), String> {
     // Chromium refuses a relative download directory, so the path handed to
     // the browser must be absolute whatever way `cu` was started.
     let data = fs::canonicalize(&data).unwrap_or(data);
+    let cdp_port = cdp_port_from_env().unwrap_or(DEFAULT_CDP_PORT);
+    // One daemon per profile: a second one would clear the first one's
+    // browser locks and overwrite its server.json.
+    cu::session::claim_owner(&data, port, cdp_port)?;
+    let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| e.to_string())?;
     let token = server::random_token();
     fs::write(
         data.join("server.json"),
         format!("{{\"port\":{port},\"token\":\"{token}\"}}\n"),
     )
     .map_err(|e| e.to_string())?;
-    let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| e.to_string())?;
-    let cdp_port = cdp_port_from_env().unwrap_or(DEFAULT_CDP_PORT);
     // Listen and publish the token before the browser is up: `cu start` then
     // returns in single-digit milliseconds instead of blocking ~0.5 s on
     // Chromium, and the browser warms up while the agent reads its first tool
