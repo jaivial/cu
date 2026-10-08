@@ -189,6 +189,12 @@ cu does not solve, click through or evade challenges; it reports them and stops.
 
 Every helper cu runs in a page (snapshot walk, ref registry, text read, settle wait, screenshot measure, challenge probe) evaluates in cu's own isolated world of the frame: a separate JavaScript global over the same DOM. The page's scripts do not see `window.__cu`, cannot observe the evaluations and cannot shadow the built-ins the helpers use; cu never sends `Runtime.enable`. The page's main world is used only for the batch's no-op barrier. `CU_HELPER_WORLD=main` puts the main-document helpers back in the page's world, if a page ever needs it.
 
+### Out-of-process iframes, popups and workers
+
+With site isolation on (the compatibility profile) a cross-site iframe is rendered by another process: it is missing from the page's frame tree and used to vanish from snapshots and text without a word. cu now finds those out-of-process iframes as DevTools targets (`type: iframe`, nested ones by `parentId`), walks each in cu's isolated world of its own process -- the same helpers, the same ref bands, the page still never sees `__cu` -- and acts on their refs through that target (focus, type, click; the click point is translated through every owning iframe element, whichever process holds it), in instant and paced input alike. In fast-test, where those frames share the page's process, nothing changes.
+
+The daemon's browser-level connection also turns on target discovery (observation only; nothing is attached to pages or workers): `cu targets` (`GET /v1/targets`) lists live pages, iframe targets and dedicated/shared/service workers with their origin+path, opener and context, plus lifetime totals; `cu tabs` names the tab that opened each popup (`opener`), and `cu diagnostics` carries the live counts. A browser-level `Target.setAutoAttach` was tried and only attaches top-level pages; reaching frames and workers that way would mean holding a session on every page for its whole life.
+
 ### Per-origin budgets
 
 Every navigation cu starts (`cu navigate`, `navigate` actions in a batch) takes a slot on its origin first:

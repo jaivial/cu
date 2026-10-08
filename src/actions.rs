@@ -163,6 +163,63 @@ pub fn key_event(key: &str) -> Option<(&'static str, &'static str, u32, &'static
     })
 }
 
+/// Evaluate `expression` in cu's isolated world of `frame`, inside the
+/// out-of-process iframe `target`: the same world name, so the registry its
+/// snapshot installed is found. A script `{"error":...}` becomes an `Err`.
+fn eval_on(target: &Tab, frame: &str, expression: &str) -> Result<String, String> {
+    let context = crate::execution::isolated_context(&mut |m, p| target.command(m, p), frame)?;
+    let reply = target.command(
+        "Runtime.evaluate",
+        &format!(
+            "{{\"expression\":{},\"contextId\":{context},\"returnByValue\":true}}",
+            json_string(expression)
+        ),
+    )?;
+    if reply.contains("\"exceptionDetails\"") {
+        return Err(json_string_value(&reply, "description")
+            .unwrap_or_else(|| "script failed in the frame".into()));
+    }
+    let value = evaluated_string(&reply).unwrap_or_default();
+    match json_string_value(&value, "error") {
+        Some(error) => Err(error),
+        None => Ok(value),
+    }
+}
+
+/// Top-left of `child`'s iframe element inside `owner` (an out-of-process
+/// iframe target), scrolled into view first.
+fn owner_offset(owner: &Tab, child: &str) -> Result<(f64, f64), String> {
+    owner.command("DOM.enable", "{}")?;
+    let reply = owner.command(
+        "DOM.getFrameOwner",
+        &format!("{{\"frameId\":{}}}", json_string(child)),
+    )?;
+    let backend = json_value(&reply, "backendNodeId")
+        .ok_or_else(|| "iframe element not found; take a new snapshot".to_string())?;
+    let resolved = owner.command(
+        "DOM.resolveNode",
+        &format!("{{\"backendNodeId\":{backend}}}"),
+    )?;
+    let object = json_string_value(&resolved, "objectId")
+        .ok_or_else(|| "iframe element is gone; take a new snapshot".to_string())?;
+    let rect = owner.command(
+        "Runtime.callFunctionOn",
+        &format!(
+            "{{\"objectId\":{},\"functionDeclaration\":{},\"returnByValue\":true}}",
+            json_string(&object),
+            json_string(SCROLL_AND_RECT)
+        ),
+    )?;
+    let value =
+        evaluated_string(&rect).ok_or_else(|| "iframe position unknown; take a new snapshot".to_string())?;
+    let num = |k: &str| {
+        json_value(&value, k)
+            .and_then(|v| v.parse::<f64>().ok())
+            .ok_or_else(|| "could not locate the iframe".to_string())
+    };
+    Ok((num("x")?, num("y")?))
+}
+
 /// Where to click: the centre of an element's box and the box size.
 #[derive(Clone, Copy)]
 struct Target {
@@ -492,8 +549,21 @@ impl Page {
     /// Call a registry helper in the frame that owns `reference`, or explain
     /// that the page has no refs yet.
     fn registry_for(&mut self, reference: &str, call: &str) -> Result<String, String> {
+        let expression = format!(
+            "{REGISTRY}?{REGISTRY}.{call}:JSON.stringify({{error:'this page has no refs yet; take a snapshot first'}})"
+        );
+        if let Some((frame, target)) = self.remote_frame(reference) {
+            return eval_on(&target, &frame, &expression);
+        }
         let context = self.enter(reference)?;
         self.registry_in(context, call)
+    }
+
+    /// The frame of `reference` and the out-of-process iframe target that
+    /// renders it, when it is not in the page's own process (site isolation).
+    fn remote_frame(&self, reference: &str) -> Option<(String, Tab)> {
+        let frame = server::frame_for_ref(&self.tab, reference)?;
+        server::target_for_frame(&self.tab, &frame).map(|t| (frame, t))
     }
 
     fn registry_in(&mut self, context: Option<i64>, call: &str) -> Result<String, String> {
@@ -578,14 +648,18 @@ impl Page {
     /// coordinates the mouse events are dispatched in.
     fn locate(&mut self, reference: &str, hit_test: bool) -> Result<Target, String> {
         let subframe = self.subframe_of(reference);
-        let context = match &subframe {
-            None => self.main_world()?,
-            Some(frame) => Some(self.world(frame)?),
+        let value = if self.remote_frame(reference).is_some() {
+            self.registry_for(reference, &format!("locate({},{hit_test})", json_string(reference)))?
+        } else {
+            let context = match &subframe {
+                None => self.main_world()?,
+                Some(frame) => Some(self.world(frame)?),
+            };
+            self.registry_in(
+                context,
+                &format!("locate({},{hit_test})", json_string(reference)),
+            )?
         };
-        let value = self.registry_in(
-            context,
-            &format!("locate({},{hit_test})", json_string(reference)),
-        )?;
         let x = json_value(&value, "x").and_then(|v| v.parse().ok());
         let y = json_value(&value, "y").and_then(|v| v.parse().ok());
         let (mut x, mut y) = x
@@ -626,10 +700,12 @@ impl Page {
     fn frame_offset(&mut self, frame_id: &str) -> Result<(f64, f64), String> {
         let mut chain = vec![frame_id.to_string()];
         let mut current = frame_id.to_string();
+        let remote = server::oopif_frames(&self.tab);
         loop {
             let parent = self
                 .frames
                 .iter()
+                .chain(remote.iter())
                 .find(|f| f.id == current)
                 .and_then(|f| f.parent.clone())
                 .ok_or_else(|| {
@@ -647,6 +723,21 @@ impl Page {
         }
         let mut offset = (0.0f64, 0.0f64);
         for child in chain.iter().rev() {
+            // The owner element lives in the parent's document: in the page's
+            // process, or in the out-of-process iframe that embeds `child`.
+            let parent = self
+                .frames
+                .iter()
+                .chain(remote.iter())
+                .find(|f| f.id == *child)
+                .and_then(|f| f.parent.clone())
+                .unwrap_or_default();
+            if let Some(owner_target) = server::target_for_frame(&self.tab, &parent) {
+                let (dx, dy) = owner_offset(&owner_target, child)?;
+                offset.0 += dx;
+                offset.1 += dy;
+                continue;
+            }
             let owner = self.conn().call(
                 "DOM.getFrameOwner",
                 &format!("{{\"frameId\":{}}}", json_string(child)),
@@ -985,7 +1076,8 @@ impl Page {
             self.conn().call(method, params)
         });
         self.frames = frames;
-        let (text, pairs) = walked?;
+        let (mut text, mut pairs) = walked?;
+        server::walk_oopifs(&tab, &mut text, &mut pairs);
         server::note_ref_frames(&tab, &pairs);
         Ok(text)
     }
