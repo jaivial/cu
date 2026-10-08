@@ -6,6 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use cu::policy::{BrowserMode, BrowserPolicy};
 use cu::server::{self, AppState};
 
 const DEFAULT_PORT: u16 = 8787;
@@ -38,6 +39,7 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("start") => start(&args[1..]),
         Some("status") => request("GET", "/v1/status", None).map(|s| println!("{s}")),
+        Some("diagnostics") => request("GET", "/v1/diagnostics", None).map(|s| println!("{s}")),
         Some("navigate") => match args.get(1) {
             Some(url) => request(
                 "POST",
@@ -128,7 +130,7 @@ fn main() {
 }
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR]\n  cu status\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat]\n  cu status\n  cu diagnostics\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
     );
 }
 
@@ -139,6 +141,7 @@ fn cdp_port_from_env() -> Option<u16> {
 
 fn start(args: &[String]) -> Result<(), String> {
     let mut port = DEFAULT_PORT;
+    let mut mode = BrowserMode::from_env()?;
     let mut data = PathBuf::from(env::var_os("CU_DATA_DIR").unwrap_or_else(|| ".cu".into()));
     let mut i = 0;
     while i < args.len() {
@@ -155,10 +158,18 @@ fn start(args: &[String]) -> Result<(), String> {
                 i += 1;
                 data = PathBuf::from(args.get(i).ok_or("--data needs a value")?);
             }
+            "--mode" => {
+                i += 1;
+                mode = BrowserMode::parse(args.get(i).ok_or("--mode needs fast or compat")?)?;
+            }
+            "--compat" => mode = BrowserMode::Compatibility,
             flag => return Err(format!("unknown option {flag}")),
         }
         i += 1;
     }
+    // Decided before anything is written, so a compatibility start that has
+    // no full browser to run fails here instead of after the daemon is up.
+    let policy = BrowserPolicy::resolve(mode)?;
     fs::create_dir_all(data.join("profiles/default")).map_err(|e| e.to_string())?;
     fs::create_dir_all(data.join("sessions")).map_err(|e| e.to_string())?;
     fs::create_dir_all(data.join("downloads")).map_err(|e| e.to_string())?;
@@ -179,7 +190,7 @@ fn start(args: &[String]) -> Result<(), String> {
     // result. Actions that need the browser wait on the readiness signal.
     server::exit_on_signal(cdp_port);
     let browser = server::BrowserState::new();
-    server::spawn_browser_thread(data.clone(), cdp_port, Arc::clone(&browser));
+    server::spawn_browser_thread(data.clone(), cdp_port, Arc::clone(&browser), policy);
     eprintln!("cu listening on http://127.0.0.1:{port}; browser DevTools on 127.0.0.1:{cdp_port}");
     let state = Arc::new(AppState {
         data_dir: data,

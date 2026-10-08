@@ -1,5 +1,7 @@
 //! Minimal client SDK for a running `cu` session server.
 pub mod actions;
+pub mod diagnostics;
+pub mod policy;
 pub mod server;
 use std::io::{Read, Write};
 use std::net::TcpStream;

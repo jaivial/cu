@@ -1,6 +1,5 @@
 //! Loopback HTTP server for `cu`: request parsing, routing and the browser bridge.
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -10,7 +9,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::policy::BrowserPolicy;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -195,8 +196,9 @@ pub fn spawn_browser_thread(
     data: PathBuf,
     cdp_port: u16,
     browser: Arc<BrowserState>,
+    policy: BrowserPolicy,
 ) -> JoinHandle<()> {
-    thread::spawn(move || match launch_browser(&data, cdp_port) {
+    thread::spawn(move || match launch_browser(&data, cdp_port, &policy) {
         Ok(mut child) => {
             let _ = child.stdin.take();
             // Recorded before readiness: a launch that times out (or a
@@ -210,6 +212,7 @@ pub fn spawn_browser_thread(
             // and declaring the daemon browserless for ever is worse than
             // waiting. While the child lives it is still coming up, so the
             // watch is repeated -- up to five windows, then it is a failure.
+            let launched = Instant::now();
             let mut result = wait_for_browser(cdp_port, BROWSER_START_TIMEOUT, Some(&mut child));
             let mut windows = 1;
             while result.is_err() && windows < 5 {
@@ -236,12 +239,28 @@ pub fn spawn_browser_thread(
                     // `spawn_browser_control`), before readiness so the first
                     // click is already covered.
                     spawn_browser_control(cdp_port, &data);
-                    browser.mark_ready()
+                    browser.mark_ready();
+                    // After readiness: the record is for the log and
+                    // `/v1/diagnostics`, and must not delay the first action.
+                    let version = http_get(&format!("127.0.0.1:{cdp_port}"), "/json/version").ok();
+                    let info = cdp_browser_command(cdp_port, "SystemInfo.getInfo", "{}").ok();
+                    crate::diagnostics::record_ready(
+                        &data,
+                        version.as_deref(),
+                        info.as_deref(),
+                        launched.elapsed(),
+                    );
                 }
-                Err(e) => browser.mark_failed(e),
+                Err(e) => {
+                    crate::diagnostics::record_failure(&e);
+                    browser.mark_failed(e)
+                }
             }
         }
-        Err(e) => browser.mark_failed(e),
+        Err(e) => {
+            crate::diagnostics::record_failure(&e);
+            browser.mark_failed(e)
+        }
     })
 }
 
@@ -383,84 +402,43 @@ fn clear_stale_locks(data: &Path) {
     }
 }
 
-/// Flags every browser is launched with.
-///
-/// An agent's browser needs pages, DevTools and the profile -- not updates,
-/// sync, translation, crash upload, audio or a GPU process. Each of those is a
-/// process or a background timer, and on a loaded machine they compete with
-/// the page for CPU. Site isolation is relaxed so same-site frames share one
-/// renderer, which is most of the memory saving.
-pub const BROWSER_ARGS: &[&str] = &[
-    "--remote-allow-origins=*",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-dev-shm-usage",
-    // Background work an agent never asked for.
-    "--disable-background-networking",
-    "--disable-component-update",
-    "--disable-sync",
-    "--disable-default-apps",
-    "--disable-extensions",
-    "--disable-breakpad",
-    "--disable-crash-reporter",
-    "--metrics-recording-only",
-    "--no-pings",
-    "--mute-audio",
-    "--password-store=basic",
-    // Rendering: software raster. (`--in-process-gpu` would also drop the GPU
-    // process, but it crashes chrome-headless-shell on cross-document
-    // navigation, so it is not used.)
-    "--disable-gpu",
-    // The network service as a thread of the browser, not a process.
-    "--enable-features=NetworkServiceInProcess",
-    // Fewer processes: same-site frames share a renderer.
-    "--disable-site-isolation-trials",
-    "--renderer-process-limit=4",
-    "--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,\
-     AutofillServerCommunication,CalculateNativeWinOcclusion,InterestFeedContentSuggestions,\
-     CertificateTransparencyComponentUpdater,LensOverlay,PaintHolding,\
-     SpareRendererForSitePerProcess,BackForwardCache",
-];
-
-/// Launch the persistent Chromium that owns `data/profiles/default`.
+/// Launch the persistent browser that owns `data/profiles/default`, with the
+/// executable, flags and headless mode `policy` decided (see
+/// [`crate::policy`]).
 ///
 /// The DevTools port must match the port the daemon was configured with:
 /// `launch_browser` used to hard-code 9222, so a daemon started with
 /// `--port`/`CU_CDP_PORT` pointed at a browser that was listening somewhere
 /// else and every navigate/screenshot failed with "connection refused".
-///
-/// Browsers are launched headless because agents usually run without a
-/// display; set `CU_HEADLESS=0` (or `--show`) to attach one instead.
-pub fn launch_browser(data: &Path, cdp_port: u16) -> Result<Child, String> {
-    let binary = env::var("CU_BROWSER").unwrap_or_else(|_| "chromium".into());
-    let headless = env::var("CU_HEADLESS")
-        .ok()
-        .map(|v| v != "0")
-        .unwrap_or(true);
+pub fn launch_browser(data: &Path, cdp_port: u16, policy: &BrowserPolicy) -> Result<Child, String> {
     clear_stale_locks(data);
-    let mut command = Command::new(binary);
-    command
-        .arg(format!("--remote-debugging-port={cdp_port}"))
-        .args(BROWSER_ARGS)
-        // One argument: Chromium only parses `--user-data-dir=PATH` here, and
-        // treats a separate PATH as a second target ("Multiple targets are not
-        // supported in headless mode", exit 13).
-        .arg(format!(
-            "--user-data-dir={}",
-            data.join("profiles/default").display()
-        ))
-        .arg("about:blank")
+    let args = policy.args(&data.join("profiles/default"), cdp_port);
+    crate::diagnostics::record_launch(policy, &args);
+    eprintln!(
+        "cu: launching {} -> {} ({} mode, {})",
+        policy.executable.display(),
+        policy.resolved.display(),
+        policy.mode.name(),
+        if policy.headless_shell {
+            "headless-shell"
+        } else if policy.headless {
+            "headless=new"
+        } else {
+            "headful"
+        }
+    );
+    let child = Command::new(&policy.executable)
+        .args(&args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null());
-    if headless {
-        command.arg("--headless=new");
-    }
-    // Chromium writes its startup diagnostics (including "no display") to
-    // stderr; keep it so a browser that dies at once can be diagnosed.
-    let child = command
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("could not start Chromium (set CU_BROWSER): {e}"))?;
+        .map_err(|e| {
+            format!(
+                "could not start {} (set CU_BROWSER): {e}",
+                policy.executable.display()
+            )
+        })?;
     // A browser that exits immediately (no display, bad binary) is reported by
     // `wait_for_browser` on the first poll instead of after a fixed sleep here,
     // which used to cost every start 300 ms whether or not it was needed.
@@ -641,15 +619,14 @@ pub fn route(
             | ("GET", "/v1/text")
     ) || (method == "DELETE"
         && (path.starts_with("/v1/contexts/") || path.starts_with("/v1/tabs/")));
-    if needs_browser {
-        if let Err(error) = wait_until_ready(state) {
+    if needs_browser
+        && let Err(error) = wait_until_ready(state) {
             return (
                 "503 Service Unavailable",
                 "application/json",
                 format!("{{\"error\":\"{}\"}}", json_escape(&error)),
             );
         }
-    }
     // `?context=NAME` runs a page action in an isolated browser context of
     // the same browser; `?tab=ID` runs it in another real tab (a popup, a
     // window a click opened). They are two ways of picking a page, so giving
@@ -738,6 +715,10 @@ pub fn route(
                 ),
             }
         }
+        // Which browser really runs, in which mode, and how the protocol is
+        // used. Answers before the browser is up too (`browser` is then the
+        // launch decision without a version yet).
+        ("GET", "/v1/diagnostics") => ("200 OK", "application/json", crate::diagnostics::json()),
         ("GET", "/v1/status") => (
             "200 OK",
             "application/json",
@@ -1170,7 +1151,7 @@ where
 pub fn downloads_json(dir: &Path) -> String {
     let mut files: Vec<(SystemTime, String)> = Vec::new();
     collect_downloads(dir, None, &mut files, 0);
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
     format!(
         "{{\"downloads\":[{}]}}",
         files
@@ -2384,6 +2365,23 @@ impl CdpConnection {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         let message = format!("{{\"id\":{id},\"method\":\"{method}\",\"params\":{params}}}");
+        let started = Instant::now();
+        let reply = self.exchange(id, &message, observe);
+        crate::diagnostics::record_command(
+            method,
+            params,
+            started.elapsed(),
+            reply.as_ref().is_ok_and(|r| !r.contains("\"error\":{")),
+        );
+        reply
+    }
+
+    fn exchange(
+        &mut self,
+        id: u64,
+        message: &str,
+        observe: &mut dyn FnMut(&str),
+    ) -> Result<String, String> {
         self.stream
             .write_all(&encode_client_frame(message.as_bytes()))
             .map_err(|e| e.to_string())?;
@@ -2394,7 +2392,10 @@ impl CdpConnection {
             match message_id(&text) {
                 Some(got) if got == id => return Ok(text),
                 Some(_) => continue,
-                None => observe(&text),
+                None => {
+                    crate::diagnostics::record_event();
+                    observe(&text)
+                }
             }
         }
     }
@@ -2679,11 +2680,9 @@ pub fn http_get(address: &str, path: &str) -> Result<String, String> {
             let head = String::from_utf8_lossy(&buf[..end]);
             if let Some(len) =
                 header_value(&head, "content-length").and_then(|v| v.trim().parse::<usize>().ok())
-            {
-                if buf.len() >= end + len {
+                && buf.len() >= end + len {
                     break;
                 }
-            }
         }
         match stream.read(&mut chunk) {
             Ok(0) => break,
@@ -2896,9 +2895,8 @@ mod tests {
     #[test]
     fn json_strings_are_escaped_and_read_back() {
         let password = "quote\" backslash\\ newline\n";
-        assert_eq!(
-            json_string_value(&json_string(password), "unused").is_none(),
-            true
+        assert!(
+            json_string_value(&json_string(password), "unused").is_none()
         );
         assert_eq!(json_string_value(&json_string(password), ""), None);
         let encoded = format!("{{\"v\":{}}}", json_string(password));
@@ -3018,10 +3016,10 @@ mod snapshot_tests {
             "--disable-extensions",
             "--disable-background-networking",
         ] {
-            assert!(BROWSER_ARGS.contains(&flag), "{flag} missing");
+            assert!(crate::policy::FAST_TEST_ARGS.contains(&flag), "{flag} missing");
         }
         // One --disable-features: Chromium only honours the last one it sees.
-        let features: Vec<_> = BROWSER_ARGS
+        let features: Vec<_> = crate::policy::FAST_TEST_ARGS
             .iter()
             .filter(|a| a.starts_with("--disable-features="))
             .collect();

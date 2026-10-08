@@ -153,6 +153,15 @@ including a comparison with agent-browser and Playwright MCP.
 
 The browser executable defaults to `chromium`; set `CU_BROWSER` to an alternate binary. Browsers are launched headless, which is what an agent usually wants; set `CU_HEADLESS=0` to attach a display instead. `CU_DATA_DIR` changes the default data directory and `CU_CDP_PORT` the DevTools port (default `9222`). Do not expose this server beyond localhost without adding TLS and an access-control layer.
 
+### Browser mode: fast-test and compatibility
+
+`cu start` launches the browser in one of two profiles, chosen with `CU_MODE=fast|compat` or `cu start --mode fast|compat` (`--compat` for short):
+
+- **fast-test** (default): the light profile cu has always used. GPU, extensions, site isolation, background networking and a list of features are switched off to save start-up time, processes and memory. Meant for sites you own and test.
+- **compatibility**: a stock full Google Chrome or Chromium (Chrome is preferred when `CU_BROWSER` is unset) with only `--no-first-run`, `--no-default-browser-check` and `--password-store=basic`. Nothing is disabled and nothing is spoofed. A headless-shell build (`chrome-headless-shell`, Playwright's `headless_shell`) is refused in this mode, because it is a separate, older browser that no flag turns into the full one; headless runs use the full browser's `--headless=new`. For the most normal setup run headful (`CU_HEADLESS=0`) on a real display.
+
+The daemon logs the executable it spawned (and where the symlink points), the product version, the headless mode and the GL renderer, plus plain notes such as "the User-Agent says HeadlessChrome" or "software rendering". The same record is written to `DATA/browser.json` and served, with DevTools protocol counters (commands, errors, latency, main-world vs isolated evaluations, `Runtime.enable` calls -- which should stay 0), at `GET /v1/diagnostics` (`cu diagnostics`). These are observations about the setup; neither mode guarantees how a site will treat the browser.
+
 ## Login
 
 `POST /login` takes `username` and `password` form fields. The daemon types them into the page the browser is showing and submits the form, which is how the credentials reach the site without ever passing through an agent. The password is not written to disk, not logged and not included in the response; the reply only says whether it could be typed. Navigate to the sign-in page first, or the submission has nowhere to go.
