@@ -178,6 +178,7 @@ fn start(args: &[String]) -> Result<(), String> {
     // Decided before anything is written, so a compatibility start that has
     // no full browser to run fails here instead of after the daemon is up.
     let policy = BrowserPolicy::resolve(mode)?;
+    cu::scheduler::configure(cu::scheduler::Budget::for_mode(mode));
     fs::create_dir_all(data.join("profiles/default")).map_err(|e| e.to_string())?;
     fs::create_dir_all(data.join("sessions")).map_err(|e| e.to_string())?;
     fs::create_dir_all(data.join("downloads")).map_err(|e| e.to_string())?;

@@ -177,6 +177,19 @@ cu does not solve, click through or evade challenges; it reports them and stops.
 
 Every helper cu runs in a page (snapshot walk, ref registry, text read, settle wait, screenshot measure, challenge probe) evaluates in cu's own isolated world of the frame: a separate JavaScript global over the same DOM. The page's scripts do not see `window.__cu`, cannot observe the evaluations and cannot shadow the built-ins the helpers use; cu never sends `Runtime.enable`. The page's main world is used only for the batch's no-op barrier. `CU_HELPER_WORLD=main` puts the main-document helpers back in the page's world, if a page ever needs it.
 
+### Per-origin budgets
+
+Every navigation cu starts (`cu navigate`, `navigate` actions in a batch) takes a slot on its origin first:
+
+| | fast-test | compatibility | override |
+|---|---|---|---|
+| navigations in flight per origin | 16 | 2 | `CU_ORIGIN_CONCURRENCY` |
+| minimum gap between starts | 0 | 1000 ms | `CU_ORIGIN_INTERVAL_MS` |
+| automatic retries (429/503, transient network errors) | 0 | 2 | `CU_ORIGIN_RETRIES` (max 5) |
+| longest wait for a slot before failing | 30 s | 30 s | `CU_ORIGIN_MAX_WAIT_MS` |
+
+A 429/503 with `Retry-After` closes the origin until then (capped at one hour). A challenge, block or rate-limit page without the header backs the origin off exponentially (2 s, 4 s, ... up to 5 min), and a ready page resets it. Challenges and blocks are never retried automatically. A navigation that would have to wait longer than the max-wait fails at once with `429` and `retry_in_ms`, so the agent is never left blocking. The navigate reply adds `status`, `retries`, `queued_ms` and `origin_closed_ms` when they apply, and `GET /v1/diagnostics` lists every origin's state. Only the main document's status and `Retry-After` are read from the response; no other header and no cookie.
+
 ## Login
 
 `POST /login` takes `username` and `password` form fields. The daemon types them into the page the browser is showing and submits the form, which is how the credentials reach the site without ever passing through an agent. The password is not written to disk, not logged and not included in the response; the reply only says whether it could be typed. Navigate to the sign-in page first, or the submission has nowhere to go.

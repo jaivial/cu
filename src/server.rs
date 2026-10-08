@@ -776,61 +776,7 @@ pub fn route(
                     "{\"error\":\"url is required\"}".into(),
                 );
             }
-            match tab.command(
-                "Page.navigate",
-                &format!("{{\"url\":\"{}\"}}", json_escape(&url)),
-            ) {
-                Ok(result) => {
-                    // A navigation the browser could not perform answers with
-                    // `errorText` (`net::ERR_NAME_NOT_RESOLVED` and friends);
-                    // passing that on as a 200 hid a failed navigation from
-                    // the agent.
-                    if let Some(error) =
-                        json_string_value(&result, "errorText").filter(|e| !e.is_empty())
-                    {
-                        return (
-                            "502 Bad Gateway",
-                            "application/json",
-                            format!(
-                                "{{\"error\":{}}}",
-                                json_string(&format!("navigation failed: {error}"))
-                            ),
-                        );
-                    }
-                    // Do not hand back a half-loaded page, but never hang on a
-                    // stream that stays open for ever. Whether the wait ended
-                    // on a ready page or on the budget says `settled`.
-                    let (waited, settled) = wait_for_page_on(&tab, SETTLE_MAX);
-                    // A page that loaded is not necessarily the page asked
-                    // for: say what it is, and never call a defence page
-                    // (or an undecided one) a plain success.
-                    let challenge = if crate::challenge::enabled() {
-                        let assessment = crate::challenge::assess(
-                            |m, p| tab.command(m, p),
-                            crate::challenge::wait_budget(),
-                        );
-                        crate::challenge::record(&tab, &assessment);
-                        format!(",\"challenge\":{}", assessment.json())
-                    } else {
-                        String::new()
-                    };
-                    (
-                        "200 OK",
-                        "application/json",
-                        format!(
-                            "{{\"result\":{},\"settled_ms\":{},\"settled\":{}{challenge}}}",
-                            result.trim(),
-                            waited.as_millis(),
-                            settled
-                        ),
-                    )
-                }
-                Err(error) => (
-                    "502 Bad Gateway",
-                    "application/json",
-                    format!("{{\"error\":\"{}\"}}", json_escape(&error)),
-                ),
-            }
+            navigate_scheduled(&tab, &url)
         }
         ("GET", "/v1/screenshot") => screenshot(&tab, query(full_path)),
         // Act on snapshot refs. `/v1/act` takes a batch; `/v1/click` and
@@ -902,6 +848,164 @@ pub fn route(
             "{\"error\":\"not found\"}".into(),
         ),
     }
+}
+
+/// `POST /v1/navigate`: wait for the origin's budget, navigate, settle,
+/// assess, and retry a 429/503 or a transient network error within the
+/// budget (see [`crate::scheduler`]). A challenge or a block is never
+/// retried.
+fn navigate_scheduled(tab: &Tab, url: &str) -> (&'static str, &'static str, String) {
+    let refused = |r: crate::scheduler::Refused| ("429 Too Many Requests", "application/json", r.json());
+    let retries = crate::scheduler::budget().retries;
+    let mut attempt = 0;
+    loop {
+        let permit = match crate::scheduler::acquire(url) {
+            Ok(permit) => permit,
+            Err(r) => return refused(r),
+        };
+        let queued = permit.as_ref().map(|p| p.waited).unwrap_or_default();
+        let (result, document) = match navigate_observed(tab, url) {
+            Ok(pair) => pair,
+            Err(error) => {
+                return (
+                    "502 Bad Gateway",
+                    "application/json",
+                    format!("{{\"error\":\"{}\"}}", json_escape(&error)),
+                );
+            }
+        };
+        // A navigation the browser could not perform answers with
+        // `errorText` (`net::ERR_NAME_NOT_RESOLVED` and friends); passing
+        // that on as a 200 hid a failed navigation from the agent.
+        if let Some(error) = json_string_value(&result, "errorText").filter(|e| !e.is_empty()) {
+            if attempt < retries && crate::scheduler::transient(&error) {
+                attempt += 1;
+                drop(permit);
+                thread::sleep(crate::scheduler::retry_pause(attempt));
+                continue;
+            }
+            return (
+                "502 Bad Gateway",
+                "application/json",
+                format!(
+                    "{{\"error\":{}}}",
+                    json_string(&format!("navigation failed: {error}"))
+                ),
+            );
+        }
+        // Do not hand back a half-loaded page, but never hang on a stream
+        // that stays open for ever. Whether the wait ended on a ready page or
+        // on the budget says `settled`.
+        let (waited, settled) = wait_for_page_on(tab, SETTLE_MAX);
+        // A page that loaded is not necessarily the page asked for: say what
+        // it is, and never call a defence page (or an undecided one) a plain
+        // success.
+        let assessment = crate::challenge::enabled().then(|| {
+            let assessment =
+                crate::challenge::assess(|m, p| tab.command(m, p), crate::challenge::wait_budget());
+            crate::challenge::record(tab, &assessment);
+            assessment
+        });
+        let status = document.as_ref().map(|d| d.status).unwrap_or(0);
+        let state = assessment
+            .as_ref()
+            .map(|a| a.state)
+            .unwrap_or(if matches!(status, 429) {
+                crate::challenge::ChallengeState::RateLimited
+            } else {
+                crate::challenge::ChallengeState::Unknown
+            });
+        let closed = crate::scheduler::report(&crate::scheduler::Outcome {
+            url,
+            status,
+            retry_after: document.as_ref().and_then(|d| d.retry_after),
+            state,
+        });
+        drop(permit);
+        // Only a plain "slow down" is retried, and only if the wait fits the
+        // budget; `acquire` waits out the origin's closed window.
+        let retryable = matches!(status, 429 | 503)
+            && matches!(
+                state,
+                crate::challenge::ChallengeState::RateLimited
+                    | crate::challenge::ChallengeState::Unknown
+            );
+        if retryable && attempt < retries && closed <= crate::scheduler::budget().max_wait {
+            attempt += 1;
+            continue;
+        }
+        let mut extra = String::new();
+        if let Some(a) = &assessment {
+            extra.push_str(&format!(",\"challenge\":{}", a.json()));
+        }
+        if status != 0 {
+            extra.push_str(&format!(",\"status\":{status}"));
+        }
+        if attempt > 0 {
+            extra.push_str(&format!(",\"retries\":{attempt}"));
+        }
+        if !queued.is_zero() {
+            extra.push_str(&format!(",\"queued_ms\":{}", queued.as_millis()));
+        }
+        if !closed.is_zero() {
+            extra.push_str(&format!(",\"origin_closed_ms\":{}", closed.as_millis()));
+        }
+        return (
+            "200 OK",
+            "application/json",
+            format!(
+                "{{\"result\":{},\"settled_ms\":{},\"settled\":{}{extra}}}",
+                result.trim(),
+                waited.as_millis(),
+                settled
+            ),
+        );
+    }
+}
+
+/// `Page.navigate` on a connection that has `Network` on just for the
+/// navigation, so the main document's status and `Retry-After` are seen.
+/// Only those two values are kept from the response.
+fn navigate_observed(
+    tab: &Tab,
+    url: &str,
+) -> Result<(String, Option<crate::scheduler::DocumentResponse>), String> {
+    let mut connection = checkout(tab)?;
+    // Small buffers: the bodies are never fetched, only headers are needed.
+    let enabled = connection
+        .call(
+            "Network.enable",
+            "{\"maxTotalBufferSize\":0,\"maxResourceBufferSize\":0}",
+        )
+        .or_else(|_| {
+            connection = open_connection(tab)?;
+            connection.call(
+                "Network.enable",
+                "{\"maxTotalBufferSize\":0,\"maxResourceBufferSize\":0}",
+            )
+        });
+    let mut document = None;
+    let mut see = |event: &str| {
+        if let Some(d) = crate::scheduler::document_response(event) {
+            // The first document response is the main frame's (an iframe's
+            // arrives after the main document commits).
+            if document.is_none() {
+                document = Some(d);
+            }
+        }
+    };
+    let reply = connection.call_observed(
+        "Page.navigate",
+        &format!("{{\"url\":{}}}", json_string(url)),
+        &mut see,
+    );
+    if reply.is_ok() && enabled.is_ok() {
+        // The response event can trail the reply by a hair; one round trip
+        // drains what is already queued.
+        let _ = connection.call_observed("Network.disable", "{}", &mut see);
+        checkin(tab, connection);
+    }
+    Ok((reply?, document))
 }
 
 /// A one-action batch from a `/v1/click` or `/v1/type` body.
@@ -1543,7 +1647,7 @@ pub struct Frame {
 
 /// The object bound to `key` at the top of `input`, as a string slice.
 /// The mirror of [`json_array`] for objects.
-fn json_object<'a>(input: &'a str, key: &str) -> Option<&'a str> {
+pub fn json_object<'a>(input: &'a str, key: &str) -> Option<&'a str> {
     let needle = format!("\"{key}\"");
     let start = input.find(&needle)?.checked_add(needle.len())?;
     let rest = input[start..].trim_start().strip_prefix(':')?.trim_start();

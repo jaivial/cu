@@ -194,6 +194,12 @@ pub fn run_batch(tab: &Tab, batch: &Batch) -> Result<String, String> {
                         crate::challenge::wait_budget(),
                     );
                     crate::challenge::record(tab, &assessment);
+                    crate::scheduler::report(&crate::scheduler::Outcome {
+                        url: &assessment.url,
+                        status: assessment.status,
+                        retry_after: None,
+                        state: assessment.state,
+                    });
                     assessment
                 });
                 let mut line = format!(
@@ -379,6 +385,16 @@ impl Page {
                 false
             }
             Action::Navigate { url } => {
+                // The origin's budget applies inside a batch too; a closed
+                // origin fails the action rather than stalling the batch.
+                let _permit = crate::scheduler::acquire(url).map_err(|r| {
+                    format!(
+                        "{} is backing off ({}); retry in {} ms",
+                        r.origin,
+                        r.reason,
+                        r.retry_in.as_millis()
+                    )
+                })?;
                 let mut watch = NavWatch::new(&self.frame);
                 watch.started = true;
                 let reply = self.input(
