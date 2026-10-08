@@ -177,6 +177,12 @@ After every navigation (`cu navigate`, and any batch action that navigated) cu r
 - A batch stops after a navigation that lands on `human_required`, `blocked` or `rate_limited`, and names the action that was not run.
 - `cu challenge` (`GET /v1/challenge`) re-checks the current page on demand. `CU_CHALLENGE=0` turns the post-navigation check off for owned test sites.
 
+Vendor signals tuned against real challenge pages (captured once from public sites and replayed from an owned mock): Cloudflare's `_cf_chl_opt` config and `#challenge-error-text` (language-independent: the title is localised) and the `cf-mitigated: challenge` response header; DataDome's inline `dd` config before its frame exists -- `t:'bv'` block, `rt:'c'` CAPTCHA, `rt:'i'` device check (treated as an interstitial) -- and `x-datadome: protected` on an otherwise unmarked 4xx. The main document's status is now taken from its own response (the navigation's loader id), not the first document response seen.
+
+Batches observe the network around each `navigate` action too (`Network` on only for that navigation, bodies never buffered), so a batch navigation reports `status`, honours `Retry-After` (`origin_closed_ms`) and feeds the header hints to the probe, like `cu navigate`.
+
+`cu diagnostics` has a `challenge` block: assessments by state and vendor, `challenge_rate` (defence verdicts / assessments), `false_success_rate` (ready verdicts whose next check on the same tab and origin found a defence / ready verdicts -- a lower bound: only what a later check saw), and hand-offs cleared vs released. The gate's re-checks of a paused tab are not counted as new assessments.
+
 cu does not solve, click through or evade challenges; it reports them and stops.
 
 ### Helper isolation

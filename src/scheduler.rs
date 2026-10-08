@@ -353,6 +353,10 @@ pub struct DocumentResponse {
     pub frame_id: String,
     pub status: u16,
     pub retry_after: Option<Duration>,
+    /// Vendor signals a defence puts in the response headers themselves
+    /// (`cf-mitigated: challenge`, `x-datadome: protected`): names and
+    /// values of those two headers only, never cookies.
+    pub hints: Vec<String>,
 }
 
 /// A document response from one CDP event, if it is one.
@@ -371,7 +375,20 @@ pub fn document_response(event: &str) -> Option<DocumentResponse> {
         .iter()
         .find_map(|k| crate::server::json_string_value(headers, k))
         .and_then(|v| parse_retry_after(&v));
+    let header = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|k| crate::server::json_string_value(headers, k))
+    };
+    let mut hints = Vec::new();
+    if let Some(v) = header(&["cf-mitigated", "Cf-Mitigated", "CF-Mitigated"]) {
+        hints.push(format!("cf-mitigated: {}", v.to_ascii_lowercase()));
+    }
+    if let Some(v) = header(&["x-datadome", "X-Datadome", "X-DataDome"]) {
+        hints.push(format!("x-datadome: {}", v.to_ascii_lowercase()));
+    }
     Some(DocumentResponse {
+        hints,
         request_id: crate::server::json_string_value(event, "requestId").unwrap_or_default(),
         frame_id: crate::server::json_string_value(event, "frameId").unwrap_or_default(),
         status: crate::server::json_number(response, "status").unwrap_or(0.0) as u16,

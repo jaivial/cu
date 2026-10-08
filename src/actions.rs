@@ -180,6 +180,8 @@ pub struct Outcome {
     /// Set when the action opened a new window or tab (`Page.windowOpen`),
     /// so the agent knows to look at `GET /v1/tabs`.
     pub popup: bool,
+    /// What the network saw of the main document of a `navigate` action.
+    pub document: Option<crate::scheduler::DocumentResponse>,
     pub ms: u128,
 }
 
@@ -198,25 +200,37 @@ pub fn run_batch(tab: &Tab, batch: &Batch) -> Result<String, String> {
                 // A navigation may land on a bot-defence page instead of the
                 // one asked for; say so, and stop the batch where carrying on
                 // would mean acting on a challenge.
+                let document = outcome.document.as_ref();
                 let assessment = (outcome.navigated && crate::challenge::enabled()).then(|| {
-                    let assessment = crate::challenge::assess(
+                    let assessment = crate::challenge::assess_response(
                         |m, p| page.conn().call(m, p),
                         crate::challenge::wait_budget(),
+                        document,
                     );
                     crate::challenge::record(tab, &assessment);
-                    crate::scheduler::report(&crate::scheduler::Outcome {
-                        url: &assessment.url,
-                        status: assessment.status,
-                        retry_after: None,
-                        state: assessment.state,
-                    });
                     assessment
+                });
+                // The origin hears about every navigation the batch made,
+                // with the server's `Retry-After` when it sent one.
+                let closed = assessment.as_ref().map(|a| {
+                    crate::scheduler::report(&crate::scheduler::Outcome {
+                        url: &a.url,
+                        status: document.map(|d| d.status).unwrap_or(a.status),
+                        retry_after: document.and_then(|d| d.retry_after),
+                        state: a.state,
+                    })
                 });
                 let mut line = format!(
                     "{{\"ok\":true,\"navigated\":{},\"ms\":{}",
                     outcome.navigated,
                     t.elapsed().as_millis().max(outcome.ms)
                 );
+                if let Some(d) = document.filter(|d| d.status != 0) {
+                    line.push_str(&format!(",\"status\":{}", d.status));
+                }
+                if let Some(closed) = closed.filter(|c| !c.is_zero()) {
+                    line.push_str(&format!(",\"origin_closed_ms\":{}", closed.as_millis()));
+                }
                 let mut stop = None;
                 if let Some(assessment) =
                     assessment.filter(|a| a.state != crate::challenge::ChallengeState::Ready)
@@ -343,6 +357,7 @@ impl Page {
     fn run(&mut self, action: &Action) -> Result<Outcome, String> {
         let started = Instant::now();
         let (mut download, mut popup) = (None, false);
+        let mut document = None;
         let navigated = match action {
             Action::Click { reference } => {
                 let mut watch = NavWatch::new(&self.watch_frame(reference));
@@ -429,15 +444,35 @@ impl Page {
                 })?;
                 let mut watch = NavWatch::new(&self.frame);
                 watch.started = true;
+                // `Network` on for this navigation only, bodies never
+                // buffered: the main document's status, `Retry-After` and
+                // vendor header hints are all that is read.
+                let network = self
+                    .conn()
+                    .call(
+                        "Network.enable",
+                        "{\"maxTotalBufferSize\":0,\"maxResourceBufferSize\":0}",
+                    )
+                    .is_ok();
                 let reply = self.input(
                     "Page.navigate",
                     &format!("{{\"url\":{}}}", json_string(url)),
                     &mut watch,
-                )?;
+                );
+                let settled = reply.as_ref().ok().map(|_| self.settle(&mut watch));
+                if network {
+                    let _ = self
+                        .conn()
+                        .call_observed("Network.disable", "{}", &mut |e| watch.see(e));
+                }
+                let reply = reply?;
                 if let Some(error) = json_string_value(&reply, "errorText") {
                     return Err(format!("navigation failed: {error}"));
                 }
-                self.settle(&mut watch)?;
+                if let Some(settled) = settled {
+                    settled?;
+                }
+                document = watch.document.take();
                 true
             }
             Action::Wait { ms } => {
@@ -449,6 +484,7 @@ impl Page {
             navigated,
             download,
             popup,
+            document,
             ms: started.elapsed().as_millis(),
         })
     }
@@ -969,6 +1005,9 @@ struct NavWatch {
     download: Option<String>,
     /// A new window or tab was opened from this page.
     popup: bool,
+    /// The main document's response (status, `Retry-After`, vendor header
+    /// hints), when `Network` was on for the navigation.
+    document: Option<crate::scheduler::DocumentResponse>,
 }
 
 impl NavWatch {
@@ -981,6 +1020,7 @@ impl NavWatch {
             within: false,
             download: None,
             popup: false,
+            document: None,
         }
     }
 
@@ -988,6 +1028,12 @@ impl NavWatch {
         let Some(method) = json_string_value(event, "method") else {
             return;
         };
+        if self.document.is_none()
+            && let Some(d) = crate::scheduler::document_response(event)
+            && (d.frame_id.is_empty() || d.frame_id == self.frame)
+        {
+            self.document = Some(d);
+        }
         let main = json_string_value(event, "frameId").is_none_or(|f| f == self.frame);
         match method.as_str() {
             // Opening a new tab is not a navigation of this page.
