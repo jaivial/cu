@@ -421,14 +421,27 @@ impl Page {
         )
     }
 
-    /// The isolated world of the frame that owns `reference`, or `None` for
-    /// the main document (its default world is where the registry of a
-    /// single-frame page lives). Isolated worlds are created with the fixed
-    /// name `cu`, so the walk's registry is the one found here later.
+    /// The execution context of the frame that owns `reference`: cu's
+    /// isolated world of that frame (the main document's too, unless
+    /// `CU_HELPER_WORLD=main`, when `None` means the page's own world).
+    /// Isolated worlds persist per document under the fixed name `cu`, so the
+    /// walk's registry is the one found here later.
     fn enter(&mut self, reference: &str) -> Result<Option<i64>, String> {
         match self.subframe_of(reference) {
-            None => Ok(None),
+            None => self.main_world(),
             Some(frame) => self.world(&frame).map(Some),
+        }
+    }
+
+    /// The main document's helper context: cu's isolated world, or `None`
+    /// for the page's own world when the policy asks for it.
+    fn main_world(&mut self) -> Result<Option<i64>, String> {
+        match crate::execution::helper_world() {
+            crate::execution::World::Main => Ok(None),
+            crate::execution::World::Isolated => {
+                let frame = self.frame.clone();
+                self.world(&frame).map(Some)
+            }
         }
     }
 
@@ -438,26 +451,20 @@ impl Page {
     }
 
     fn world(&mut self, frame_id: &str) -> Result<i64, String> {
-        let reply = self.conn().call(
-            "Page.createIsolatedWorld",
-            &format!(
-                "{{\"frameId\":{},\"worldName\":\"cu\"}}",
-                json_string(frame_id)
-            ),
-        )?;
-        json_value(&reply, "executionContextId")
-            .and_then(|v| v.parse().ok())
-            .ok_or_else(|| "the frame is gone; take a new snapshot".to_string())
+        let conn = self.conn();
+        crate::execution::isolated_context(&mut |m, p| conn.call(m, p), frame_id)
     }
 
-    /// Run a script in the page and return the string it produced. A script
-    /// that reports `{"error":...}` becomes an `Err` with that message.
+    /// Run a helper on the main document (in the helper world) and return
+    /// the string it produced. A script that reports `{"error":...}` becomes
+    /// an `Err` with that message.
     fn eval(&mut self, expression: &str) -> Result<String, String> {
-        self.eval_in(None, expression)
+        let context = self.main_world()?;
+        self.eval_in(context, expression)
     }
 
     /// [`eval`](Self::eval) in an execution context: `Some(context)` for an
-    /// iframe's isolated world, `None` for the page's default world.
+    /// isolated world, `None` for the page's own world (`CU_HELPER_WORLD=main`).
     fn eval_in(&mut self, context: Option<i64>, expression: &str) -> Result<String, String> {
         // Trailing comma on the fragment: the format below separates the
         // expression and this fragment with one comma and has none after it.
@@ -488,7 +495,7 @@ impl Page {
     fn locate(&mut self, reference: &str, hit_test: bool) -> Result<(f64, f64), String> {
         let subframe = self.subframe_of(reference);
         let context = match &subframe {
-            None => None,
+            None => self.main_world()?,
             Some(frame) => Some(self.world(frame)?),
         };
         let value = self.registry_in(

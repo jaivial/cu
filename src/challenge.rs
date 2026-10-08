@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use crate::server::{
     Tab, evaluated_string, flatten_frame_tree, json_array, json_number, json_string,
-    json_string_value, json_strings, json_value,
+    json_string_value, json_strings,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -378,14 +378,7 @@ where
     let tree = cmd("Page.getFrameTree", "{}")?;
     let frames = flatten_frame_tree(&tree);
     let main = frames.first().ok_or("page has no main frame")?;
-    let world = cmd(
-        "Page.createIsolatedWorld",
-        &format!(
-            "{{\"frameId\":{},\"worldName\":\"cu\"}}",
-            json_string(&main.id)
-        ),
-    )?;
-    let context = json_value(&world, "executionContextId").ok_or("the page is gone")?;
+    let context = crate::execution::isolated_context(&mut cmd, &main.id)?;
     let reply = cmd(
         "Runtime.evaluate",
         &format!(
