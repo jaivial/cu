@@ -80,6 +80,10 @@ pub struct Probe {
     /// Every frame URL known: frame tree and iframe `src`s, with a `!`
     /// prefix when the iframe element is visible.
     pub frames: Vec<String>,
+    /// Defence signals from the main document's response headers
+    /// (`cf-mitigated: challenge`, `x-datadome: protected`), when the
+    /// navigation was observed on the network.
+    pub hints: Vec<String>,
 }
 
 /// The classification and the evidence it rests on.
@@ -116,6 +120,10 @@ fn frame(probe: &Probe, needle: &str, visible: bool) -> bool {
     })
 }
 
+fn hint(probe: &Probe, value: &str) -> bool {
+    probe.hints.iter().any(|h| h == value)
+}
+
 fn text_has(probe: &Probe, phrases: &[&str]) -> Option<String> {
     phrases
         .iter()
@@ -139,6 +147,29 @@ pub fn classify(probe: &Probe) -> Verdict {
         return Verdict::new(RateLimited, Some("cloudflare"), vec![s]);
     }
 
+    // DataDome's own page, read from the inline `dd` config it serves before
+    // any frame exists (seen on real 403s): `t:'bv'` is a block, `rt:'i'` the
+    // automatic device check (it may reload into the site), `rt:'c'` the
+    // CAPTCHA.
+    if has(probe, "dd-t-bv") {
+        return Verdict::new(Blocked, Some("datadome"), vec!["datadome block page (t=bv)".into()]);
+    }
+    if has(probe, "dd-rt-c") {
+        return Verdict::new(
+            HumanRequired,
+            Some("datadome"),
+            vec!["datadome captcha page (rt=c)".into()],
+        );
+    }
+    if has(probe, "dd-rt-i") {
+        let mut verdict = Verdict::new(
+            ChallengePending,
+            Some("datadome"),
+            vec!["datadome device check (rt=i)".into()],
+        );
+        verdict.interstitial = true;
+        return verdict;
+    }
     // DataDome: the CAPTCHA frame says which page it is with `t=`: `fe` is a
     // challenge, `bv` a block.
     if frame(probe, "captcha-delivery.com", false) {
@@ -174,10 +205,20 @@ pub fn classify(probe: &Probe) -> Verdict {
     }
 
     // Cloudflare interstitial ("Just a moment...", managed challenge).
+    // The title and text are localised (a Spanish profile reads "Un
+    // momento..."), so the language-independent signals come first: the
+    // `_cf_chl_opt` config of the challenge page, its error-text element and
+    // the `cf-mitigated: challenge` response header.
     let cf_page = title.starts_with("just a moment")
         || title.starts_with("attention required")
         || has(probe, "cf-challenge")
-        || probe.url.contains("__cf_chl");
+        || has(probe, "cf-chl-opt")
+        || hint(probe, "cf-mitigated: challenge")
+        // The challenge rewrites the address to carry `__cf_chl_*` tokens;
+        // a page that loaded fine under such an address (the reload after a
+        // pass) is not itself a challenge, so the token only counts with a
+        // non-2xx status.
+        || (probe.url.contains("__cf_chl") && !(200..300).contains(&probe.status));
     let cf_text = text_has(
         probe,
         &[
@@ -191,8 +232,14 @@ pub fn classify(probe: &Probe) -> Verdict {
     );
     if cf_page || (cf_text.is_some() && has(probe, "cf-platform")) {
         let mut signals = vec![];
-        if cf_page {
-            signals.push(format!("title/markers: {}", probe.title));
+        if hint(probe, "cf-mitigated: challenge") {
+            signals.push("cf-mitigated: challenge header".into());
+        }
+        if has(probe, "cf-chl-opt") {
+            signals.push("_cf_chl_opt challenge config".into());
+        }
+        if title.starts_with("just a moment") || title.starts_with("attention required") {
+            signals.push(format!("title: {}", probe.title));
         }
         signals.extend(cf_text);
         let mut verdict = Verdict::new(ChallengePending, Some("cloudflare"), signals);
@@ -314,6 +361,22 @@ pub fn classify(probe: &Probe) -> Verdict {
 
     // No vendor signal. Only a plainly healthy page is ready.
     let web = probe.url.starts_with("http://") || probe.url.starts_with("https://");
+    // A response a vendor marked as mitigated is never a plain page, even if
+    // its DOM carried no marker this probe knows.
+    if web && hint(probe, "cf-mitigated: challenge") {
+        return Verdict::new(
+            ChallengePending,
+            Some("cloudflare"),
+            vec!["cf-mitigated: challenge header".into()],
+        );
+    }
+    if web && status >= 400 && hint(probe, "x-datadome: protected") {
+        return Verdict::new(
+            Unknown,
+            Some("datadome"),
+            vec![format!("status {status} from a datadome-protected origin")],
+        );
+    }
     if !web {
         return Verdict::new(Ready, None, vec!["not an http(s) page".into()]);
     }
@@ -353,6 +416,19 @@ pub const PROBE_JS: &str = r#"JSON.stringify((function(){
   mark('px-captcha', '#px-captcha', true);
   mark('awswaf', 'script[src*="awswaf.com"], script[src*="token.awswaf"]', false);
   mark('awswaf-captcha', '#captcha-container, awswaf-captcha', true);
+  mark('cf-challenge', '#challenge-error-text, #challenge-success-text', false);
+  // Inline configs of vendor pages (script text is DOM; the page's globals
+  // are not visible from this world, the text is).
+  for (const sc of document.querySelectorAll('script:not([src])')) {
+    const t = sc.textContent || '';
+    if (t.length > 20000) continue;
+    if (t.includes('_cf_chl_opt')) markers.push('cf-chl-opt');
+    if (t.includes('captcha-delivery.com')) {
+      const rt = /['"]rt['"]\s*:\s*['"](\w)['"]/.exec(t), tt = /['"]t['"]\s*:\s*['"](\w+)['"]/.exec(t);
+      if (tt && tt[1] === 'bv') markers.push('dd-t-bv');
+      else if (rt) markers.push('dd-rt-' + rt[1]);
+    }
+  }
   mark('captcha', '[id*="captcha" i], [class*="captcha" i]', true);
   const frames = [...document.querySelectorAll('iframe, frame')].map((f) => (shown(f) ? '!' : '') + (f.src || ''));
   let status = 0;
@@ -399,6 +475,7 @@ where
         frames: json_array(&value, "frames")
             .map(|a| json_strings(&a))
             .unwrap_or_default(),
+        hints: Vec::new(),
     };
     // The frame tree also holds frames the DOM query cannot reach (inside
     // closed shadow roots); their visibility is unknown, so no `!`.
@@ -423,14 +500,34 @@ pub fn wait_budget() -> Duration {
 /// until it clears or `budget` is spent; one that does not clear becomes
 /// `human_required`. A probe that fails mid-navigation (the interstitial
 /// reloading into the real page) is retried, not reported.
-pub fn assess<F>(mut cmd: F, budget: Duration) -> Assessment
+pub fn assess<F>(cmd: F, budget: Duration) -> Assessment
+where
+    F: FnMut(&str, &str) -> Result<String, String>,
+{
+    assess_response(cmd, budget, None)
+}
+
+/// [`assess`], with what the network saw of the main document: its status
+/// stands in when the page did not record one, and its header hints count
+/// as evidence.
+pub fn assess_response<F>(
+    mut cmd: F,
+    budget: Duration,
+    response: Option<&crate::scheduler::DocumentResponse>,
+) -> Assessment
 where
     F: FnMut(&str, &str) -> Result<String, String>,
 {
     let started = Instant::now();
     loop {
         let error = match probe(&mut cmd) {
-            Ok(probe) => {
+            Ok(mut probe) => {
+                if let Some(response) = response {
+                    if probe.status == 0 {
+                        probe.status = response.status;
+                    }
+                    probe.hints = response.hints.clone();
+                }
                 let mut verdict = classify(&probe);
                 let waited = started.elapsed();
                 if verdict.interstitial && verdict.state == ChallengeState::ChallengePending {
@@ -542,8 +639,101 @@ fn states() -> &'static Mutex<HashMap<Tab, Assessment>> {
     STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Counters over every assessment of the daemon's life, for
+/// `/v1/diagnostics`.
+#[derive(Default)]
+struct Metrics {
+    assessed: u64,
+    by_state: HashMap<&'static str, u64>,
+    by_vendor: HashMap<&'static str, u64>,
+    /// `ready` verdicts.
+    ready: u64,
+    /// A `ready` page whose next check, on the same tab and origin, found a
+    /// defence: cu said success and the origin was in fact challenging (the
+    /// false-success count cu can observe).
+    ready_contradicted: u64,
+    /// Human hand-offs that were released by hand rather than cleared.
+    released: u64,
+    /// Hand-offs the gate's re-check found cleared.
+    cleared: u64,
+}
+
+fn metrics() -> &'static Mutex<Metrics> {
+    static METRICS: OnceLock<Mutex<Metrics>> = OnceLock::new();
+    METRICS.get_or_init(Default::default)
+}
+
+/// The `challenge` object of `/v1/diagnostics`.
+pub fn metrics_json() -> String {
+    let m = metrics().lock().unwrap_or_else(|e| e.into_inner());
+    let defences: u64 = ["challenge_pending", "human_required", "blocked", "rate_limited"]
+        .iter()
+        .map(|s| m.by_state.get(s).copied().unwrap_or(0))
+        .sum();
+    let ratio = |n: u64, d: u64| {
+        if d == 0 {
+            "null".to_string()
+        } else {
+            format!("{:.4}", n as f64 / d as f64)
+        }
+    };
+    let map = |h: &HashMap<&'static str, u64>| {
+        let mut v: Vec<_> = h.iter().collect();
+        v.sort();
+        v.iter()
+            .map(|(k, n)| format!("{}:{n}", json_string(k)))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!(
+        "{{\"assessed\":{},\"states\":{{{}}},\"vendors\":{{{}}},\"challenge_rate\":{},\
+         \"ready\":{},\"ready_contradicted\":{},\"false_success_rate\":{},\
+         \"handoffs_cleared\":{},\"handoffs_released\":{},\
+         \"note\":\"challenge_rate = defence verdicts / assessments; false_success_rate = ready verdicts whose next check on the same tab and origin found a defence / ready verdicts (a lower bound: only what a later check saw)\"}}",
+        m.assessed,
+        map(&m.by_state),
+        map(&m.by_vendor),
+        ratio(defences, m.assessed),
+        m.ready,
+        m.ready_contradicted,
+        ratio(m.ready_contradicted, m.ready),
+        m.cleared,
+        m.released,
+    )
+}
+
 /// Remember the latest assessment of a tab and log any defence.
 pub fn record(tab: &Tab, assessment: &Assessment) {
+    {
+        let previous = last(tab);
+        let mut m = metrics().lock().unwrap_or_else(|e| e.into_inner());
+        m.assessed += 1;
+        *m.by_state.entry(assessment.state.name()).or_default() += 1;
+        if let Some(vendor) = assessment.vendor {
+            *m.by_vendor.entry(vendor).or_default() += 1;
+        }
+        if assessment.state == ChallengeState::Ready {
+            m.ready += 1;
+        }
+        if let Some(previous) = previous {
+            // Same origin, not same URL: a challenge page often rewrites
+            // its own address (Cloudflare's `history.replaceState`).
+            if previous.state == ChallengeState::Ready
+                && assessment.state.is_defence()
+                && crate::scheduler::origin_of(&previous.url).is_some()
+                && crate::scheduler::origin_of(&previous.url)
+                    == crate::scheduler::origin_of(&assessment.url)
+            {
+                m.ready_contradicted += 1;
+            }
+        }
+    }
+    store(tab, assessment);
+}
+
+/// Log and remember an assessment without counting it: the gate's re-checks
+/// of a paused tab are not new navigations.
+fn store(tab: &Tab, assessment: &Assessment) {
     if assessment.state != ChallengeState::Ready {
         eprintln!(
             "cu: challenge: {} {} on {} ({})",
@@ -570,6 +760,9 @@ pub fn last(tab: &Tab) -> Option<Assessment> {
 
 /// Give up a pending human hand-off: the tab is handed back to automation.
 pub fn release(tab: &Tab) -> bool {
+    if last(tab).is_some_and(|a| a.state == ChallengeState::HumanRequired) {
+        metrics().lock().unwrap_or_else(|e| e.into_inner()).released += 1;
+    }
     states()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -592,7 +785,10 @@ pub fn gate(tab: &Tab) -> Option<Assessment> {
         // Cleared, or turned into something no person can fix from here:
         // the tab goes back to automation with the new state on record.
         ChallengeState::Ready | ChallengeState::Blocked | ChallengeState::RateLimited => {
-            record(tab, &fresh);
+            if fresh.state == ChallengeState::Ready {
+                metrics().lock().unwrap_or_else(|e| e.into_inner()).cleared += 1;
+            }
+            store(tab, &fresh);
             None
         }
         // Still on the challenge (an interstitial re-probed without a wait
@@ -600,7 +796,7 @@ pub fn gate(tab: &Tab) -> Option<Assessment> {
         ChallengeState::HumanRequired | ChallengeState::ChallengePending => {
             let mut held = fresh;
             held.state = ChallengeState::HumanRequired;
-            record(tab, &held);
+            store(tab, &held);
             Some(held)
         }
         // A re-probe that cannot tell is no proof the person finished.

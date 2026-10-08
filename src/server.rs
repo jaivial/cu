@@ -750,8 +750,17 @@ pub fn route(
     }
     match (method, path) {
         ("GET", "/v1/challenge") => {
-            let assessment = crate::challenge::assess(|m, p| tab.command(m, p), Duration::ZERO);
-            crate::challenge::record(&tab, &assessment);
+            // A paused tab is re-checked the way the gate does it, so an
+            // interstitial read without a wait cannot quietly end the
+            // hand-off; any other tab gets a fresh, counted check.
+            let assessment = match crate::challenge::gate(&tab) {
+                Some(held) => held,
+                None => {
+                    let fresh = crate::challenge::assess(|m, p| tab.command(m, p), Duration::ZERO);
+                    crate::challenge::record(&tab, &fresh);
+                    fresh
+                }
+            };
             ("200 OK", "application/json", assessment.json())
         }
         ("POST", "/v1/challenge/release") => (
@@ -966,8 +975,11 @@ fn navigate_scheduled(tab: &Tab, url: &str) -> (&'static str, &'static str, Stri
         // it is, and never call a defence page (or an undecided one) a plain
         // success.
         let assessment = crate::challenge::enabled().then(|| {
-            let assessment =
-                crate::challenge::assess(|m, p| tab.command(m, p), crate::challenge::wait_budget());
+            let assessment = crate::challenge::assess_response(
+                |m, p| tab.command(m, p),
+                crate::challenge::wait_budget(),
+                document.as_ref(),
+            );
             crate::challenge::record(tab, &assessment);
             assessment
         });
@@ -1049,14 +1061,14 @@ fn navigate_observed(
                 "{\"maxTotalBufferSize\":0,\"maxResourceBufferSize\":0}",
             )
         });
-    let mut document = None;
+    // Every document response seen; the main document's is the one whose
+    // request id is the navigation's loader id. Taking the first one was
+    // wrong: a frame of the previous page still loading (DataDome's CAPTCHA
+    // iframe answers 200) could arrive first and stand in for a 403.
+    let mut documents = Vec::new();
     let mut see = |event: &str| {
         if let Some(d) = crate::scheduler::document_response(event) {
-            // The first document response is the main frame's (an iframe's
-            // arrives after the main document commits).
-            if document.is_none() {
-                document = Some(d);
-            }
+            documents.push(d);
         }
     };
     let reply = connection.call_observed(
@@ -1070,7 +1082,19 @@ fn navigate_observed(
         let _ = connection.call_observed("Network.disable", "{}", &mut see);
         checkin(tab, connection);
     }
-    Ok((reply?, document))
+    let reply = reply?;
+    let loader = json_string_value(&reply, "loaderId");
+    let frame = json_string_value(&reply, "frameId");
+    let document = documents
+        .iter()
+        .find(|d| loader.as_deref() == Some(d.request_id.as_str()))
+        .or_else(|| {
+            documents
+                .iter()
+                .find(|d| frame.as_deref() == Some(d.frame_id.as_str()))
+        })
+        .cloned();
+    Ok((reply, document))
 }
 
 /// A one-action batch from a `/v1/click` or `/v1/type` body.
