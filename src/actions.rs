@@ -499,11 +499,13 @@ impl Page {
                     // one, otherwise scrolls to it and clicks into it; the
                     // focus call then only confirms it took the focus. Old
                     // text is selected and deleted with keys, not wiped.
-                    let tab_next = self
+                    let tab = self
                         .registry_for(reference, &format!("tabNext({})", json_string(reference)))
-                        .is_ok_and(|v| v == "true");
-                    if tab_next {
+                        .unwrap_or_default();
+                    if tab == "next" {
                         self.key("Tab", &mut watch)?;
+                    } else if tab == "prev" {
+                        self.shift_tab(&mut watch)?;
                     } else {
                         self.wheel_into_view(reference, &mut watch)?;
                         if let Ok(at) = self.locate(reference, true) {
@@ -1014,25 +1016,52 @@ impl Page {
         if self.subframe_of(reference).is_some() {
             return Ok(());
         }
-        for _ in 0..4 {
-            let Ok(rect) = self.registry_for(reference, &format!("rect({})", json_string(reference)))
+        for _ in 0..8 {
+            let Ok(info) =
+                self.registry_for(reference, &format!("scrollInfo({})", json_string(reference)))
             else {
                 return Ok(());
             };
-            let num = |k: &str| json_value(&rect, k).and_then(|v| v.parse::<f64>().ok());
-            let (Some(top), Some(bottom), Some(vw), Some(vh)) =
-                (num("top"), num("bottom"), num("vw"), num("vh"))
-            else {
+            let num = |o: &str, k: &str| json_value(o, k).and_then(|v| v.parse::<f64>().ok());
+            let (Some(top), Some(bottom), Some(vw), Some(vh)) = (
+                num(&info, "top"),
+                num(&info, "bottom"),
+                num(&info, "vw"),
+                num(&info, "vh"),
+            ) else {
                 return Ok(());
             };
-            // Comfortably inside the viewport already: nothing to scroll.
-            if top >= 0.0 && bottom <= vh {
-                return Ok(());
-            }
-            let at = crate::input::pointer(&self.tab)
-                .unwrap_or_else(|| crate::input::origin(&self.tab, vw, vh));
-            let aim = vh * crate::human::Rng::new(top.to_bits(), "aim").uniform(0.35, 0.6);
-            let dy = (top + bottom) / 2.0 - aim;
+            // An inner scroller (a feed, a modal, a sidebar) that does not
+            // show the element yet: turn the wheel over that box, once the
+            // box itself is on screen. Otherwise the document's scroll.
+            let scroller = crate::server::json_object(&info, "scroller").and_then(|o| {
+                Some((
+                    num(o, "top")?,
+                    num(o, "bottom")?,
+                    num(o, "left")?,
+                    num(o, "right")?,
+                    num(o, "inner_top")?,
+                    num(o, "inner_bottom")?,
+                ))
+            });
+            let (at, dy) = match scroller {
+                Some((st, sb, sl, sr, it, ib)) if sb - st >= 24.0 && sr - sl >= 24.0 => {
+                    let box_centre = ((sl + sr) / 2.0, (st + sb) / 2.0);
+                    let at = self.pointer_into(box_centre, sr - sl, sb - st, watch)?;
+                    let aim = it + (ib - it) * crate::human::Rng::new(top.to_bits(), "aim").uniform(0.3, 0.6);
+                    (at, (top + bottom) / 2.0 - aim)
+                }
+                _ => {
+                    // Comfortably inside the viewport already: nothing to scroll.
+                    if top >= 0.0 && bottom <= vh {
+                        return Ok(());
+                    }
+                    let at = crate::input::pointer(&self.tab)
+                        .unwrap_or_else(|| crate::input::origin(&self.tab, vw, vh));
+                    let aim = vh * crate::human::Rng::new(top.to_bits(), "aim").uniform(0.35, 0.6);
+                    (at, (top + bottom) / 2.0 - aim)
+                }
+            };
             let before = top;
             for (delta, pause) in crate::input::plan_scroll(&self.tab, dy) {
                 std::thread::sleep(pause);
@@ -1052,11 +1081,67 @@ impl Page {
                 .registry_for(reference, &format!("rect({})", json_string(reference)))
                 .ok()
                 .and_then(|r| json_value(&r, "top").and_then(|v| v.parse::<f64>().ok()));
-            // The wheel did not move this element: not the document's scroll.
+            // The wheel moved nothing (a scroller that ignores wheels, an
+            // iframe): leave the rest to the instant scroll of `locate`.
             if moved.is_none_or(|t| (t - before).abs() < 1.0) {
                 return Ok(());
             }
         }
+        Ok(())
+    }
+
+    /// Move the pointer into a box (centre, width, height) along the
+    /// session's path, unless it is already inside; returns where it is.
+    fn pointer_into(
+        &mut self,
+        centre: (f64, f64),
+        w: f64,
+        h: f64,
+        watch: &mut NavWatch,
+    ) -> Result<(f64, f64), String> {
+        let inside = |p: (f64, f64)| {
+            (p.0 - centre.0).abs() < w / 2.0 - 4.0 && (p.1 - centre.1).abs() < h / 2.0 - 4.0
+        };
+        let from = crate::input::pointer(&self.tab).unwrap_or_else(|| {
+            crate::input::origin(&self.tab, centre.0 * 2.0, centre.1 * 2.0)
+        });
+        if inside(from) {
+            return Ok(from);
+        }
+        let plan = crate::input::plan_click(&self.tab, from, centre, w * 0.6, h * 0.6);
+        for (point, pause) in plan.path {
+            std::thread::sleep(pause);
+            self.input(
+                "Input.dispatchMouseEvent",
+                &format!(
+                    "{{\"type\":\"mouseMoved\",\"x\":{:.1},\"y\":{:.1},\"button\":\"none\",\"buttons\":0}}",
+                    point.0, point.1
+                ),
+                watch,
+            )?;
+        }
+        crate::input::set_pointer(&self.tab, plan.point);
+        Ok(plan.point)
+    }
+
+    /// Shift+Tab, as a keyboard sends it: Shift down, Tab with the shift
+    /// modifier, both up.
+    fn shift_tab(&mut self, watch: &mut NavWatch) -> Result<(), String> {
+        let shift = "\"key\":\"Shift\",\"code\":\"ShiftLeft\",\"windowsVirtualKeyCode\":16";
+        let tab = "\"key\":\"Tab\",\"code\":\"Tab\",\"windowsVirtualKeyCode\":9,\"modifiers\":8";
+        let (hold, gap) = crate::input::plan_typing(&self.tab, "xx")[0];
+        self.input(
+            "Input.dispatchKeyEvent",
+            &format!("{{\"type\":\"rawKeyDown\",{shift},\"modifiers\":8}}"),
+            watch,
+        )?;
+        std::thread::sleep(hold / 2);
+        self.input("Input.dispatchKeyEvent", &format!("{{\"type\":\"rawKeyDown\",{tab}}}"), watch)?;
+        std::thread::sleep(hold);
+        self.input("Input.dispatchKeyEvent", &format!("{{\"type\":\"keyUp\",{tab}}}"), watch)?;
+        std::thread::sleep(hold / 2);
+        self.input("Input.dispatchKeyEvent", &format!("{{\"type\":\"keyUp\",{shift}}}"), watch)?;
+        std::thread::sleep(gap);
         Ok(())
     }
 
@@ -1416,18 +1501,52 @@ if (!window.__cu) {
         vw: innerWidth, vh: innerHeight });
     },
     tabNext(ref) {
-      // Whether one Tab from the focused element lands on `ref`: both in the
-      // plain document order of focusable, visible, enabled controls, with
-      // no positive tabindex anywhere to reorder it.
+      // Whether one Tab ('next') or one Shift+Tab ('prev') from the focused
+      // element lands on `ref`, in the sequential focus order the browser
+      // uses: positive tabindex first, ascending (document order among
+      // equals), then tabindex 0 in document order. Focusable, rendered,
+      // enabled controls only; radio groups and shadow trees are not
+      // modelled, so a field in one is reached by a click instead.
       const el = get(ref), from = document.activeElement;
       if (!el || !from || from === document.body || from === el) return 'false';
       const all = [...document.querySelectorAll(
         'a[href],button,input,select,textarea,[tabindex],[contenteditable=""],[contenteditable="true"]')];
-      if (all.some((e) => e.tabIndex > 0)) return 'false';
-      const order = all.filter((e) => e.tabIndex >= 0 && !e.disabled &&
-        !(e.type === 'hidden') && e.getClientRects().length > 0);
+      if (all.some((e) => e.type === 'radio')) return 'false';
+      const usable = all.filter((e) => e.tabIndex >= 0 && !e.disabled && e.type !== 'hidden' &&
+        !e.closest('[inert]') && e.getClientRects().length > 0 &&
+        (!e.checkVisibility || e.checkVisibility({ visibilityProperty: true })));
+      const order = [
+        ...usable.filter((e) => e.tabIndex > 0).sort((a, b) => a.tabIndex - b.tabIndex),
+        ...usable.filter((e) => e.tabIndex === 0),
+      ];
       const i = order.indexOf(from);
-      return String(i >= 0 && order[i + 1] === el);
+      if (i < 0) return 'false';
+      if (order[i + 1] === el) return 'next';
+      if (order[i - 1] === el) return 'prev';
+      return 'false';
+    },
+    scrollInfo(ref) {
+      // The element's box, the viewport, and the innermost scrolling
+      // ancestor that does not show it yet (its visible box, clipped to the
+      // viewport), so paced scrolling can turn the wheel over that box.
+      const el = get(ref);
+      if (!el) return err(ref + ' is not on the page any more; take a new snapshot');
+      const b = el.getBoundingClientRect();
+      const out = { top: b.top, bottom: b.bottom, left: b.left, right: b.right, vw: innerWidth, vh: innerHeight };
+      for (let s = el.parentElement; s && s !== document.body && s !== document.documentElement; s = s.parentElement) {
+        const st = getComputedStyle(s);
+        if (!/(auto|scroll|overlay)/.test(st.overflowY) || s.scrollHeight <= s.clientHeight + 1) continue;
+        const r = s.getBoundingClientRect();
+        // The scrollport: the border box minus borders and the scrollbar.
+        const top = r.top + s.clientTop, bottom = top + s.clientHeight;
+        const left = r.left + s.clientLeft, right = left + s.clientWidth;
+        if (b.top >= top - 1 && b.bottom <= bottom + 1) continue;
+        out.scroller = { top: Math.max(top, 0), bottom: Math.min(bottom, innerHeight),
+          left: Math.max(left, 0), right: Math.min(right, innerWidth),
+          inner_top: top, inner_bottom: bottom };
+        break;
+      }
+      return JSON.stringify(out);
     },
     focus(ref, clear) {
       const el = get(ref);
