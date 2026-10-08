@@ -185,11 +185,39 @@ pub fn run_batch(tab: &Tab, batch: &Batch) -> Result<String, String> {
         let t = Instant::now();
         match page.run(action) {
             Ok(outcome) => {
+                // A navigation may land on a bot-defence page instead of the
+                // one asked for; say so, and stop the batch where carrying on
+                // would mean acting on a challenge.
+                let assessment = (outcome.navigated && crate::challenge::enabled()).then(|| {
+                    let assessment = crate::challenge::assess(
+                        |m, p| page.conn().call(m, p),
+                        crate::challenge::wait_budget(),
+                    );
+                    crate::challenge::record(tab, &assessment);
+                    assessment
+                });
                 let mut line = format!(
                     "{{\"ok\":true,\"navigated\":{},\"ms\":{}",
                     outcome.navigated,
                     t.elapsed().as_millis().max(outcome.ms)
                 );
+                let mut stop = None;
+                if let Some(assessment) =
+                    assessment.filter(|a| a.state != crate::challenge::ChallengeState::Ready)
+                {
+                    line.push_str(&format!(",\"challenge\":{}", assessment.json()));
+                    if matches!(
+                        assessment.state,
+                        crate::challenge::ChallengeState::HumanRequired
+                            | crate::challenge::ChallengeState::Blocked
+                            | crate::challenge::ChallengeState::RateLimited
+                    ) {
+                        stop = Some(format!(
+                            "stopped on a {} page; the remaining actions were not run",
+                            assessment.state.name()
+                        ));
+                    }
+                }
                 // A download or a popup changes what the agent should do
                 // next, so both are named rather than left to be inferred.
                 if let Some(name) = &outcome.download {
@@ -199,6 +227,12 @@ pub fn run_batch(tab: &Tab, batch: &Batch) -> Result<String, String> {
                     line.push_str(",\"popup\":true");
                 }
                 results.push(line + "}");
+                if let Some(error) = stop {
+                    if i + 1 < batch.actions.len() {
+                        failure = Some((i + 1, error));
+                    }
+                    break;
+                }
             }
             Err(error) => {
                 results.push(format!(

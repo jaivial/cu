@@ -65,7 +65,12 @@ pub fn record_launch(policy: &BrowserPolicy, args: &[String]) {
 
 /// Fill in what the running browser says about itself, log one line and
 /// write `browser.json` next to `server.json`.
-pub fn record_ready(data: &Path, version: Option<&str>, system_info: Option<&str>, ready: Duration) {
+pub fn record_ready(
+    data: &Path,
+    version: Option<&str>,
+    system_info: Option<&str>,
+    ready: Duration,
+) {
     let mut guard = launch().lock().unwrap_or_else(|e| e.into_inner());
     let Some(record) = guard.as_mut() else {
         return;
@@ -136,7 +141,8 @@ fn notes(record: &LaunchRecord) -> Vec<String> {
     }
     if let Some(gl) = &record.gl_renderer {
         let lower = gl.to_ascii_lowercase();
-        if lower.contains("swiftshader") || lower.contains("llvmpipe") || lower.contains("software") {
+        if lower.contains("swiftshader") || lower.contains("llvmpipe") || lower.contains("software")
+        {
             notes.push(format!("software rendering ({gl}): no hardware GPU in use"));
         }
     } else if record.product.is_some() {
@@ -285,8 +291,6 @@ pub fn json() -> String {
     format!(
         "{{\"browser\":{launch},\"protocol\":{},\"note\":{}}}",
         protocol_json(),
-        json_string(
-            "observations about this setup, not a measure of how sites will treat it"
-        )
+        json_string("observations about this setup, not a measure of how sites will treat it")
     )
 }

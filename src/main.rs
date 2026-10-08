@@ -39,6 +39,14 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("start") => start(&args[1..]),
         Some("status") => request("GET", "/v1/status", None).map(|s| println!("{s}")),
+        Some("challenge") => match args.get(1).map(String::as_str) {
+            None => request("GET", &on_tab("/v1/challenge"), None).map(|s| println!("{s}")),
+            Some("release") => request("POST", &on_tab("/v1/challenge/release"), Some("{}"))
+                .map(|s| println!("{s}")),
+            Some(other) => Err(format!(
+                "unknown challenge command {other}; usage: cu challenge [release]"
+            )),
+        },
         Some("diagnostics") => request("GET", "/v1/diagnostics", None).map(|s| println!("{s}")),
         Some("navigate") => match args.get(1) {
             Some(url) => request(
@@ -130,7 +138,7 @@ fn main() {
 }
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat]\n  cu status\n  cu diagnostics\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat]\n  cu status\n  cu diagnostics\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save NAME\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
     );
 }
 

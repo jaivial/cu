@@ -618,9 +618,10 @@ fn stopping_the_daemon_closes_its_browser() {
     let token = loop {
         if let Ok(config) = std::fs::read_to_string(dir.join("server.json"))
             && let Some(token) = server::json_value(&config, "token")
-                && TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                    break token;
-                }
+            && TcpStream::connect(("127.0.0.1", port)).is_ok()
+        {
+            break token;
+        }
         std::thread::sleep(Duration::from_millis(10));
     };
     let client = cu::Client::new(format!("127.0.0.1:{port}"), token);
