@@ -109,6 +109,29 @@ pub const COMPATIBILITY_ARGS: &[&str] = &[
     "--password-store=basic",
 ];
 
+/// Flags added when WebGL is asked for (`CU_WEBGL=1` or `cu start --webgl`),
+/// in either mode; `--disable-gpu` is dropped from `FastTest` at the same time.
+///
+/// A host without a GPU (a server under xvfb) has no hardware GL, and since
+/// Chromium 137 the browser no longer falls back to SwiftShader on its own:
+/// WebGL is simply unavailable and sites that need WebGL2 (CapCut's editor)
+/// send the browser to an "incompatible" page. ANGLE on SwiftShader is a CPU
+/// implementation of GLES 3, which is enough for WebGL2; Chromium only lets
+/// web content use it when `--enable-unsafe-swiftshader` says so.
+pub const WEBGL_ARGS: &[&str] = &[
+    "--use-gl=angle",
+    "--use-angle=swiftshader",
+    "--enable-unsafe-swiftshader",
+    "--ignore-gpu-blocklist",
+];
+
+/// Whether `CU_WEBGL` asks for WebGL (any value but empty, `0` or `false`).
+pub fn webgl_from_env() -> bool {
+    env::var("CU_WEBGL")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false"))
+        .unwrap_or(false)
+}
+
 /// Executables tried, in order, when `CU_BROWSER` is not set.
 ///
 /// `FastTest` keeps cu's historical default first. `Compatibility` prefers a
@@ -146,6 +169,8 @@ pub struct BrowserPolicy {
     /// The executable is a `headless-shell` build (Chrome for Testing's
     /// `chrome-headless-shell`, Playwright's `headless_shell`).
     pub headless_shell: bool,
+    /// Software WebGL ([`WEBGL_ARGS`]) instead of `FastTest`'s `--disable-gpu`.
+    pub webgl: bool,
 }
 
 impl BrowserPolicy {
@@ -182,6 +207,7 @@ impl BrowserPolicy {
             resolved,
             headless,
             headless_shell,
+            webgl: webgl_from_env(),
         })
     }
 
@@ -192,7 +218,14 @@ impl BrowserPolicy {
             BrowserMode::FastTest => FAST_TEST_ARGS,
             BrowserMode::Compatibility => COMPATIBILITY_ARGS,
         };
-        args.extend(base.iter().map(|a| a.to_string()));
+        args.extend(
+            base.iter()
+                .filter(|a| !(self.webgl && **a == "--disable-gpu"))
+                .map(|a| a.to_string()),
+        );
+        if self.webgl {
+            args.extend(WEBGL_ARGS.iter().map(|a| a.to_string()));
+        }
         // One argument: Chromium only parses `--user-data-dir=PATH` here, and
         // treats a separate PATH as a second target ("Multiple targets are not
         // supported in headless mode", exit 13).

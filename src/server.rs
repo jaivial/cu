@@ -3657,6 +3657,13 @@ mod snapshot_tests {
                 "{flag} missing"
             );
         }
+        // Software WebGL is opt-in (CU_WEBGL / --webgl); the default stays GPU-less.
+        for flag in crate::policy::WEBGL_ARGS {
+            assert!(
+                !crate::policy::FAST_TEST_ARGS.contains(flag),
+                "{flag} must not be in the default launch"
+            );
+        }
         // One --disable-features: Chromium only honours the last one it sees.
         let features: Vec<_> = crate::policy::FAST_TEST_ARGS
             .iter()

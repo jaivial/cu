@@ -347,7 +347,7 @@ is **not** measured, stated plainly:
 ## Agent surface
 
 ```sh
-cu start [--data DIR]        # one daemon per machine; a second start fails cleanly
+cu start [--data DIR] [--webgl]   # one daemon per machine; a second start fails cleanly
 cu status [--short]          # daemon, browser and how many leases are held
 cu tab open [URL] [--lease S] [--label NAME]   # one tab per test
 cu tab close ID · cu tab renew ID [SECONDS] · cu tabs [close ID]
@@ -367,6 +367,15 @@ errors say what is wrong and what to do. Underneath: `GET /v1/status`,
 `POST /v1/navigate`, `/v1/click`, `/v1/type`, `/v1/act`, `/v1/lease` and
 session routes — all bearer-token protected, loopback only. The Rust SDK
 (`Client`) mirrors the CLI.
+
+**WebGL (opt-in).** The default launch has no GPU process (`--disable-gpu`), so
+WebGL is off and sites that need WebGL2 (CapCut's editor, map and 3D apps)
+refuse the browser. `cu start --webgl` (or `CU_WEBGL=1`) drops `--disable-gpu`
+and adds `--use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader
+--ignore-gpu-blocklist`: WebGL2 on SwiftShader, a CPU renderer, which works on a
+GPU-less server under xvfb (Chromium 137+ needs `--enable-unsafe-swiftshader`
+to expose it to pages). It costs CPU, so leave it off unless a site needs it;
+`cu diagnostics` shows the GL renderer in use.
 
 ## Security
 
