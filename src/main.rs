@@ -172,7 +172,7 @@ fn main() {
 }
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
     );
 }
 
@@ -185,6 +185,7 @@ fn start(args: &[String]) -> Result<(), String> {
     let mut port = DEFAULT_PORT;
     let mut mode = BrowserMode::from_env()?;
     let mut data = PathBuf::from(env::var_os("CU_DATA_DIR").unwrap_or_else(|| ".cu".into()));
+    let mut webgl = false;
     let mut public_url = env::var("CU_PUBLIC_URL").ok().filter(|u| !u.trim().is_empty());
     let mut i = 0;
     while i < args.len() {
@@ -206,6 +207,7 @@ fn start(args: &[String]) -> Result<(), String> {
                 mode = BrowserMode::parse(args.get(i).ok_or("--mode needs fast or compat")?)?;
             }
             "--compat" => mode = BrowserMode::Compatibility,
+            "--webgl" => webgl = true,
             "--public-url" => {
                 i += 1;
                 public_url = Some(args.get(i).ok_or("--public-url needs a URL")?.clone());
@@ -216,7 +218,8 @@ fn start(args: &[String]) -> Result<(), String> {
     }
     // Decided before anything is written, so a compatibility start that has
     // no full browser to run fails here instead of after the daemon is up.
-    let policy = BrowserPolicy::resolve(mode)?;
+    let mut policy = BrowserPolicy::resolve(mode)?;
+    policy.webgl |= webgl;
     let public = public_url
         .as_deref()
         .map(server::parse_public_url)

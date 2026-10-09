@@ -3,6 +3,9 @@
 Use `cu` when an agent needs a persistent local browser session.
 
 1. Start once: `cu start --data .cu`.
+   If a site says the browser lacks WebGL/WebGL2 (e.g. CapCut's
+   `/incompatibility` page), restart with `cu start --webgl` (or
+   `CU_WEBGL=1`): software WebGL2, more CPU, off by default.
 2. Check it: `cu status`.
 3. Navigate with `cu navigate https://example.com`. If the reply says
    `"settled":false`, the page was still loading when the three-second wait
