@@ -127,6 +127,7 @@ impl TestServer {
             token: token.clone(),
             cdp_port,
             browser: Arc::clone(&browser_state),
+            public_host: None,
         });
         std::thread::spawn(move || server::serve(state, listener));
         Self {

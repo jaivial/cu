@@ -21,6 +21,9 @@ pub struct AppState {
     pub cdp_port: u16,
     /// Readiness of the persistent browser, shared with the launch thread.
     pub browser: Arc<BrowserState>,
+    /// Host (lower-case, no port) of the public URL a reverse proxy serves
+    /// `/login` under (`CU_PUBLIC_URL` / `--public-url`), if any.
+    pub public_host: Option<String>,
 }
 
 /// Whether the persistent browser is up, or why it never came up.
@@ -618,7 +621,15 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
         "\n\n"
     };
     let body = request.split(sep).nth(1).unwrap_or("");
-    let (status, content_type, response) = if path == "/login" && method == "GET" {
+    let head = request.split(sep).next().unwrap_or("");
+    let host_ok = host_allowed(header_value(head, "host"), path, state.public_host.as_deref());
+    let (status, content_type, response) = if !host_ok {
+        (
+            "421 Misdirected Request",
+            "application/json",
+            "{\"error\":\"host not served here\"}".into(),
+        )
+    } else if path == "/login" && method == "GET" {
         ("200 OK", "text/html", login_page())
     } else if path == "/login" && method == "POST" {
         ("200 OK", "text/html", login_submit(body, &state))
@@ -636,6 +647,42 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
         response.len()
     );
+}
+
+/// Whether a request's `Host` header is one this daemon answers.
+///
+/// The listener is loopback-only, so loopback names (any port) are accepted for
+/// every route; a missing header is too, for raw local clients. The public
+/// host a reverse proxy forwards is accepted for `/login` only, which is all
+/// the documented proxy exposes. Any other host is refused, which also keeps a
+/// DNS-rebinding page from reaching the API through a browser.
+pub fn host_allowed(host: Option<&str>, path: &str, public_host: Option<&str>) -> bool {
+    let Some(host) = host else { return true };
+    let host = host.trim().to_ascii_lowercase();
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host.rsplit_once(':').map_or(host.as_str(), |(name, _)| name)
+    };
+    if matches!(name, "localhost" | "127.0.0.1" | "::1") {
+        return true;
+    }
+    path == "/login" && public_host == Some(name)
+}
+
+/// Normalise a public base URL (`https://login.example.com[:port][/]`) and
+/// return it without the trailing slash, plus its lower-case host.
+pub fn parse_public_url(url: &str) -> Result<(String, String), String> {
+    let url = url.trim().trim_end_matches('/');
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or("public URL must start with https:// or http://")?;
+    if rest.is_empty() || rest.contains(['/', '?', '#', '@', '"', '\\']) || rest.contains(char::is_whitespace) {
+        return Err("public URL must be a bare origin like https://login.example.com".into());
+    }
+    let host = rest.rsplit_once(':').map_or(rest, |(name, _)| name).to_ascii_lowercase();
+    Ok((url.to_string(), host))
 }
 
 /// Position of `needle` in `haystack`, if present.
@@ -3523,6 +3570,7 @@ mod tests {
             token: "t".into(),
             cdp_port: 1,
             browser: BrowserState::new(),
+            public_host: None,
         };
         let page = login_submit("username=&password=", &state);
         assert!(!page.contains("Login received"));
@@ -3536,6 +3584,7 @@ mod tests {
             token: "t".into(),
             cdp_port: 1,
             browser: BrowserState::new(),
+            public_host: None,
         };
         // The browser is unreachable on port 1, so nothing is typed; the point
         // is that no password ever comes back in the page.

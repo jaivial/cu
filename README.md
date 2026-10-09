@@ -374,6 +374,9 @@ The daemon binds to loopback only. Its bearer token is generated per data
 directory and stored in `.cu/server.json`, which is gitignored and must never be
 committed or published. Credentials are typed into the page by the daemon from
 the local login form; they are never passed to the model, logged, or returned.
+To reach that form from another device, publish only `/login` behind a TLS
+reverse proxy and start the daemon with `CU_PUBLIC_URL` (`--public-url`); other
+`Host` headers are refused. See *Public login URL* in [docs/README.md](docs/README.md).
 
 ## Reproducing the benchmarks
 

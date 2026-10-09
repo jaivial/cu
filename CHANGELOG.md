@@ -4,6 +4,11 @@
 
 ### Added
 
+- Public login URL: `CU_PUBLIC_URL` / `cu start --public-url URL` tells the
+  daemon the origin a reverse proxy serves `/login` under; `cu login` prints
+  it. Requests are accepted for loopback `Host` names, plus the public host on
+  `/login` only; any other `Host` gets 421. docs/README.md documents the
+  Cloudflare + nginx (`location = /login`) + certbot setup.
 - Screenshot control: `GET /v1/screenshot` takes `width`, `height` (viewport
   in CSS pixels), `scale` (device scale factor, e.g. `2` for retina-sharp),
   `ref` or `selector` (clip to one element) and `padding`; `cu shot` takes the
