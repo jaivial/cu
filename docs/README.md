@@ -169,7 +169,7 @@ download already named it in its result. A download started from
 Latency for every one of these is tracked in [BENCHMARKS.md](BENCHMARKS.md),
 including a comparison with agent-browser and Playwright MCP.
 
-The browser executable defaults to `chromium`; set `CU_BROWSER` to an alternate binary. Browsers are launched headless, which is what an agent usually wants; set `CU_HEADLESS=0` to attach a display instead. `CU_DATA_DIR` changes the default data directory and `CU_CDP_PORT` the DevTools port (default `9222`). Do not expose this server beyond localhost without adding TLS and an access-control layer.
+The browser executable defaults to `chromium`; set `CU_BROWSER` to an alternate binary. Browsers are launched headless, which is what an agent usually wants; set `CU_HEADLESS=0` to attach a display instead. `CU_DATA_DIR` changes the default data directory and `CU_CDP_PORT` the DevTools port (default `9222`). Do not expose this server beyond localhost without adding TLS and an access-control layer; the one supported exposure is the login form behind a reverse proxy (see *Public login URL*).
 
 ### Browser mode: fast-test and compatibility
 
@@ -245,6 +245,85 @@ Nothing is ever mistyped: the field receives exactly the given text, which matte
 ## Login
 
 `POST /login` takes `username` and `password` form fields. The daemon types them into the page the browser is showing and submits the form, which is how the credentials reach the site without ever passing through an agent. The password is not written to disk, not logged and not included in the response; the reply only says whether it could be typed. Navigate to the sign-in page first, or the submission has nowhere to go.
+
+## Public login URL
+
+The daemon always binds to `127.0.0.1`. To let a person open the login form from another machine (a phone, a laptop) without exposing the API, put a TLS reverse proxy in front that forwards **only** `/login`, and tell the daemon its public URL:
+
+```sh
+CU_PUBLIC_URL=https://login.example.com cu start --port 8801
+# or: cu start --port 8801 --public-url https://login.example.com
+cu login   # -> Open https://login.example.com/login in a browser. ...
+```
+
+- `CU_PUBLIC_URL` / `--public-url` takes a bare origin (`https://host[:port]`, no path). It is checked at start, written to `server.json` as `public_url`, and `cu login` prints `<public_url>/login` (falling back to `CU_PUBLIC_URL`, then `http://127.0.0.1:<port>/login`).
+- **Host check.** The daemon answers `Host: localhost`, `127.0.0.1` or `[::1]` (any port, or no `Host` at all) on every route, and the configured public host on `/login` only. Any other `Host` gets `421 Misdirected Request`. That also stops DNS-rebinding pages reaching the API through a browser. A proxy must therefore pass the original host (`proxy_set_header Host $host;`), and a daemon behind a proxy **must** be started with `CU_PUBLIC_URL`, or the proxied `/login` is refused.
+- The form posts back to the relative `/login`, and the daemon builds no absolute URLs, so `X-Forwarded-Proto` / `X-Forwarded-For` are not needed and are ignored. TLS ends at the proxy.
+- `/login` is unauthenticated by design: anyone who can reach it can type credentials into whatever page the browser is showing. Publish it only while a login is in progress if that matters to you, or add `auth_basic` / an IP `allow` list in the proxy.
+
+### Replicating the setup (as deployed on kraken)
+
+kraken serves the daemon on port 8801 as `https://cucredentials.menustudioai.com/login`. For another daemon, swap in your own subdomain, server IP and port.
+
+1. **DNS (Cloudflare).** Create an `A` record for the subdomain pointing at the server, DNS-only (grey cloud) so certbot's HTTP challenge and the TLS certificate are the server's own:
+
+   ```sh
+   curl -X POST "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records" \
+     -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+     --data '{"type":"A","name":"cucredentials.menustudioai.com","content":"65.109.100.94","ttl":1,"proxied":false}'
+   ```
+
+2. **nginx vhost** (`/etc/nginx/sites-available/cucredentials.menustudioai.com`, symlinked into `sites-enabled`). Only `location = /login` (exact match, both GET and POST) is proxied; everything else is a redirect on :80 and a 404 on :443, so `/v1/*` is unreachable from outside:
+
+   ```nginx
+   server {
+       listen 80;
+       listen [::]:80;
+       server_name cucredentials.menustudioai.com;
+       location /.well-known/acme-challenge/ { root /var/www/certbot; }
+       location = /login {
+           proxy_pass http://127.0.0.1:8801;
+           proxy_http_version 1.1;
+           proxy_set_header Host $host;
+           proxy_set_header X-Real-IP $remote_addr;
+           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+           proxy_set_header X-Forwarded-Proto $scheme;
+       }
+       location / { return 301 https://$host$request_uri; }
+   }
+
+   server {
+       listen 443 ssl;
+       listen [::]:443 ssl;
+       server_name cucredentials.menustudioai.com;
+       ssl_certificate     /etc/letsencrypt/live/cucredentials.menustudioai.com/fullchain.pem;
+       ssl_certificate_key /etc/letsencrypt/live/cucredentials.menustudioai.com/privkey.pem;
+       location = /login {
+           proxy_pass http://127.0.0.1:8801;
+           proxy_http_version 1.1;
+           proxy_set_header Host $host;
+           proxy_set_header X-Real-IP $remote_addr;
+           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+           proxy_set_header X-Forwarded-Proto $scheme;
+       }
+       location / { return 404; }
+   }
+   ```
+
+3. **Certificate (Let's Encrypt).** Enable the :80 server block first, then issue with the nginx plugin (renewal is handled by certbot's timer), then add the :443 block and reload:
+
+   ```sh
+   sudo certbot certonly --nginx -d cucredentials.menustudioai.com
+   sudo nginx -t && sudo systemctl reload nginx
+   ```
+
+4. **Daemon.** Start it with the public URL (in a systemd unit, add it to the `env` list):
+
+   ```sh
+   CU_PUBLIC_URL=https://cucredentials.menustudioai.com cu start --port 8801 --data /path/to/data
+   ```
+
+5. **Check.** `https://<host>/login` answers 200 with the form, `https://<host>/v1/status` answers 404 (nginx), and `cu login` prints the public URL.
 
 ## SDK
 

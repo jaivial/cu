@@ -154,7 +154,8 @@ fn main() {
         }
         Some("login") => {
             println!(
-                "Open http://127.0.0.1:{DEFAULT_PORT}/login in a browser. Passwords go directly to the server."
+                "Open {} in a browser. Passwords go directly to the server.",
+                login_url()
             );
             Ok(())
         }
@@ -171,7 +172,7 @@ fn main() {
 }
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
     );
 }
 
@@ -184,6 +185,7 @@ fn start(args: &[String]) -> Result<(), String> {
     let mut port = DEFAULT_PORT;
     let mut mode = BrowserMode::from_env()?;
     let mut data = PathBuf::from(env::var_os("CU_DATA_DIR").unwrap_or_else(|| ".cu".into()));
+    let mut public_url = env::var("CU_PUBLIC_URL").ok().filter(|u| !u.trim().is_empty());
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -204,6 +206,10 @@ fn start(args: &[String]) -> Result<(), String> {
                 mode = BrowserMode::parse(args.get(i).ok_or("--mode needs fast or compat")?)?;
             }
             "--compat" => mode = BrowserMode::Compatibility,
+            "--public-url" => {
+                i += 1;
+                public_url = Some(args.get(i).ok_or("--public-url needs a URL")?.clone());
+            }
             flag => return Err(format!("unknown option {flag}")),
         }
         i += 1;
@@ -211,6 +217,10 @@ fn start(args: &[String]) -> Result<(), String> {
     // Decided before anything is written, so a compatibility start that has
     // no full browser to run fails here instead of after the daemon is up.
     let policy = BrowserPolicy::resolve(mode)?;
+    let public = public_url
+        .as_deref()
+        .map(server::parse_public_url)
+        .transpose()?;
     cu::scheduler::configure(cu::scheduler::Budget::for_mode(mode));
     fs::create_dir_all(data.join("profiles/default")).map_err(|e| e.to_string())?;
     fs::create_dir_all(data.join("sessions")).map_err(|e| e.to_string())?;
@@ -226,7 +236,13 @@ fn start(args: &[String]) -> Result<(), String> {
     let token = server::random_token();
     fs::write(
         data.join("server.json"),
-        format!("{{\"port\":{port},\"token\":\"{token}\"}}\n"),
+        match &public {
+            Some((url, _)) => format!(
+                "{{\"port\":{port},\"token\":\"{token}\",\"public_url\":\"{}\"}}\n",
+                server::json_escape(url)
+            ),
+            None => format!("{{\"port\":{port},\"token\":\"{token}\"}}\n"),
+        },
     )
     .map_err(|e| e.to_string())?;
     // Listen and publish the token before the browser is up: `cu start` then
@@ -237,14 +253,34 @@ fn start(args: &[String]) -> Result<(), String> {
     let browser = server::BrowserState::new();
     server::spawn_browser_thread(data.clone(), cdp_port, Arc::clone(&browser), policy);
     eprintln!("cu listening on http://127.0.0.1:{port}; browser DevTools on 127.0.0.1:{cdp_port}");
+    if let Some((url, _)) = &public {
+        eprintln!("cu login page published at {url}/login");
+    }
     let state = Arc::new(AppState {
         data_dir: data,
         token,
         cdp_port,
         browser,
+        public_host: public.map(|(_, host)| host),
     });
     server::serve(state, listener);
     Ok(())
+}
+/// Where a person opens the login form: the running daemon's public URL, else
+/// `CU_PUBLIC_URL`, else the daemon's loopback port.
+fn login_url() -> String {
+    let data = env::var_os("CU_DATA_DIR").unwrap_or_else(|| ".cu".into());
+    let config = fs::read_to_string(PathBuf::from(data).join("server.json")).unwrap_or_default();
+    let public = server::json_value(&config, "public_url")
+        .or_else(|| env::var("CU_PUBLIC_URL").ok())
+        .and_then(|u| server::parse_public_url(&u).ok());
+    if let Some((url, _)) = public {
+        return format!("{url}/login");
+    }
+    let port = server::json_value(&config, "port")
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_PORT);
+    format!("http://127.0.0.1:{port}/login")
 }
 fn request(method: &str, path: &str, body: Option<&str>) -> Result<String, String> {
     let data = env::var_os("CU_DATA_DIR").unwrap_or_else(|| ".cu".into());
