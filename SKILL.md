@@ -6,6 +6,12 @@ Use `cu` when an agent needs a persistent local browser session.
    If a site says the browser lacks WebGL/WebGL2 (e.g. CapCut's
    `/incompatibility` page), restart with `cu start --webgl` (or
    `CU_WEBGL=1`): software WebGL2, more CPU, off by default.
+   The browser runs with a window on an X display (cu starts its own Xvfb when
+   the machine has none) and with a windowed User-Agent and no
+   `navigator.webdriver`, because sites behind Cloudflare Turnstile answer a
+   headless browser with "verifying you are not a bot" instead of the page.
+   `CU_HEADLESS=1` asks for `--headless=new` back (and those sites will
+   challenge), `CU_DISPLAY=:N` picks the display.
 2. Check it: `cu status`.
 3. Navigate with `cu navigate https://example.com`. If the reply says
    `"settled":false`, the page was still loading when the three-second wait

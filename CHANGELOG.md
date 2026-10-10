@@ -4,6 +4,21 @@
 
 ### Added
 
+- Browser fingerprint hardening (`src/stealth.rs`, on by default, `CU_STEALTH=0`
+  to turn it off): the launch now prefers a window on an X display
+  (`CU_DISPLAY`, an existing `DISPLAY`, or an Xvfb the daemon starts and stops
+  with the browser) over `--headless=new`; the User-Agent is rewritten with
+  `Network.setUserAgentOverride` to the one the same build reports with a
+  window (HTTP header *and* client hints); `Page.addScriptToEvaluateOnNewDocument`
+  removes `navigator.webdriver` and the DevTools command line's
+  `cdc_...`/`window.__proto__` names; the software GL renderer is answered as a
+  desktop GPU. Measured on `receitasdepesos.com.br` (Chrome 145): headless
+  returned the Cloudflare interstitial (`human_required`, 403), the same
+  browser headful returned 200 and the real page. `cu diagnostics` gains a
+  `stealth` block, and every page assessment reads the fingerprint values back
+  and notes anything that still reads as automation. Nothing here solves or
+  evades a challenge -- a site that still wants a person gets the hand-off.
+
 - Public login URL: `CU_PUBLIC_URL` / `cu start --public-url URL` tells the
   daemon the origin a reverse proxy serves `/login` under; `cu login` prints
   it. Requests are accepted for loopback `Host` names, plus the public host on
