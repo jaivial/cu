@@ -69,7 +69,6 @@ impl BrowserMode {
 /// the page for CPU. Site isolation is relaxed so same-site frames share one
 /// renderer, which is most of the memory saving.
 pub const FAST_TEST_ARGS: &[&str] = &[
-    "--remote-allow-origins=*",
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-dev-shm-usage",
@@ -112,7 +111,9 @@ pub const FAST_TEST_ARGS: &[&str] = &[
 /// Deliberately absent: `--disable-gpu`, `--disable-extensions`, site
 /// isolation, `--disable-features`, `--mute-audio`, `--enable-automation`
 /// (which sets `navigator.webdriver`) and `--remote-allow-origins` (cu's
-/// websocket sends no `Origin`, so it is not needed).
+/// websocket sends no `Origin`, so it is not needed: the flag only widens
+/// who may open the DevTools socket, and a browser without it still accepts
+/// an `Origin`-less client, which is the only kind cu ever is).
 pub const COMPATIBILITY_ARGS: &[&str] = &[
     "--no-first-run",
     "--no-default-browser-check",

@@ -566,26 +566,37 @@ pub const OBSERVE_JS: &str = r#"JSON.stringify((function(){
 })())"#;
 
 /// Note anything a page still reads as an automation tell.
+///
+/// Idempotent on purpose: this runs on every challenge assessment, so a note
+/// that is already there is not pushed a second time. Otherwise the
+/// diagnostics of a long session grow one copy per navigation.
 pub fn record_observed(observed: &str) {
     let read = |key: &str| {
         crate::server::json_string_value(observed, key)
             .unwrap_or_default()
             .eq_ignore_ascii_case("true")
     };
+    let once = |message: String| {
+        if let Ok(notes) = state().lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            if !notes.contains(&message) {
+                notes.push(message);
+            }
+        }
+    };
     if read("headless") {
-        remember("a page still reads a Headless User-Agent".into());
+        once("a page still reads a Headless User-Agent".into());
     }
     if read("webdriver") {
-        remember("a page still reads navigator.webdriver = true".into());
+        once("a page still reads navigator.webdriver = true".into());
     }
     if read("commandLine") {
-        remember("a page still reads the DevTools command line".into());
+        once("a page still reads the DevTools command line".into());
     }
     if read("proto") {
-        remember("a page still reads the driver’s window.__proto__".into());
+        once("a page still reads the driver’s window.__proto__".into());
     }
     let gl = crate::server::json_string_value(observed, "gl").unwrap_or_default();
     if !gl.is_empty() && !gl.contains("SwiftShader") {
-        remember(format!("GPU renderer reported to pages: {gl}"));
+        once(format!("GPU renderer reported to pages: {gl}"));
     }
 }
