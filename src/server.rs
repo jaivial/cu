@@ -1772,6 +1772,15 @@ const MAX_VIEWPORT: u32 = 8192;
 /// Largest device scale factor accepted.
 const MAX_SCALE: f64 = 4.0;
 
+/// How long the screenshot's measure step waits for two painted frames, in
+/// milliseconds, before measuring the page anyway.
+///
+/// Two frames at 60 Hz are about 33 ms, so a page that is painting pays a
+/// third of this and nothing; the budget only matters on a browser that has
+/// stopped producing frames for the tab, where the wait ends by itself
+/// instead of hanging the capture until the socket read times out.
+const FRAME_WAIT_MS: u32 = 250;
+
 impl ShotOptions {
     pub fn parse(query: &str) -> Result<Self, String> {
         let get = |key: &str| Some(form_value(query, key)).filter(|v| !v.is_empty());
@@ -1861,6 +1870,18 @@ fn capture(tab: &Tab, options: &ShotOptions) -> Result<(String, String), String>
     };
     // Measuring also waits two frames, so the new viewport has been laid out
     // and painted (responsive images, layout transitions) before the capture.
+    //
+    // The frame wait is bounded, and it must be: `requestAnimationFrame` only
+    // fires while the browser is producing frames for the tab, and on a host
+    // with no GPU a tab that is not visible (occluded, another window on top,
+    // a window the window manager never mapped) produces none at all. An
+    // unbounded wait there never resolves, `Runtime.evaluate` with
+    // `awaitPromise` never answers, the read times out and the whole capture
+    // dies with "Resource temporarily unavailable" -- a screenshot that fails
+    // on *every* page of such a browser. Racing the frames against a timer
+    // keeps the paint wait on a page that is painting and gives up on one
+    // that is not: `Page.captureScreenshot` below reads the frame that is
+    // there, which on a still frame is the page.
     let what = options
         .reference
         .clone()
@@ -1868,7 +1889,8 @@ fn capture(tab: &Tab, options: &ShotOptions) -> Result<(String, String), String>
         .unwrap_or_default();
     let expression = format!(
         "(async()=>{{const err=(m)=>JSON.stringify({{error:m}});{}\
-         await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));\
+         await new Promise(r=>{{let done=false;const go=()=>{{if(!done){{done=true;r();}}}};\
+         requestAnimationFrame(()=>requestAnimationFrame(go));setTimeout(go,{FRAME_WAIT_MS});}});\
          {}}})()",
         match &target {
             Some(target) => format!(
@@ -1936,6 +1958,14 @@ fn capture(tab: &Tab, options: &ShotOptions) -> Result<(String, String), String>
     };
     params.push('}');
     let result = tab.command("Page.captureScreenshot", &params)?;
+    // A capture the browser refused has no `data`, and reporting that as a
+    // 200 with a null image is what made a broken capture look like a working
+    // one: the agent got `jpeg_base64: null` instead of the reason.
+    if let Some(error) = json_object(&result, "error") {
+        return Err(json_string_value(&error, "message")
+            .or_else(|| json_string_value(&error, "code").map(|c| format!("capture failed ({c})")))
+            .unwrap_or_else(|| "the browser returned no image".into()));
+    }
     // Without an override the real device scale factor is unknown here, so
     // the size is only reported when it is known.
     let size = if options.scale.is_some() {
