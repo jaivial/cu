@@ -152,7 +152,11 @@ pub fn classify(probe: &Probe) -> Verdict {
     // automatic device check (it may reload into the site), `rt:'c'` the
     // CAPTCHA.
     if has(probe, "dd-t-bv") {
-        return Verdict::new(Blocked, Some("datadome"), vec!["datadome block page (t=bv)".into()]);
+        return Verdict::new(
+            Blocked,
+            Some("datadome"),
+            vec!["datadome block page (t=bv)".into()],
+        );
     }
     if has(probe, "dd-rt-c") {
         return Verdict::new(
@@ -477,9 +481,9 @@ fn first_party(probe: &Probe) -> Option<Verdict> {
     };
     // Hash-routed SPAs keep the route in the fragment (`#/challenge/...`).
     let fragment = probe.url.split_once('#').map(|(_, f)| f.to_lowercase());
-    let by_path = CHECKPOINT_PATHS.iter().find(|p| {
-        path.contains(*p) || fragment.as_deref().is_some_and(|f| f.contains(&p[1..]))
-    });
+    let by_path = CHECKPOINT_PATHS
+        .iter()
+        .find(|p| path.contains(*p) || fragment.as_deref().is_some_and(|f| f.contains(&p[1..])));
     let code_form = has(probe, "code-form");
     let form = has(probe, "form-input");
     let wording = text_has(probe, CHECKPOINT_TEXT);
@@ -604,6 +608,23 @@ where
     Ok(probe)
 }
 
+/// The fingerprint values [`crate::stealth`] installs, read from the page's
+/// own world -- the one world where `navigator.userAgent` is the one the
+/// navigation carried and the renderer answers to.
+///
+/// Read once, after the probe: a page that has just decided what to show has
+/// already read everything, and this is what says why. It runs in the
+/// browser's own world (no `contextId`), which is the whole point.
+fn observe_stealth(cmd: &mut impl FnMut(&str, &str) -> Result<String, String>) {
+    let params = crate::execution::evaluate_params(crate::stealth::OBSERVE_JS, "", false);
+    let observed = cmd("Runtime.evaluate", &params)
+        .ok()
+        .and_then(|reply| crate::server::evaluated_string(&reply));
+    if let Some(observed) = observed {
+        crate::stealth::record_observed(&observed);
+    }
+}
+
 /// How long an interstitial is given to clear by itself before it is handed
 /// to a person: `CU_CHALLENGE_WAIT_MS`, default 10 s, at most 60 s.
 pub fn wait_budget() -> Duration {
@@ -662,11 +683,13 @@ where
                         ));
                     }
                 }
+                observe_stealth(&mut cmd);
                 return Assessment::new(&probe, verdict, waited);
             }
             Err(e) => e,
         };
         if started.elapsed() >= budget.max(Duration::from_millis(1500)) {
+            observe_stealth(&mut cmd);
             return Assessment {
                 state: ChallengeState::Unknown,
                 vendor: None,
@@ -735,7 +758,9 @@ impl Assessment {
         Some(match self.state {
             ChallengeState::Ready => return None,
             ChallengeState::HumanRequired => {
-                "a person must complete this check in the browser (run cu headful with CU_HEADLESS=0); \
+                "a person must complete this check in the browser (cu already runs headful on \
+                 an X display by default; a daemon started with CU_HEADLESS=1 is the one that \
+                 needs CU_HEADLESS=0 to get a window, and CU_STEALTH=0 turns the hardening off); \
                  automatic actions on this tab are paused until a fresh check shows it cleared \
                  (cu challenge), or the hand-off is released (cu challenge release)"
             }
@@ -790,10 +815,15 @@ fn metrics() -> &'static Mutex<Metrics> {
 /// The `challenge` object of `/v1/diagnostics`.
 pub fn metrics_json() -> String {
     let m = metrics().lock().unwrap_or_else(|e| e.into_inner());
-    let defences: u64 = ["challenge_pending", "human_required", "blocked", "rate_limited"]
-        .iter()
-        .map(|s| m.by_state.get(s).copied().unwrap_or(0))
-        .sum();
+    let defences: u64 = [
+        "challenge_pending",
+        "human_required",
+        "blocked",
+        "rate_limited",
+    ]
+    .iter()
+    .map(|s| m.by_state.get(s).copied().unwrap_or(0))
+    .sum();
     let ratio = |n: u64, d: u64| {
         if d == 0 {
             "null".to_string()
@@ -990,7 +1020,9 @@ fn recheck_after_url_change(tab: &Tab, changed_at: Instant) {
     if fresh.url == before.url && fresh.state == before.state {
         return;
     }
-    fresh.signals.push("re-checked after the address changed".into());
+    fresh
+        .signals
+        .push("re-checked after the address changed".into());
     {
         let mut m = metrics().lock().unwrap_or_else(|e| e.into_inner());
         m.url_rechecks += 1;

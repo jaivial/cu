@@ -24,6 +24,8 @@ pub struct LaunchRecord {
     pub resolved: String,
     pub headless: bool,
     pub headless_shell: bool,
+    /// X display the browser got a window on (`None` while headless).
+    pub display: Option<String>,
     pub args: Vec<String>,
     pub started_unix: u64,
     /// From `/json/version` once DevTools answers.
@@ -51,6 +53,7 @@ pub fn record_launch(policy: &BrowserPolicy, args: &[String]) {
         resolved: policy.resolved.display().to_string(),
         headless: policy.headless,
         headless_shell: policy.headless_shell,
+        display: policy.display.clone(),
         // The profile path is the only argument that names the user's
         // machine layout; it is kept, there is no secret in it.
         args: args.to_vec(),
@@ -146,7 +149,9 @@ fn notes(record: &LaunchRecord) -> Vec<String> {
         .as_deref()
         .is_some_and(|ua| ua.contains("HeadlessChrome"))
     {
-        notes.push("the User-Agent says HeadlessChrome: sites can see headless mode".into());
+        // Reported by `/json/version`, before the User-Agent is replaced; the
+        // stealth notes say what the browser answers with instead.
+        notes.push("the User-Agent said HeadlessChrome before hardening".into());
     }
     if let Some(gl) = &record.gl_renderer {
         let lower = gl.to_ascii_lowercase();
@@ -175,11 +180,12 @@ fn opt(value: &Option<String>) -> String {
 
 fn launch_json(record: &LaunchRecord) -> String {
     format!(
-        "{{\"mode\":{},\"headless\":{},\"requested\":{},\"executable\":{},\"resolved\":{},\
+        "{{\"mode\":{},\"headless\":{},\"display\":{},\"requested\":{},\"executable\":{},\"resolved\":{},\
          \"product\":{},\"protocol\":{},\"user_agent\":{},\"v8\":{},\"gl_renderer\":{},\
          \"ready_ms\":{},\"started_unix\":{},\"error\":{},\"args\":[{}],\"notes\":[{}]}}",
         json_string(&record.mode),
         json_string(headless_name(record)),
+        opt(&record.display),
         json_string(&record.requested),
         json_string(&record.executable),
         json_string(&record.resolved),
@@ -298,8 +304,9 @@ pub fn json() -> String {
         .map(launch_json)
         .unwrap_or_else(|| "null".into());
     format!(
-        "{{\"browser\":{launch},\"session\":{},\"protocol\":{},\"origins\":{},\"challenge\":{},\"targets\":{},\"note\":{}}}",
+        "{{\"browser\":{launch},\"session\":{},\"stealth\":{},\"protocol\":{},\"origins\":{},\"challenge\":{},\"targets\":{},\"note\":{}}}",
         crate::session::json(),
+        crate::stealth::json(),
         protocol_json(),
         crate::scheduler::json(),
         crate::challenge::metrics_json(),

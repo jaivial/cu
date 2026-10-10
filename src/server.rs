@@ -255,6 +255,7 @@ pub fn spawn_browser_thread(
                     );
                     restore_cookies(cdp_port, &data.join("profiles/default"));
                     observe_identity(cdp_port);
+                    harden(cdp_port, &policy);
                 }
                 Err(e) => {
                     crate::diagnostics::record_failure(&e);
@@ -284,6 +285,47 @@ fn restore_cookies(cdp_port: u16, profile: &Path) {
         false => Ok(()),
     }) {
         eprintln!("cu: could not restore the saved session's cookies: {e}");
+    }
+}
+
+/// Give the browser the fingerprint hardening [`crate::stealth`] describes,
+/// before the first action, and note what happened.
+///
+/// Best effort by design: a browser that could not be hardened still browses
+/// (`cu navigate` must never fail because a defence script did not apply),
+/// and `/v1/diagnostics` reports what did or did not happen. The window the
+/// profile asks for is the size the window is set to, grown onto the whole
+/// virtual screen when the display's size is known, so `screen` reads a real
+/// desktop rather than an 800x600 window floating in one.
+fn harden(cdp_port: u16, policy: &BrowserPolicy) {
+    if !policy.stealth {
+        eprintln!("cu: stealth off (CU_STEALTH=0)");
+        return;
+    }
+    let window = policy.display.as_deref().and_then(|display| {
+        let (width, height) = crate::session::identity()
+            .and_then(|i| i.window)
+            .unwrap_or((1440, 900));
+        match crate::stealth::display_size(display) {
+            Some((screen_w, screen_h)) => Some((
+                width.max(screen_w).min(4096),
+                height.max(screen_h).min(2160),
+            )),
+            None => Some((width, height)),
+        }
+    });
+    match crate::stealth::apply(cdp_port, window) {
+        Ok(notes) => {
+            for note in notes {
+                eprintln!("cu: stealth: {note}");
+            }
+            if let Some(display) = &policy.display {
+                if let Some((width, height)) = window {
+                    eprintln!("cu: stealth: window {width}x{height} on {display}");
+                }
+            }
+        }
+        Err(e) => eprintln!("cu: stealth could not be applied: {e}"),
     }
 }
 
@@ -342,11 +384,11 @@ fn spawn_browser_control(cdp_port: u16, data: &Path) {
         // Target discovery on the same connection: every popup, iframe
         // target and worker is announced here (observation only; nothing is
         // attached), for `GET /v1/targets` (see `crate::targets`).
-        if let Err(error) =
-            connection.call_observed("Target.setDiscoverTargets", "{\"discover\":true}", &mut |e| {
-                crate::targets::see(e)
-            })
-        {
+        if let Err(error) = connection.call_observed(
+            "Target.setDiscoverTargets",
+            "{\"discover\":true}",
+            &mut |e| crate::targets::see(e),
+        ) {
             eprintln!("cu: target discovery is off: {error}");
         }
         // Drain browser events (download progress, target changes) so the
@@ -389,6 +431,10 @@ pub fn shutdown_browser(cdp_port: u16) {
     if process_alive(pid) {
         let _ = Command::new("kill").arg(pid.to_string()).status();
     }
+    // The X server this daemon started goes with the browser: it has no other
+    // user, and a stale `:99` would keep the next launch headful when it
+    // should be headless.
+    crate::stealth::stop_display();
 }
 
 /// Close the browser and exit when the daemon is asked to stop.
@@ -493,13 +539,24 @@ pub fn launch_browser(data: &Path, cdp_port: u16, policy: &BrowserPolicy) -> Res
             "headless-shell"
         } else if policy.headless {
             "headless=new"
-        } else {
+        } else if policy.display.is_some() {
             "headful"
+        } else {
+            "headful asked for, no X display: headless=new"
         }
     );
+    if let Some(display) = &policy.display {
+        eprintln!("cu: browser window on DISPLAY={display}");
+    }
     let child = Command::new(&policy.executable)
         .args(&args)
         .envs(identity.env())
+        .envs(
+            policy
+                .display
+                .iter()
+                .map(|display| ("DISPLAY", display.as_str())),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -622,7 +679,11 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
     };
     let body = request.split(sep).nth(1).unwrap_or("");
     let head = request.split(sep).next().unwrap_or("");
-    let host_ok = host_allowed(header_value(head, "host"), path, state.public_host.as_deref());
+    let host_ok = host_allowed(
+        header_value(head, "host"),
+        path,
+        state.public_host.as_deref(),
+    );
     let (status, content_type, response) = if !host_ok {
         (
             "421 Misdirected Request",
@@ -662,7 +723,8 @@ pub fn host_allowed(host: Option<&str>, path: &str, public_host: Option<&str>) -
     let name = if let Some(rest) = host.strip_prefix('[') {
         rest.split(']').next().unwrap_or("")
     } else {
-        host.rsplit_once(':').map_or(host.as_str(), |(name, _)| name)
+        host.rsplit_once(':')
+            .map_or(host.as_str(), |(name, _)| name)
     };
     if matches!(name, "localhost" | "127.0.0.1" | "::1") {
         return true;
@@ -678,10 +740,16 @@ pub fn parse_public_url(url: &str) -> Result<(String, String), String> {
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
         .ok_or("public URL must start with https:// or http://")?;
-    if rest.is_empty() || rest.contains(['/', '?', '#', '@', '"', '\\']) || rest.contains(char::is_whitespace) {
+    if rest.is_empty()
+        || rest.contains(['/', '?', '#', '@', '"', '\\'])
+        || rest.contains(char::is_whitespace)
+    {
         return Err("public URL must be a bare origin like https://login.example.com".into());
     }
-    let host = rest.rsplit_once(':').map_or(rest, |(name, _)| name).to_ascii_lowercase();
+    let host = rest
+        .rsplit_once(':')
+        .map_or(rest, |(name, _)| name)
+        .to_ascii_lowercase();
     Ok((url.to_string(), host))
 }
 
@@ -1005,7 +1073,13 @@ fn context_session(
     context: &str,
     load: bool,
 ) -> (&'static str, &'static str, String) {
-    let error = |status, e: &str| (status, "application/json", format!("{{\"error\":{}}}", json_string(e)));
+    let error = |status, e: &str| {
+        (
+            status,
+            "application/json",
+            format!("{{\"error\":{}}}", json_string(e)),
+        )
+    };
     if !valid_name(context) {
         return error("400 Bad Request", "invalid context name");
     }
@@ -1033,7 +1107,10 @@ fn context_session(
         let set = cdp_browser_command(
             state.cdp_port,
             "Storage.setCookies",
-            &format!("{{\"cookies\":{cookies},\"browserContextId\":{}}}", json_string(&id)),
+            &format!(
+                "{{\"cookies\":{cookies},\"browserContextId\":{}}}",
+                json_string(&id)
+            ),
         )
         .and_then(|reply| match reply.contains("\"error\":{") {
             true => Err(json_value(&reply, "message").unwrap_or(reply)),
@@ -1049,7 +1126,10 @@ fn context_session(
                     json_objects(&cookies).len()
                 ),
             ),
-            Err(e) => error("502 Bad Gateway", &format!("could not set the cookies: {e}")),
+            Err(e) => error(
+                "502 Bad Gateway",
+                &format!("could not set the cookies: {e}"),
+            ),
         };
     }
     let Some(id) = browser_context(state.cdp_port) else {
@@ -1086,7 +1166,8 @@ fn context_session(
 /// budget (see [`crate::scheduler`]). A challenge or a block is never
 /// retried.
 fn navigate_scheduled(tab: &Tab, url: &str) -> (&'static str, &'static str, String) {
-    let refused = |r: crate::scheduler::Refused| ("429 Too Many Requests", "application/json", r.json());
+    let refused =
+        |r: crate::scheduler::Refused| ("429 Too Many Requests", "application/json", r.json());
     let retries = crate::scheduler::budget().retries;
     let mut attempt = 0;
     loop {
@@ -2220,16 +2301,16 @@ where
             crate::execution::World::Isolated
         };
         let context = match crate::execution::context_fragment(&mut cmd, world, &frame.id) {
-                Ok(fragment) => fragment,
-                Err(e) if index == 0 => return Err(e),
-                // The frame went away between the tree walk and here; its
-                // section says so rather than failing the whole snapshot.
-                Err(_) => {
-                    text.push_str(&format!(
-                        "- frame: {} (unreadable right now; take a new snapshot)\n",
-                        frame.url
-                    ));
-                    continue;
+            Ok(fragment) => fragment,
+            Err(e) if index == 0 => return Err(e),
+            // The frame went away between the tree walk and here; its
+            // section says so rather than failing the whole snapshot.
+            Err(_) => {
+                text.push_str(&format!(
+                    "- frame: {} (unreadable right now; take a new snapshot)\n",
+                    frame.url
+                ));
+                continue;
             }
         };
         let params = format!(
@@ -2414,8 +2495,7 @@ fn wait_for_page_on(tab: &Tab, budget: Duration) -> (Duration, bool) {
             thread::sleep(Duration::from_millis(2));
             continue;
         };
-        let params =
-            crate::execution::evaluate_params(&settle_script(left), &context, true);
+        let params = crate::execution::evaluate_params(&settle_script(left), &context, true);
         match tab.command("Runtime.evaluate", &params) {
             Ok(reply) if !reply.contains("\"exceptionDetails\"") => {
                 settled = evaluated_string(&reply).is_some_and(|state| state != "loading");
@@ -2901,6 +2981,20 @@ pub struct CdpConnection {
 }
 
 impl CdpConnection {
+    /// Open a DevTools websocket to one target of `cdp_port`, by id.
+    ///
+    /// The browser-level commands do not name a target, so the stealth pass
+    /// ([`crate::stealth`]) reaches the page ones through here.
+    pub fn target(cdp_port: u16, target: &str) -> Result<Self, String> {
+        let discovery = http_get(&format!("127.0.0.1:{cdp_port}"), "/json/list")?;
+        let ws = json_objects(&discovery)
+            .into_iter()
+            .find(|o| json_string_value(o, "id").as_deref() == Some(target))
+            .and_then(|o| json_string_value(&o, "webSocketDebuggerUrl"))
+            .ok_or_else(|| format!("no DevTools target {target} any more"))?;
+        Self::connect(&ws)
+    }
+
     /// Discover the tab's target and complete the websocket handshake.
     fn open(tab: &Tab) -> Result<Self, String> {
         let discovery = http_get(&format!("127.0.0.1:{}", tab.cdp_port), "/json")?;
@@ -2930,7 +3024,11 @@ impl CdpConnection {
     }
 
     /// Complete the websocket handshake with one DevTools endpoint.
-    fn connect(ws: &str) -> Result<Self, String> {
+    ///
+    /// Public because cu connects to endpoints other than a tab's own: the
+    /// browser-level control connection and the per-target pass of
+    /// [`crate::stealth`].
+    pub fn connect(ws: &str) -> Result<Self, String> {
         let (host, path) = ws
             .strip_prefix("ws://")
             .and_then(|s| s.split_once('/'))

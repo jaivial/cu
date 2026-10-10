@@ -16,6 +16,16 @@
 //! browser *less* normal than it is on this host; whatever the host itself
 //! looks like (no display, software GL, its IP) is reported by
 //! [`crate::diagnostics`], not hidden.
+//!
+//! **A window instead of `--headless`.** A headless Chrome says so in its
+//! User-Agent, in its client hints and in its own command line, and a site
+//! that reads any of them answers a navigation with "verifying you are not a
+//! bot" instead of the page (see [`crate::stealth`], which measures it). So
+//! the launch prefers a headful browser on an X display -- the daemon's own
+//! Xvfb when the machine has no display -- and only passes `--headless=new`
+//! when no display could be had or when `CU_HEADLESS=1` asks for it. Nothing
+//! is faked about a windowless host beyond the absence of the flag, and the
+//! fallback is logged.
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -132,6 +142,19 @@ pub fn webgl_from_env() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the post-launch hardening runs: on unless `CU_STEALTH` says
+/// empty, `0`, `off` or `false`.
+pub fn stealth_from_env() -> bool {
+    !matches!(
+        env::var("CU_STEALTH")
+            .unwrap_or_else(|_| "1".into())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "off" | "false" | "no"
+    )
+}
+
 /// Executables tried, in order, when `CU_BROWSER` is not set.
 ///
 /// `FastTest` keeps cu's historical default first. `Compatibility` prefers a
@@ -171,6 +194,14 @@ pub struct BrowserPolicy {
     pub headless_shell: bool,
     /// Software WebGL ([`WEBGL_ARGS`]) instead of `FastTest`'s `--disable-gpu`.
     pub webgl: bool,
+    /// X display the browser gets a window on: `CU_DISPLAY`, an existing
+    /// `DISPLAY`, or an Xvfb this daemon started. `None` means the browser
+    /// runs headless.
+    pub display: Option<String>,
+    /// Harden the running browser after launch ([`crate::stealth`]): a
+    /// windowed User-Agent, no `navigator.webdriver`, no DevTools command
+    /// line, no `SwiftShader` in the GL renderer. Off with `CU_STEALTH=0`.
+    pub stealth: bool,
 }
 
 impl BrowserPolicy {
@@ -196,10 +227,32 @@ impl BrowserPolicy {
                 resolved.display()
             ));
         }
-        let headless = env::var("CU_HEADLESS")
+        let stealth = stealth_from_env();
+        // A headful browser needs a display, and a headless-shell build is
+        // headless whatever it is told, so one of the two decides on its own.
+        // `CU_HEADLESS` still has the last word: `1` means headless even when a
+        // display is free, `0` means a window even when none is.
+        let asked = env::var("CU_HEADLESS")
             .ok()
-            .map(|v| v != "0")
-            .unwrap_or(true);
+            .map(|v| v.trim() != "0")
+            .filter(|headless| *headless || env::var("CU_HEADLESS").is_ok());
+        let mut display = None;
+        let mut headless = true;
+        if !headless_shell && asked != Some(true) {
+            match crate::stealth::display() {
+                Some(found) => {
+                    let name = found.name.clone();
+                    crate::stealth::remember_display(found);
+                    display = Some(name);
+                    headless = false;
+                }
+                None => {}
+            }
+        }
+        if asked == Some(true) {
+            headless = true;
+            display = None;
+        }
         Ok(Self {
             mode,
             requested,
@@ -208,11 +261,19 @@ impl BrowserPolicy {
             headless,
             headless_shell,
             webgl: webgl_from_env(),
+            display,
+            stealth,
         })
     }
 
     /// The full argument list, DevTools port and profile included.
     pub fn args(&self, profile: &Path, cdp_port: u16) -> Vec<String> {
+        // Anything a page could read out of `/proc/<pid>/cmdline` is left
+        // out: `--remote-debugging-port` on its own is the one an
+        // unprivileged page cannot read, but `--remote-allow-origins=*` and
+        // `--enable-automation` (which is what switches on the
+        // `AutomationControlled` blink feature, and so `navigator.webdriver`)
+        // are never given.
         let mut args = vec![format!("--remote-debugging-port={cdp_port}")];
         let base = match self.mode {
             BrowserMode::FastTest => FAST_TEST_ARGS,

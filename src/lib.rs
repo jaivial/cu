@@ -9,6 +9,7 @@ pub mod policy;
 pub mod scheduler;
 pub mod server;
 pub mod session;
+pub mod stealth;
 pub mod targets;
 use std::io::{Read, Write};
 use std::net::TcpStream;
