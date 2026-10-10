@@ -135,6 +135,22 @@
 
 ### Fixed
 
+- `GET /v1/screenshot` works again on a browser that is not painting. The
+  measure step that runs before the capture waited for two
+  `requestAnimationFrame` callbacks with no bound, and a tab only gets those
+  while the browser is producing frames for it: on a host with no GPU, a tab
+  that is occluded or was never mapped by a window manager produces none, at
+  all, ever. The `Runtime.evaluate` that awaited them never answered, the
+  socket read timed out (5 s, twice over the retry) and every screenshot came
+  back `{"error":"Resource temporarily unavailable (os error 11)"}` -- or, once
+  the read happened to win the race against the stale frame, a 200 with
+  `jpeg_base64: null` -- on *every* page and in both formats, while a raw
+  `Page.captureScreenshot` on the same tab returned a full image in 30 ms. The
+  frames are now raced against a 250 ms timer: a page that is painting still
+  gets its two frames (about 33 ms), and one that is not is measured anyway and
+  the existing frame is captured. A capture the browser refused is also
+  reported as the error it is, instead of a 200 carrying a null image.
+
 - The landing page no longer scrolls sideways. The screen-reader-only spans in
   the comparison tables were absolutely positioned with no positioned ancestor,
   so their `nowrap` text was laid out against the initial containing block and
