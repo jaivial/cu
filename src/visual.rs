@@ -527,7 +527,12 @@ pub struct Drawn {
 /// ref lives in (iframes included, in their own document, so the box lands
 /// where the frame shows the element); items without a known frame go to the
 /// main document.
-pub fn draw(tab: &Tab, items: &[OverlayItem]) -> Result<Drawn, String> {
+///
+/// Best effort per frame: a frame that cannot be drawn in (gone, navigating)
+/// is skipped rather than failing the capture, and [`Drawn::labels`] says
+/// what made it onto the image. Nothing is left on the page by a failure
+/// half way, because whatever was drawn is in `places` for [`clear`].
+pub fn draw(tab: &Tab, items: &[OverlayItem]) -> Drawn {
     let mut groups: Vec<((Tab, Option<String>), Vec<OverlayItem>)> = Vec::new();
     for item in items {
         let key = frame_of(tab, item.reference.as_deref());
@@ -541,39 +546,51 @@ pub fn draw(tab: &Tab, items: &[OverlayItem]) -> Result<Drawn, String> {
         places: Vec::new(),
     };
     for ((target, frame), list) in groups {
-        let mut cmd = |m: &str, p: &str| target.command(m, p);
-        let main = crate::execution::main_frame(&mut cmd)?;
-        let frame_id = frame.unwrap_or_else(|| main.clone());
-        // The registry the refs live in is in cu's isolated world (the main
-        // document's follows `CU_HELPER_WORLD`): the overlay is drawn from
-        // there so it can find them.
-        let world = if frame_id == main && target == *tab {
-            crate::execution::helper_world()
-        } else {
-            crate::execution::World::Isolated
-        };
-        let context = crate::execution::context_fragment(&mut cmd, world, &frame_id)?;
-        let expression = format!("{DRAW_JS}({},{FIND_JS})", items_json(&list));
-        let reply = cmd(
-            "Runtime.evaluate",
-            &crate::execution::evaluate_params(&expression, &context, true),
-        )?;
-        drawn.places.push((target.clone(), context));
-        let value = evaluated_string(&reply).unwrap_or_default();
-        if let Some(labels) = server::json_array(&value, "drawn") {
-            drawn.labels.extend(
-                labels
-                    .trim_matches(|c| c == '[' || c == ']')
-                    .split(',')
-                    .filter_map(|l| {
-                        let l = l.trim();
-                        (!l.is_empty())
-                            .then(|| json_string_value(&format!("{{\"l\":{l}}}"), "l"))?
-                    }),
-            );
-        }
+        let _ = draw_in(tab, &target, frame, &list, &mut drawn);
     }
-    Ok(drawn)
+    drawn
+}
+
+/// [`draw`] for the items of one frame.
+fn draw_in(
+    tab: &Tab,
+    target: &Tab,
+    frame: Option<String>,
+    list: &[OverlayItem],
+    drawn: &mut Drawn,
+) -> Result<(), String> {
+    let mut cmd = |m: &str, p: &str| target.command(m, p);
+    let main = crate::execution::main_frame(&mut cmd)?;
+    let frame_id = frame.unwrap_or_else(|| main.clone());
+    // The registry the refs live in is in cu's isolated world (the main
+    // document's follows `CU_HELPER_WORLD`): the overlay is drawn from
+    // there so it can find them.
+    let world = if frame_id == main && target == tab {
+        crate::execution::helper_world()
+    } else {
+        crate::execution::World::Isolated
+    };
+    let context = crate::execution::context_fragment(&mut cmd, world, &frame_id)?;
+    // Recorded before the draw, so an evaluate that fails after painting
+    // still gets its overlay removed.
+    drawn.places.push((target.clone(), context.clone()));
+    let expression = format!("{DRAW_JS}({},{FIND_JS})", items_json(list));
+    let reply = cmd(
+        "Runtime.evaluate",
+        &crate::execution::evaluate_params(&expression, &context, true),
+    )?;
+    let value = evaluated_string(&reply).unwrap_or_default();
+    if let Some(labels) = server::json_array(&value, "drawn") {
+        // Labels are refs (`e12`) and mark numbers (`#3`): no commas.
+        drawn.labels.extend(
+            labels
+                .trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .map(|l| l.trim().trim_matches('"').to_string())
+                .filter(|l| !l.is_empty()),
+        );
+    }
+    Ok(())
 }
 
 /// Remove an overlay [`draw`] painted.
@@ -606,15 +623,23 @@ fn marks() -> &'static Mutex<HashMap<Tab, Vec<Mark>>> {
     MARKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The page's URL, as the browser reports it.
+/// The page's URL, from the frame tree (no script runs in the page for it),
+/// with its `#fragment`: on a hash-routed app that is the route, and marks
+/// on `#/cart` must not be drawn on `#/login`.
 fn page_url(tab: &Tab) -> String {
-    tab.command(
-        "Runtime.evaluate",
-        "{\"expression\":\"location.href\",\"returnByValue\":true}",
-    )
-    .ok()
-    .and_then(|r| evaluated_string(&r))
-    .unwrap_or_default()
+    let Ok(tree) = tab.command("Page.getFrameTree", "{}") else {
+        return String::new();
+    };
+    let url = server::flatten_frame_tree(&tree)
+        .into_iter()
+        .next()
+        .map(|f| f.url)
+        .unwrap_or_default();
+    let fragment = json_object(&tree, "frameTree")
+        .and_then(|t| json_object(t, "frame"))
+        .and_then(|f| json_string_value(f, "urlFragment"))
+        .unwrap_or_default();
+    url + &fragment
 }
 
 /// Inspect an element and keep a note on it. Returns the mark as JSON.
@@ -702,7 +727,11 @@ pub fn mark_items(marks: &[Mark], url: &str) -> Vec<OverlayItem> {
         .map(|m| OverlayItem {
             label: format!("#{}", m.n),
             reference: Some(m.reference.clone()).filter(|r| !r.is_empty()),
-            selector: Some(m.selector.clone()).filter(|s| !s.is_empty()),
+            // A selector is only meaningful in the document it was made in.
+            // An iframe's is not tried in the main document once the ref has
+            // gone stale: it could match some other element there.
+            selector: Some(m.selector.clone())
+                .filter(|s| !s.is_empty() && json_string_value(&m.info, "frame").is_none()),
             color: severity_color(m.severity.as_deref()),
         })
         .collect()

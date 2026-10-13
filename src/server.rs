@@ -1980,7 +1980,7 @@ fn capture_annotated(tab: &Tab, options: &ShotOptions) -> Result<(String, String
             ),
         )?;
     }
-    let drawn = crate::visual::draw(tab, &items)?;
+    let drawn = crate::visual::draw(tab, &items);
     let result = capture(tab, options);
     crate::visual::clear(&drawn);
     let (reply, size) = result?;
