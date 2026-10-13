@@ -199,10 +199,7 @@ pub fn acquire(url: &str) -> Result<Option<Permit>, Refused> {
             return Err(Refused {
                 origin: origin.clone(),
                 retry_in: wait,
-                reason: state
-                    .reason
-                    .clone()
-                    .unwrap_or_else(|| "rate budget".into()),
+                reason: state.reason.clone().unwrap_or_else(|| "rate budget".into()),
             });
         }
         if wait.is_zero() && state.in_flight < budget.concurrency {

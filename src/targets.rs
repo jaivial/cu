@@ -135,8 +135,14 @@ pub fn json() -> String {
                 json_string(id),
                 json_string(&t.kind),
                 json_string(&t.url),
-                t.opener.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
-                t.context.as_deref().map(json_string).unwrap_or_else(|| "null".into()),
+                t.opener
+                    .as_deref()
+                    .map(json_string)
+                    .unwrap_or_else(|| "null".into()),
+                t.context
+                    .as_deref()
+                    .map(json_string)
+                    .unwrap_or_else(|| "null".into()),
                 t.seen.elapsed().as_millis()
             ))
             .collect::<Vec<_>>()
