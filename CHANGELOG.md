@@ -2,7 +2,20 @@
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-13
+
 ### Added
+
+- Visual QA references (`src/visual.rs`): `cu inspect REF|--selector CSS`
+  (`GET /v1/inspect`) returns a unique selector (piercing open shadow roots
+  with `>>>`), test id, landmarks, box, key styles and state, and on dev
+  builds the rendering component, its owner chain and source file
+  (React `_debugSource`/`_debugStack`, Vue `__file`, Svelte `__svelte_meta`,
+  Angular `ng`, inspector-plugin attributes). `cu mark` / `cu marks [--md |
+  clear]` (`/v1/marks`) pin QA notes with severity to elements and render
+  them as a Markdown report. `cu shot --annotate REFS|all` labels snapshot
+  refs on the image and `cu shot --marks` draws the marks numbered like the
+  report; overlays live for one capture in a closed shadow root.
 
 - Browser fingerprint hardening (`src/stealth.rs`, on by default, `CU_STEALTH=0`
   to turn it off): the launch now prefers a window on an X display

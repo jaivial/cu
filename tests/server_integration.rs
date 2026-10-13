@@ -944,3 +944,31 @@ fn a_context_name_cannot_be_a_path() {
     let response = server.get("/v1/snapshot?context=..%2Fx");
     assert_eq!(status_code(&response), "400", "got {}", body_of(&response));
 }
+
+#[test]
+fn inspect_and_marks_say_what_is_missing() {
+    let server = TestServer::start("visual", true);
+    let response = server.get("/v1/inspect");
+    assert_eq!(status_code(&response), "400");
+    assert!(body_of(&response).contains("give ref or selector"));
+    let response = server.post("/v1/marks", r#"{"ref":"e1"}"#);
+    assert_eq!(status_code(&response), "400", "{response}");
+    let response = server.get("/v1/marks");
+    assert_eq!(status_code(&response), "200");
+    assert_eq!(body_of(&response), r#"{"marks":[]}"#);
+    let response = server.get("/v1/marks?format=md");
+    assert!(body_of(&response).contains("No marks."), "{response}");
+}
+
+#[test]
+fn an_annotated_screenshot_needs_refs_to_label() {
+    let server = TestServer::start("shot-annotate", true);
+    let response = server.get("/v1/screenshot?annotate=all");
+    assert_eq!(status_code(&response), "502", "{response}");
+    assert!(
+        body_of(&response).contains("take a snapshot first"),
+        "{response}"
+    );
+    let response = server.get("/v1/screenshot?annotate=nope");
+    assert_eq!(status_code(&response), "400", "{response}");
+}

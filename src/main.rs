@@ -63,6 +63,26 @@ fn main() {
                 .and_then(|s| write_screenshot(&s, file.as_deref()))
         }),
         Some("snapshot") => request("GET", &on_tab("/v1/snapshot"), None).map(|s| println!("{s}")),
+        // `cu inspect REF` / `cu inspect --selector CSS`: how to find an
+        // element again and which component and source file render it.
+        Some("inspect") => target_query(&args[1..], "usage: cu inspect REF | --selector CSS")
+            .and_then(|(query, _)| request("GET", &on_tab(&format!("/v1/inspect?{query}")), None))
+            .map(|s| println!("{s}")),
+        // `cu mark REF "what is wrong" [--severity S]`: a QA note pinned to
+        // an element, collected by `cu marks`.
+        Some("mark") => mark(&args[1..], &on_tab),
+        Some("marks") => match args.get(1).map(String::as_str) {
+            None => request("GET", &on_tab("/v1/marks"), None).map(|s| println!("{s}")),
+            Some("--md") => {
+                request("GET", &on_tab("/v1/marks?format=md"), None).map(|s| print!("{s}"))
+            }
+            Some("clear") => {
+                request("DELETE", &on_tab("/v1/marks"), Some("{}")).map(|s| println!("{s}"))
+            }
+            Some(other) => Err(format!(
+                "unknown marks command {other}; usage: cu marks [--md | clear]"
+            )),
+        },
         Some("text") => request("GET", &on_tab("/v1/text"), None).map(|s| println!("{s}")),
         Some("downloads") => request("GET", "/v1/downloads", None).map(|s| println!("{s}")),
         Some("tabs") => match args.get(1).map(String::as_str) {
@@ -172,7 +192,7 @@ fn main() {
 }
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n  cu snapshot\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
     );
 }
 
@@ -186,7 +206,9 @@ fn start(args: &[String]) -> Result<(), String> {
     let mut mode = BrowserMode::from_env()?;
     let mut data = PathBuf::from(env::var_os("CU_DATA_DIR").unwrap_or_else(|| ".cu".into()));
     let mut webgl = false;
-    let mut public_url = env::var("CU_PUBLIC_URL").ok().filter(|u| !u.trim().is_empty());
+    let mut public_url = env::var("CU_PUBLIC_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty());
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -308,7 +330,7 @@ fn request(method: &str, path: &str, body: Option<&str>) -> Result<String, Strin
 /// [--ref REF | --selector CSS] [--padding N]` as a `/v1/screenshot` query and
 /// the file to write. A FILE ending in `.png` asks for PNG.
 fn shot_query(args: &[String]) -> Result<(String, Option<String>), String> {
-    const USAGE: &str = "usage: cu shot [FILE] [--png] [--quality N] [--width N] [--height N] [--scale F] [--ref REF | --selector CSS] [--padding N]";
+    const USAGE: &str = "usage: cu shot [FILE] [--png] [--quality N] [--width N] [--height N] [--scale F] [--ref REF | --selector CSS] [--padding N] [--annotate REFS|all] [--marks]";
     let mut file = None;
     let mut png = false;
     let mut pairs: Vec<(&str, String)> = Vec::new();
@@ -327,6 +349,12 @@ fn shot_query(args: &[String]) -> Result<(String, Option<String>), String> {
             "--ref" => "ref",
             "--selector" => "selector",
             "--padding" => "padding",
+            "--annotate" => "annotate",
+            "--marks" => {
+                pairs.push(("marks", "1".into()));
+                i += 1;
+                continue;
+            }
             flag if flag.starts_with("--") => {
                 return Err(format!("unknown option {flag}; {USAGE}"));
             }
@@ -351,6 +379,57 @@ fn shot_query(args: &[String]) -> Result<(String, Option<String>), String> {
         query.push_str(&format!("&{key}={value}"));
     }
     Ok((query, file))
+}
+
+/// `REF` or `--selector CSS` at the head of `args`, as a `ref=`/`selector=`
+/// query, and the arguments after it.
+fn target_query<'a>(args: &'a [String], usage: &str) -> Result<(String, &'a [String]), String> {
+    match args.first().map(String::as_str) {
+        Some("--selector") => match args.get(1) {
+            Some(css) => Ok((format!("selector={}", url_encode(css)), &args[2..])),
+            None => Err(usage.into()),
+        },
+        Some(r) if cu::actions::valid_ref(r) => Ok((format!("ref={r}"), &args[1..])),
+        _ => Err(usage.into()),
+    }
+}
+
+fn mark(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), String> {
+    const USAGE: &str =
+        "usage: cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]";
+    let (target, rest) = target_query(args, USAGE)?;
+    let mut note = None;
+    let mut severity = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--severity" => {
+                severity = Some(rest.get(i + 1).ok_or(USAGE)?.clone());
+                i += 2;
+            }
+            text if note.is_none() => {
+                note = Some(text.to_string());
+                i += 1;
+            }
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let note = note.ok_or(USAGE)?;
+    let (key, value) = target.split_once('=').unwrap_or_default();
+    let value = server::url_decode(value);
+    let severity = severity
+        .map(|s| format!(",\"severity\":{}", server::json_string(&s)))
+        .unwrap_or_default();
+    request(
+        "POST",
+        &on_tab("/v1/marks"),
+        Some(&format!(
+            "{{\"{key}\":{},\"note\":{}{severity}}}",
+            server::json_string(&value),
+            server::json_string(&note)
+        )),
+    )
+    .map(|s| println!("{s}"))
 }
 
 /// Percent-encode a query value (a CSS selector has `#`, `&`, spaces...).
@@ -389,7 +468,9 @@ fn session(args: &[String]) -> Result<(), String> {
     if !matches!(action, "save" | "load") {
         return Err("usage: cu session save|load NAME".into());
     }
-    let name = args.get(1).ok_or("usage: cu session save|load NAME [--context CTX]")?;
+    let name = args
+        .get(1)
+        .ok_or("usage: cu session save|load NAME [--context CTX]")?;
     let mut path = if action == "save" {
         format!("/v1/session/{name}")
     } else {

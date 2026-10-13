@@ -78,6 +78,40 @@ new size before it is measured. A clipped element is scrolled into view and
 captured with `Page.captureScreenshot`'s `clip`; one larger than the viewport
 is taken from the full page. With `scale` the reply also carries the image
 size: `{"format":"png","width":2400,"height":2400,"scale":2,"png_base64":...}`.
+
+### Visual QA references
+
+A snapshot names elements and a screenshot shows pixels; these routes tie the
+two together and to the code, so a QA finding says *which* element and *where
+it comes from* instead of "the blue button near the bottom".
+
+| route | CLI | what it returns |
+|---|---|---|
+| `GET /v1/inspect?ref=eN` / `?selector=CSS` | `cu inspect eN`, `cu inspect --selector CSS` | the element's ref, role, accessible name, a unique selector, test id, landmarks around it, box, viewport, key computed styles and state; on a development build also `framework`, `component`, `components` (the owner chain) and `source` |
+| `POST /v1/marks` `{"ref":"eN"\|"selector":"CSS","note":"...","severity":"major"}` | `cu mark eN "note" [--severity S]` | a QA mark: the note plus the inspect object at that moment |
+| `GET /v1/marks` / `?format=md` | `cu marks`, `cu marks --md` | every mark of the tab, as JSON or as a Markdown report |
+| `DELETE /v1/marks` | `cu marks clear` | forget the tab's marks |
+| `GET /v1/screenshot?annotate=e1,e4` / `annotate=all` | `cu shot --annotate e1,e4\|all` | the image with those snapshot refs boxed and labelled |
+| `GET /v1/screenshot?marks=1` | `cu shot --marks` | the image with the marks on this URL boxed, numbered like the report and coloured by severity |
+
+- **Selectors** prefer an id, then `data-testid`/`data-test`/`data-cy`/`data-qa`,
+  then `name`, and fall back to a short `nth-of-type` path, checked unique in
+  its root. A control inside an open shadow root gets `host >>> inner`; the
+  `selector` parameters accept that form too.
+- **Components and sources** are read in the page's own world (where React's
+  fibers, Vue's `__vueParentComponent`, Svelte's `__svelte_meta` and Angular's
+  `ng` live) by reading properties only -- no page function is called. React
+  ≤18 gives `_debugSource` (file:line:col); React 19 gives the served module
+  from `_debugStack`. Build plugins that write attributes are read too
+  (`data-inspector-*`, `data-v-inspector`, `data-astro-source-*`,
+  `data-source-file`/`-line`, `data-component`). Production builds usually
+  give nothing here, and the fields are then left out.
+- **Overlays** are drawn in a closed shadow root at the top of the document
+  (document coordinates, `pointer-events:none`), in the frame each ref lives
+  in, for that one capture, and removed right after it. The reply lists what
+  was drawn in `"annotated"`.
+- **Privacy**: inspect never reads a field's value, so a mark on a password or
+  email field carries no secret. Marks live in daemon memory per tab.
 `ref` and `selector` together, an out-of-range value or an element that is not
 on the page (or has no size) are a `400`/`502` with the reason.
 
