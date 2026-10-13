@@ -1,0 +1,7 @@
+# The integration tests start one fake browser (a Python process) per test.
+# At the default parallelism (one test per core) a loaded machine stalls
+# those processes past the daemon's 500 ms DevTools connect bound and tests
+# fail with "connection timed out"; four at a time costs ~2 s and keeps the
+# suite deterministic. `--test-threads` on the command line still wins.
+[env]
+RUST_TEST_THREADS = "4"

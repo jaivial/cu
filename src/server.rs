@@ -4370,12 +4370,17 @@ mod frame_tests {
         ];
         let main_walk = r#"{"url":"https://main.test/","title":"Main","nodes":[{"ref":"e1","role":"link","name":"go"}],"headings":[],"next":1}"#;
         let child_walk = r#"{"url":"https://child.test/","title":"Child","nodes":[{"ref":"e9","role":"textbox","name":"inner"}],"headings":[],"next":9}"#;
+        // Both documents are read in cu's isolated world of their own frame;
+        // the context id tells the fake which one is asking.
         let (text, pairs) = walk_frames(&tab, frames, |method, params| match method {
-            "Page.createIsolatedWorld" => {
-                assert!(params.contains("\"frameId\":\"C\""), "entered {params}");
+            "Page.createIsolatedWorld" if params.contains("\"frameId\":\"C\"") => {
                 Ok(r#"{"result":{"executionContextId":7}}"#.to_string())
             }
-            "Runtime.evaluate" if params.contains("contextId") => Ok(format!(
+            "Page.createIsolatedWorld" => {
+                assert!(params.contains("\"frameId\":\"M\""), "entered {params}");
+                Ok(r#"{"result":{"executionContextId":5}}"#.to_string())
+            }
+            "Runtime.evaluate" if params.contains("\"contextId\":7") => Ok(format!(
                 "{{\"result\":{{\"result\":{{\"type\":\"string\",\"value\":{}}}}}}}",
                 json_string(child_walk)
             )),
@@ -4421,7 +4426,11 @@ mod frame_tests {
         ];
         let main_walk =
             r#"{"url":"https://main.test/","title":"Main","nodes":[],"headings":[],"next":0}"#;
+        // The main document's world exists; the child frame's is gone.
         let (text, pairs) = walk_frames(&tab, frames, |method, params| match method {
+            "Page.createIsolatedWorld" if params.contains("\"frameId\":\"M\"") => {
+                Ok(r#"{"result":{"executionContextId":5}}"#.to_string())
+            }
             "Page.createIsolatedWorld" => Ok(r#"{"result":{}}"#.to_string()),
             "Runtime.evaluate" => Ok(format!(
                 "{{\"result\":{{\"result\":{{\"type\":\"string\",\"value\":{}}}}}}}",
