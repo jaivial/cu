@@ -174,7 +174,10 @@ fn string_array(list: &str) -> Option<Vec<String>> {
             escaped = c == '\\' && !escaped;
             close.then_some(i)
         })?;
-        out.push(json_string_value(&format!("{{\"s\":\"{}\"}}", &body[..=end]), "s")?);
+        out.push(json_string_value(
+            &format!("{{\"s\":\"{}\"}}", &body[..=end]),
+            "s",
+        )?);
         rest = body[end + 1..].trim_start();
         rest = rest.strip_prefix(',').map(str::trim_start).unwrap_or(rest);
     }
@@ -269,8 +272,8 @@ fn owner_offset(owner: &Tab, child: &str) -> Result<(f64, f64), String> {
             json_string(SCROLL_AND_RECT)
         ),
     )?;
-    let value =
-        evaluated_string(&rect).ok_or_else(|| "iframe position unknown; take a new snapshot".to_string())?;
+    let value = evaluated_string(&rect)
+        .ok_or_else(|| "iframe position unknown; take a new snapshot".to_string())?;
     let num = |k: &str| {
         json_value(&value, k)
             .and_then(|v| v.parse::<f64>().ok())
@@ -667,8 +670,9 @@ impl Page {
         let Some(object) = json_string_value(&reply, "objectId") else {
             // The helper answers with a JSON string when there is no input.
             let value = evaluated_string(&reply).unwrap_or_default();
-            return Err(json_string_value(&value, "error")
-                .unwrap_or_else(|| "no file input found".into()));
+            return Err(
+                json_string_value(&value, "error").unwrap_or_else(|| "no file input found".into())
+            );
         };
         let multiple = command(
             self,
@@ -687,13 +691,21 @@ impl Page {
                 files.len()
             ));
         }
-        let list = files.iter().map(|f| json_string(f)).collect::<Vec<_>>().join(",");
+        let list = files
+            .iter()
+            .map(|f| json_string(f))
+            .collect::<Vec<_>>()
+            .join(",");
         let reply = command(
             self,
             "DOM.setFileInputFiles",
-            &format!("{{\"files\":[{list}],\"objectId\":{}}}", json_string(&object)),
+            &format!(
+                "{{\"files\":[{list}],\"objectId\":{}}}",
+                json_string(&object)
+            ),
         )?;
-        if let Some(message) = json_value(&reply, "message").filter(|_| reply.contains("\"error\"")) {
+        if let Some(message) = json_value(&reply, "message").filter(|_| reply.contains("\"error\""))
+        {
             return Err(format!("DOM.setFileInputFiles: {message}"));
         }
         // The browser opens the files lazily: one it cannot read (a snap
@@ -713,9 +725,7 @@ impl Page {
         let unreadable: Vec<&str> = files
             .iter()
             .zip(sizes.split(','))
-            .filter(|(f, size)| {
-                *size == "0" && std::fs::metadata(f).is_ok_and(|m| m.len() > 0)
-            })
+            .filter(|(f, size)| *size == "0" && std::fs::metadata(f).is_ok_and(|m| m.len() > 0))
             .map(|(f, _)| f.as_str())
             .collect();
         if !unreadable.is_empty() {
@@ -833,7 +843,10 @@ impl Page {
     fn locate(&mut self, reference: &str, hit_test: bool) -> Result<Target, String> {
         let subframe = self.subframe_of(reference);
         let value = if self.remote_frame(reference).is_some() {
-            self.registry_for(reference, &format!("locate({},{hit_test})", json_string(reference)))?
+            self.registry_for(
+                reference,
+                &format!("locate({},{hit_test})", json_string(reference)),
+            )?
         } else {
             let context = match &subframe {
                 None => self.main_world()?,
@@ -1017,9 +1030,10 @@ impl Page {
             return Ok(());
         }
         for _ in 0..8 {
-            let Ok(info) =
-                self.registry_for(reference, &format!("scrollInfo({})", json_string(reference)))
-            else {
+            let Ok(info) = self.registry_for(
+                reference,
+                &format!("scrollInfo({})", json_string(reference)),
+            ) else {
                 return Ok(());
             };
             let num = |o: &str, k: &str| json_value(o, k).and_then(|v| v.parse::<f64>().ok());
@@ -1048,7 +1062,9 @@ impl Page {
                 Some((st, sb, sl, sr, it, ib)) if sb - st >= 24.0 && sr - sl >= 24.0 => {
                     let box_centre = ((sl + sr) / 2.0, (st + sb) / 2.0);
                     let at = self.pointer_into(box_centre, sr - sl, sb - st, watch)?;
-                    let aim = it + (ib - it) * crate::human::Rng::new(top.to_bits(), "aim").uniform(0.3, 0.6);
+                    let aim = it
+                        + (ib - it)
+                            * crate::human::Rng::new(top.to_bits(), "aim").uniform(0.3, 0.6);
                     (at, (top + bottom) / 2.0 - aim)
                 }
                 _ => {
@@ -1102,9 +1118,8 @@ impl Page {
         let inside = |p: (f64, f64)| {
             (p.0 - centre.0).abs() < w / 2.0 - 4.0 && (p.1 - centre.1).abs() < h / 2.0 - 4.0
         };
-        let from = crate::input::pointer(&self.tab).unwrap_or_else(|| {
-            crate::input::origin(&self.tab, centre.0 * 2.0, centre.1 * 2.0)
-        });
+        let from = crate::input::pointer(&self.tab)
+            .unwrap_or_else(|| crate::input::origin(&self.tab, centre.0 * 2.0, centre.1 * 2.0));
         if inside(from) {
             return Ok(from);
         }
@@ -1136,11 +1151,23 @@ impl Page {
             watch,
         )?;
         std::thread::sleep(hold / 2);
-        self.input("Input.dispatchKeyEvent", &format!("{{\"type\":\"rawKeyDown\",{tab}}}"), watch)?;
+        self.input(
+            "Input.dispatchKeyEvent",
+            &format!("{{\"type\":\"rawKeyDown\",{tab}}}"),
+            watch,
+        )?;
         std::thread::sleep(hold);
-        self.input("Input.dispatchKeyEvent", &format!("{{\"type\":\"keyUp\",{tab}}}"), watch)?;
+        self.input(
+            "Input.dispatchKeyEvent",
+            &format!("{{\"type\":\"keyUp\",{tab}}}"),
+            watch,
+        )?;
         std::thread::sleep(hold / 2);
-        self.input("Input.dispatchKeyEvent", &format!("{{\"type\":\"keyUp\",{shift}}}"), watch)?;
+        self.input(
+            "Input.dispatchKeyEvent",
+            &format!("{{\"type\":\"keyUp\",{shift}}}"),
+            watch,
+        )?;
         std::thread::sleep(gap);
         Ok(())
     }
@@ -1191,7 +1218,11 @@ impl Page {
         };
         if self.input_policy == InputPolicy::Instant {
             for kind in ["mousePressed", "mouseReleased"] {
-                self.input("Input.dispatchMouseEvent", &mouse(kind, target.at, 0), watch)?;
+                self.input(
+                    "Input.dispatchMouseEvent",
+                    &mouse(kind, target.at, 0),
+                    watch,
+                )?;
             }
             return Ok(());
         }
@@ -1208,14 +1239,22 @@ impl Page {
                     .unwrap_or((1280.0, 720.0));
                 let start = crate::input::origin(&self.tab, viewport.0, viewport.1);
                 // The pointer is already there when the page first sees it.
-                self.input("Input.dispatchMouseEvent", &mouse("mouseMoved", start, 0), watch)?;
+                self.input(
+                    "Input.dispatchMouseEvent",
+                    &mouse("mouseMoved", start, 0),
+                    watch,
+                )?;
                 start
             }
         };
         let plan = crate::input::plan_click(&self.tab, from, target.at, target.w, target.h);
         for (point, pause) in plan.path {
             std::thread::sleep(pause);
-            self.input("Input.dispatchMouseEvent", &mouse("mouseMoved", point, 0), watch)?;
+            self.input(
+                "Input.dispatchMouseEvent",
+                &mouse("mouseMoved", point, 0),
+                watch,
+            )?;
         }
         self.input(
             "Input.dispatchMouseEvent",

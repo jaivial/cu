@@ -80,6 +80,32 @@ fn body_of(response: &str) -> &str {
         .unwrap_or("")
 }
 
+/// Point session encryption at a key of the test run's own.
+///
+/// Without it a session save in a test reads -- or creates -- the user's
+/// real `~/.config/cu/session.key`. The server runs in this process, so the
+/// variable is set once, before any server starts, and every test sees the
+/// same value.
+fn isolate_session_key() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let key = std::env::temp_dir().join(format!("cu-it-session-{}.key", std::process::id()));
+        let _ = std::fs::remove_file(&key);
+        // SAFETY: called once, before any server thread exists, and no test
+        // reads the environment concurrently with this write.
+        unsafe { std::env::set_var("CU_SESSION_KEY_FILE", &key) };
+    });
+}
+
+/// Decrypt session `name` of `server` into a fresh directory, the way a load
+/// would, so a test can look at what the archive holds.
+fn open_session(server: &TestServer, name: &str) -> PathBuf {
+    let out = server.data_dir.join(format!("opened-{name}"));
+    let _ = remove_dir(&out);
+    cu::session::load(&out, &server.data_dir.join("sessions"), name).expect("session loads");
+    out
+}
+
 /// A running server: its own loopback port, data dir and fake Chromium, so the
 /// tests never interfere with each other or with a real session.
 struct TestServer {
@@ -95,6 +121,7 @@ struct TestServer {
 
 impl TestServer {
     fn start(name: &str, with_browser: bool) -> Self {
+        isolate_session_key();
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
         let addr = listener.local_addr().expect("local addr").to_string();
         let data_dir = std::env::temp_dir().join(format!("cu-it-{name}-{}", std::process::id()));
@@ -102,15 +129,15 @@ impl TestServer {
         std::fs::create_dir_all(data_dir.join("profiles/default")).expect("profile dir");
         std::fs::create_dir_all(data_dir.join("sessions")).expect("sessions dir");
         let token = server::random_token();
-        let cdp_port = if with_browser { free_port() } else { 9222 };
-        let browser = if with_browser {
-            Some(spawn_fake_chromium(cdp_port).expect("spawn fake chromium"))
+        // Without a fake browser the port must still be one nothing listens
+        // on: 9222 is where a developer's real Chrome usually is, and a test
+        // that lets a route through would drive that browser.
+        let (browser, cdp_port) = if with_browser {
+            let (child, port) = spawn_fake_chromium();
+            (Some(child), port)
         } else {
-            None
+            (None, dead_port())
         };
-        if with_browser {
-            wait_for_port(cdp_port);
-        }
         // The harness starts its own (fake) browser, so the readiness signal
         // is set here instead of by a launch thread.
         let browser_state = if with_browser {
@@ -197,34 +224,60 @@ fn remove_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// A loopback port for a server that binds it later (a daemon started as a
+/// child process): the OS's choice, never handed out twice in this run.
 fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind for port")
-        .local_addr()
-        .expect("local addr")
-        .port()
+    static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    let mut given = GIVEN.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        let port = TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind for port")
+            .local_addr()
+            .expect("local addr")
+            .port();
+        if !given.contains(&port) {
+            given.push(port);
+            return port;
+        }
+    }
 }
 
-/// Spawns the fake browser: HTTP/CDP discovery on `port`, WebSocket on `port + 1`.
-fn spawn_fake_chromium(port: u16) -> std::io::Result<Child> {
-    Command::new("python3")
+/// Spawn the fake browser on a port it binds itself and return it with that
+/// port.
+///
+/// Choosing a free port here and handing it over left a window in which any
+/// other process could take it: the fake then failed to bind, and the test
+/// talked to whatever did ("connection refused", or another program's
+/// `/json` with no page in it). The fake binds port 0 and prints the port it
+/// got, so the port is never free in between.
+fn spawn_fake_chromium() -> (Child, u16) {
+    let mut child = Command::new("python3")
         .arg(env!("CARGO_MANIFEST_DIR").to_owned() + "/tests/fake_chromium.py")
-        .arg(port.to_string())
-        .arg((port + 1).to_string())
+        .arg("0")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
+        .expect("spawn fake chromium");
+    let mut line = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(child.stdout.take().expect("fake stdout")),
+        &mut line,
+    )
+    .expect("fake chromium reports its port");
+    let port = line
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("fake chromium did not start: {line:?}"));
+    (child, port)
 }
 
-fn wait_for_port(port: u16) {
-    for _ in 0..200 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    panic!("fake chromium never listened on {port}");
+/// A loopback port nothing listens on and nothing will: TCP port 1 is
+/// privileged (no unprivileged process can bind it) and has no service on a
+/// development machine, so a connect is refused at once. Used for a server
+/// that must have no browser behind it.
+fn dead_port() -> u16 {
+    1
 }
 
 #[test]
@@ -447,8 +500,13 @@ fn a_session_can_be_saved_and_reported() {
     let server = TestServer::start("session", false);
     let response = server.post("/v1/session/trip_1", "{}");
     assert_eq!(status_code(&response), "200");
-    assert_eq!(body_of(&response), "{\"saved\":true}");
-    assert!(server.data_dir.join("sessions/trip_1").is_dir());
+    // Sessions are encrypted at rest by default: one archive, no directory.
+    assert_eq!(
+        body_of(&response),
+        "{\"saved\":true,\"storage\":\"encrypted\"}"
+    );
+    assert!(server.data_dir.join("sessions/trip_1.cuse").is_file());
+    assert!(!server.data_dir.join("sessions/trip_1").exists());
 }
 
 #[test]
@@ -461,10 +519,28 @@ fn an_invalid_session_name_is_rejected() {
 #[test]
 fn a_session_load_is_reported_as_loaded() {
     let server = TestServer::start("session-load", false);
+    // A plain directory saved before encryption still loads, and says so.
     std::fs::create_dir_all(server.data_dir.join("sessions/trip_1")).expect("session dir");
     let response = server.post("/v1/session/trip_1/load", "{}");
     assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
-    assert_eq!(body_of(&response), "{\"loaded\":true}");
+    assert_eq!(
+        body_of(&response),
+        "{\"loaded\":true,\"storage\":\"plaintext\"}"
+    );
+    // An encrypted one round-trips through save and load.
+    let profile = server.data_dir.join("profiles/default");
+    std::fs::write(profile.join("Preferences"), "{\"kept\":1}").expect("profile file");
+    assert_eq!(status_code(&server.post("/v1/session/trip_9", "{}")), "200");
+    std::fs::remove_file(profile.join("Preferences")).expect("forget the file");
+    let response = server.post("/v1/session/trip_9/load", "{}");
+    assert_eq!(
+        body_of(&response),
+        "{\"loaded\":true,\"storage\":\"encrypted\"}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile.join("Preferences")).expect("restored"),
+        "{\"kept\":1}"
+    );
 }
 
 #[test]
@@ -479,7 +555,7 @@ fn a_saved_profile_leaves_the_process_locks_behind() {
     std::fs::write(profile.join("Preferences"), "{}").expect("profile file");
     let response = server.post("/v1/session/trip_2", "{}");
     assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
-    let copied = server.data_dir.join("sessions/trip_2");
+    let copied = open_session(&server, "trip_2");
     assert!(!copied.join("SingletonLock").exists());
     assert!(!copied.join("SingletonLock").is_symlink());
     assert!(
@@ -496,7 +572,7 @@ fn a_dangling_symlink_is_copied_as_a_link() {
     std::os::unix::fs::symlink("/no/such/path", profile.join("Vendor")).expect("dangling link");
     let response = server.post("/v1/session/trip_3", "{}");
     assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
-    assert!(server.data_dir.join("sessions/trip_3/Vendor").is_symlink());
+    assert!(open_session(&server, "trip_3").join("Vendor").is_symlink());
 }
 
 #[test]

@@ -26,6 +26,8 @@ CLOSED_MARKER = os.environ.get("FAKE_CHROMIUM_CLOSED")
 INPUT_LOG = []
 # Tabs opened in browser contexts: target id -> context id.
 CONTEXT_TABS = {}
+# Targets closed with Target.closeTarget: gone from discovery, like Chromium.
+CLOSED = set()
 # Every Browser.setDownloadBehavior call, as the params it arrived with, so a
 # test can see whether the daemon gave a named context a directory of its own.
 DOWNLOAD_BEHAVIOUR = []
@@ -49,6 +51,8 @@ CHILD_SNAPSHOT = json.dumps(
     separators=(",", ":"),
 )
 CHILD_WORDS = "words from inside the frame"
+# Execution context id of the iframe's isolated world.
+CHILD_CONTEXT = 7
 FAKE_SNAPSHOT = json.dumps(
     {
         "url": "https://example.test/",
@@ -92,8 +96,7 @@ class Handler(BaseHTTPRequestHandler):
         # Chromium pretty-prints this list and puts non-page targets (extension
         # background pages, service workers) in it too, sometimes ahead of the
         # page. Reproduce all of it so target selection is exercised.
-        body = json.dumps(
-            [
+        targets = [
                 {
                     "description": "",
                     "devtoolsFrontendUrl": "devtools://devtools/inspector.html",
@@ -122,7 +125,7 @@ class Handler(BaseHTTPRequestHandler):
                     "webSocketDebuggerUrl": "ws://127.0.0.1:%d/devtools/page/PAGE1" % PORT,
                 },
             ]
-        ).encode()
+        body = json.dumps([t for t in targets if t["id"] not in CLOSED]).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -232,6 +235,11 @@ class Handler(BaseHTTPRequestHandler):
             CONTEXT_TABS[target] = (params or {}).get("browserContextId")
             return {"result": {"targetId": target}}
         if method == "Target.closeTarget":
+            # Leaves discovery, as in Chromium; a fake that kept listing it
+            # made the daemon poll `/json` for its whole two-second wait.
+            target = (params or {}).get("targetId")
+            CLOSED.add(target)
+            CONTEXT_TABS.pop(target, None)
             return {"result": {"success": True}}
         if method == "Target.disposeBrowserContext":
             ctx = (params or {}).get("browserContextId")
@@ -252,7 +260,11 @@ class Handler(BaseHTTPRequestHandler):
                 }
             return {"result": {"frameTree": {"frame": {"id": "MAINFRAME", "url": "about:blank"}}}}
         if method == "Page.createIsolatedWorld":
-            return {"result": {"executionContextId": 7}}
+            # One isolated world per frame, like Chromium: cu reads the main
+            # document in its own isolated world too, so "has a contextId"
+            # does not mean "is the iframe" -- the id says which frame it is.
+            frame = (params or {}).get("frameId")
+            return {"result": {"executionContextId": CHILD_CONTEXT if frame == "CHILD1" else 5}}
         if method == "DOM.getFrameOwner":
             return {"result": {"backendNodeId": 42}}
         if method == "DOM.resolveNode":
@@ -276,7 +288,7 @@ class Handler(BaseHTTPRequestHandler):
                 # in the main world the page itself. (The walk embeds the
                 # registry, which mentions elementFromPoint, so this must be
                 # checked before the click-point branch below.)
-                if (params or {}).get("contextId") is not None:
+                if (params or {}).get("contextId") == CHILD_CONTEXT:
                     value = CHILD_SNAPSHOT
                 else:
                     value = FAKE_SNAPSHOT
@@ -287,7 +299,7 @@ class Handler(BaseHTTPRequestHandler):
             if "innerText" in expr:
                 # In an iframe's isolated world the words are the frame's, so a
                 # test can tell the two documents apart.
-                if (params or {}).get("contextId") is not None:
+                if (params or {}).get("contextId") == CHILD_CONTEXT:
                     words = CHILD_WORDS
                 else:
                     words = "the quick brown fox jumps over the lazy dog"
@@ -343,4 +355,21 @@ class Handler(BaseHTTPRequestHandler):
         self.connection.sendall(bytes(frame))
 
 
-ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+class Server(ThreadingHTTPServer):
+    # Chromium's DevTools socket queues far more than socketserver's default
+    # backlog of 5. With the tests running in parallel and every websocket
+    # holding a handler thread, a sixth pending connect was dropped and the
+    # daemon's bounded connect reported "connection timed out" on a browser
+    # that was up. A real listener's backlog keeps the fake honest.
+    request_queue_size = 128
+    daemon_threads = True
+
+
+server = Server(("127.0.0.1", PORT), Handler)
+if PORT == 0:
+    # Asked for any free port: the tests pass 0 so no other process can take
+    # the port between choosing it and binding it. Report the one bound, and
+    # use it in the websocket URLs discovery hands out.
+    PORT = server.server_address[1]
+    print(PORT, flush=True)
+server.serve_forever()
