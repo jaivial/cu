@@ -41,6 +41,18 @@ Use `cu` when an agent needs a persistent local browser session.
    any page command takes `--tab ID` to run there, and `cu tabs close ID`
    dismisses one. Never act on a popup guessed from `cu tabs` output of an
    older snapshot -- ids and urls come from the last `cu tabs`.
-8. Save the session with `cu session save NAME`, and restore it later with `cu session load NAME`. A saved session keeps the login.
+8. QA references. When a check fails, pin it to the element instead of
+   describing it in prose: `cu mark e7 "overlaps the footer at 375px"
+   --severity major` (blocker|major|minor|nit; `--selector CSS` instead of a
+   ref). `cu marks --md` is the report for the developer: per mark the note,
+   a unique selector (`a >>> b` steps into a shadow root), test id,
+   landmarks, box and styles, and on a dev build the component and its
+   source file (`src/LoginForm.tsx:42:7`). `cu inspect eN` shows the same
+   for one element without marking it. For evidence, `cu shot qa.png
+   --marks` boxes the marks numbered like the report, and `--annotate
+   all` (or `e1,e4`) labels snapshot refs on the image, so pixels and refs
+   point at each other. Marks live in the daemon per tab until `cu marks
+   clear`; field values are never recorded.
+9. Save the session with `cu session save NAME`, and restore it later with `cu session load NAME`. A saved session keeps the login.
 
 The bearer token is stored in `.cu/server.json`; keep that file private. The server binds to loopback only.

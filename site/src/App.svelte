@@ -67,6 +67,33 @@
     },
   ];
 
+  const qaFeatures = [
+    {
+      k: 'inspect',
+      t: 'De ref a código',
+      d: 'cu inspect e7 devuelve un selector único (con >>> para entrar en shadow roots), test id, landmarks, caja y estilos clave. En un build de desarrollo, también el componente, su cadena de padres y el archivo fuente: React, Vue, Svelte, Angular y plugins de inspector.',
+    },
+    {
+      k: 'mark',
+      t: 'Hallazgos fijados a un elemento',
+      d: 'cu mark e7 "se solapa con el footer a 375px" --severity major guarda la nota junto con todo lo que identifica al elemento. cu marks --md es el informe que el desarrollador puede abrir y arreglar sin adivinar.',
+    },
+    {
+      k: 'shot',
+      t: 'Capturas que hablan el idioma de los refs',
+      d: 'cu shot --annotate all etiqueta cada ref del snapshot sobre la imagen; --marks dibuja las marcas numeradas como el informe y coloreadas por severidad. Solo para esa captura, en un shadow root cerrado.',
+    },
+  ];
+
+  const qaReport = `### 1. [major] Botón demasiado pegado al email
+
+- element: button "Sign in" \`<button>\` (ref e4)
+- selector: \`[data-testid="submit-login"]\`
+- inside: main > form#login "Sign in"
+- component: SubmitButton (react) -- SubmitButton < LoginForm < App
+- source: \`src/LoginForm.tsx:42:7\`
+- box: 69x31 at (37, 186), viewport 375x667`;
+
   const cli = [
     ['cu start', 'un daemon por máquina; responde en ~6 ms y el navegador sube en segundo plano'],
     ['cu status --short', 'daemon, navegador y cuántos leases hay abiertos'],
@@ -82,6 +109,9 @@
     ["cu act '[{\"do\":\"type\",\"ref\":\"e2\",\"text\":\"Ada\"},{\"do\":\"click\",\"ref\":\"e5\"}]'", 'lote en una conexión, termina con snapshot'],
     ["cu batch 'snapshot --tab t1' 'click e3 --tab t1'", 'muchos comandos, una llamada; una línea JSON por comando'],
     ['cu shot page.jpg · cu downloads', 'captura JPEG rápida; descargas listadas desde <data>/downloads'],
+    ['cu inspect e7', 'selector único, landmarks, estilos y, en dev, componente y archivo fuente'],
+    ['cu mark e7 "nota" --severity major', 'hallazgo de QA fijado al elemento; cu marks --md es el informe'],
+    ['cu shot qa.png --annotate all --marks', 'refs y marcas dibujadas sobre la captura'],
     ['cu login', 'imprime el enlace /login para que el humano entre'],
     ['cu session save NAME / load NAME', 'guarda o restaura el perfil con la sesión iniciada'],
   ];
@@ -91,7 +121,10 @@
     ['POST', '/v1/navigate', '{"url": "..."} · espera asentada'],
     ['GET', '/v1/snapshot', 'página compacta con refs'],
     ['GET', '/v1/text', 'palabras visibles, con - frame: <url>'],
-    ['GET', '/v1/screenshot', '?format=png para PNG'],
+    ['GET', '/v1/screenshot', '?format=png · annotate=e1,e4|all · marks=1'],
+    ['GET', '/v1/inspect', '?ref=eN o ?selector=CSS · cómo encontrarlo y quién lo pinta'],
+    ['POST', '/v1/marks', '{"ref": "e7", "note": "...", "severity": "major"}'],
+    ['GET · DELETE', '/v1/marks', 'marcas en JSON o ?format=md; DELETE las borra'],
     ['POST', '/v1/click', '{"ref": "e3"}'],
     ['POST', '/v1/type', '{"ref": "e2", "text": "hi", "submit": true}'],
     ['POST', '/v1/act', '{"actions": [...], "snapshot": true}'],
@@ -247,6 +280,7 @@
     <nav aria-label="Secciones">
       <a href="#que">Qué es</a>
       <a href="#api">API / CLI</a>
+      <a href="#qa">QA visual</a>
       <a href="#bench">Velocidad</a>
       <a href="#tokens">Tokens</a>
       <a href="#recursos">Recursos</a>
@@ -419,9 +453,49 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
     </div>
   </section>
 
-  <section class="wrap section" id="bench">
+  <section class="wrap section" id="qa">
     <header class="sec-head">
       <p class="num">03</p>
+      <h2>Referencias visuales para QA</h2>
+      <p class="sub">
+        Un snapshot nombra elementos y una captura muestra píxeles, pero ninguno apunta al otro ni dice de qué
+        código sale cada cosa. <code>cu</code> une las tres piezas: el agente marca lo que falla sobre el elemento
+        exacto y el desarrollador recibe el selector, el componente y la línea.
+      </p>
+    </header>
+    <div class="features qa">
+      {#each qaFeatures as f}
+        <article>
+          <span class="fk">{f.k}</span>
+          <h3>{f.t}</h3>
+          <p>{f.d}</p>
+        </article>
+      {/each}
+    </div>
+    <div class="api-grid qa-demo">
+      <div class="term" role="img" aria-label="Ejemplo de marca de QA con cu">
+        <div class="term-bar"><i></i><i></i><i></i><span>agente@local</span></div>
+        <pre><span class="p">$</span> cu mark e4 "Botón demasiado pegado al email" --severity major
+<span class="o">{"{"}"n":1,"ref":"e4","selector":"[data-testid=\"submit-login\"]",…{"}"}</span>
+<span class="p">$</span> cu shot qa.png --marks
+<span class="p">$</span> cu marks --md
+<span class="o">{qaReport}</span></pre>
+      </div>
+      <aside class="side">
+        <div class="mini">
+          <h3>Qué se lee y qué no</h3>
+          <p class="txt">El componente se lee de las estructuras que el framework deja en el DOM de un build de
+            desarrollo, solo leyendo propiedades: no se llama a ninguna función de la página. Nunca se lee el
+            valor de un campo, así que una marca sobre un email o una contraseña no guarda secretos. Las capas
+            se pintan solo para esa captura y se quitan justo después.</p>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <section class="wrap section" id="bench">
+    <header class="sec-head">
+      <p class="num">04</p>
       <h2>Velocidad contra agent-browser y Playwright MCP</h2>
       <p class="sub">
         Mismo binario (Chrome for Testing headless shell 153), mismo sitio local y las mismas seis tareas de agente.
@@ -482,7 +556,7 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
 
   <section class="wrap section" id="tokens">
     <header class="sec-head">
-      <p class="num">04</p>
+      <p class="num">05</p>
       <h2>Tokens del snapshot</h2>
       <p class="sub">
         La misma página de catálogo de 2,3 KB (12 enlaces, 10 productos con botón, buscador y pie), contada con
@@ -505,7 +579,7 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
 
   <section class="wrap section" id="recursos">
     <header class="sec-head">
-      <p class="num">05</p>
+      <p class="num">06</p>
       <h2>Recursos y concurrencia</h2>
       <p class="sub">
         El modelo que un CI quiere: <strong>un Chrome siempre abierto</strong>, y cada test abre su propia pestaña
@@ -553,7 +627,7 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
 
   <section class="wrap section" id="real">
     <header class="sec-head">
-      <p class="num">06</p>
+      <p class="num">07</p>
       <h2>Contra una app real de producción</h2>
       <p class="sub">
         Todo lo anterior corre contra páginas locales. Esto corre los flujos que un agente de QA ejecuta de verdad
@@ -681,7 +755,7 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
 
   <section class="wrap section" id="par">
     <header class="sec-head">
-      <p class="num">07</p>
+      <p class="num">08</p>
       <h2>Agentes de IA en paralelo</h2>
       <p class="sub">
         Todo lo anterior son flujos guionizados. Esto son <strong>agentes de IA de verdad</strong>: cada "agente" es una
@@ -940,6 +1014,9 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
   .fk { font-family: var(--mono); font-size: 0.75rem; color: var(--cu); }
   .features h3 { margin: 0.8rem 0 0.6rem; font-size: 1.12rem; letter-spacing: -0.015em; line-height: 1.2; }
   .features p { margin: 0; color: var(--dim); font-size: 0.92rem; }
+  .features.qa { grid-template-columns: repeat(3, 1fr); }
+  .qa-demo { margin-top: 2rem; }
+  .qa-demo pre { white-space: pre-wrap; word-break: break-word; }
 
   .flow {
     margin-top: 2rem; display: flex; align-items: stretch; gap: 0.6rem; flex-wrap: wrap;
@@ -1053,7 +1130,7 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
   /* responsive */
   @media (max-width: 980px) {
     .hero { grid-template-columns: 1fr; padding: 4rem 0 3.5rem; gap: 2.5rem; }
-    .features { grid-template-columns: repeat(2, 1fr); }
+    .features, .features.qa { grid-template-columns: repeat(2, 1fr); }
     .api-grid, .trio { grid-template-columns: minmax(0, 1fr); }
     .sp { grid-template-columns: 9rem 1fr; }
     .sp-note { grid-column: 2; text-align: left; }
@@ -1062,7 +1139,7 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
     nav { display: none; }
     .sec-head { grid-template-columns: 1fr; }
     .num { grid-row: auto; margin: 0 0 0.4rem; }
-    .features { grid-template-columns: 1fr; }
+    .features, .features.qa { grid-template-columns: 1fr; }
     .flow i { display: none; }
     .routes li { grid-template-columns: 4.6rem 1fr; }
     .routes li span:last-child { grid-column: 2; }

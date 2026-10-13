@@ -22,6 +22,10 @@ cargo run -- snapshot       # the page in a few hundred bytes, ref-addressable
 cargo run -- shot card.png --width 600 --scale 2 --selector '.card'   # sharp 2x clip of one element
 cargo run -- click e3
 cargo run -- batch 'type e2 "Ada"' 'click e5'   # many actions, one call
+cargo run -- inspect e3     # unique selector, landmarks, styles; component + source file on dev builds
+cargo run -- mark e3 "overlaps the footer at 375px" --severity major
+cargo run -- shot qa.png --annotate all --marks   # refs and QA marks drawn on the image
+cargo run -- marks --md     # the QA report a developer can act on
 ```
 
 ## What `cu` gives an agent
@@ -46,6 +50,15 @@ cargo run -- batch 'type e2 "Ada"' 'click e5'   # many actions, one call
 - **Downloads land where the agent can see them.** Files go to
   `<data>/downloads` (per-context subfolders included), `cu downloads` lists
   them and the click that started one names it.
+- **Visual references for QA.** `cu inspect eN` tells how to find an element
+  again -- a unique selector (`host >>> inner` through shadow roots), test id,
+  landmarks, box, key styles -- and, on a development build, which component
+  renders it and from which file (`src/LoginForm.tsx:42:7`; React, Vue,
+  Svelte, Angular and inspector plugins). `cu mark eN "note" --severity major`
+  pins a finding to the element, `cu marks --md` is the report, and
+  `cu shot --annotate all --marks` draws refs and marks on the image so
+  pixels, refs and code point at each other. See
+  [Visual QA references](docs/README.md#visual-qa-references).
 - **Skill and native tool.** [SKILL.md](SKILL.md) teaches an agent the whole
   flow (agentic tests, user stories, failure reports), and mini-tui exposes `cu`
   as a **native tool** next to `bash` — no MCP server in between.
@@ -357,7 +370,8 @@ cu navigate URL · cu snapshot · cu text        # all take --tab ID / --context
 cu click e3 · cu type e2 "text" [--submit] · cu upload e5 photo.jpg
 cu act '[{"do":"type","ref":"e2","text":"Ada"},{"do":"click","ref":"e5"}]'
 cu batch 'snapshot --tab t1' 'click e3 --tab t1'   # many commands, one call
-cu shot [FILE.jpg] · cu downloads · cu login
+cu shot [FILE.jpg] [--annotate REFS|all] [--marks] · cu downloads · cu login
+cu inspect e3 · cu mark e3 "what is wrong" [--severity major] · cu marks [--md|clear]
 cu session save NAME · cu session load NAME
 ```
 

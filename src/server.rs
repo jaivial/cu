@@ -804,6 +804,10 @@ pub fn route(
             | ("GET", "/v1/text")
             | ("GET", "/v1/challenge")
             | ("POST", "/v1/challenge/release")
+            | ("GET", "/v1/inspect")
+            | ("GET", "/v1/marks")
+            | ("POST", "/v1/marks")
+            | ("DELETE", "/v1/marks")
     ) || (method == "DELETE"
         && (path.starts_with("/v1/contexts/") || path.starts_with("/v1/tabs/")));
     if needs_browser && let Err(error) = wait_until_ready(state) {
@@ -979,6 +983,79 @@ pub fn route(
             navigate_scheduled(&tab, &url)
         }
         ("GET", "/v1/screenshot") => screenshot(&tab, query(full_path)),
+        // Visual QA references (see `crate::visual`): what an element is,
+        // how to find it again and which code renders it; and QA marks
+        // pinned to elements, as JSON or a Markdown report.
+        ("GET", "/v1/inspect") => {
+            let q = query(full_path);
+            let (reference, selector) = (form_value(q, "ref"), form_value(q, "selector"));
+            if reference.is_empty() == selector.is_empty() {
+                return (
+                    "400 Bad Request",
+                    "application/json",
+                    "{\"error\":\"give ref or selector, one of them\"}".into(),
+                );
+            }
+            let found = crate::visual::inspect(
+                &tab,
+                Some(reference.as_str()).filter(|r| !r.is_empty()),
+                Some(selector.as_str()).filter(|s| !s.is_empty()),
+            );
+            match found {
+                Ok(info) => ("200 OK", "application/json", info),
+                Err(e) => (
+                    "400 Bad Request",
+                    "application/json",
+                    format!("{{\"error\":{}}}", json_string(&e)),
+                ),
+            }
+        }
+        ("POST", "/v1/marks") => {
+            let field = |k: &str| json_string_value(body, k).filter(|v| !v.is_empty());
+            let (reference, selector) = (field("ref"), field("selector"));
+            if reference.is_some() == selector.is_some() {
+                return (
+                    "400 Bad Request",
+                    "application/json",
+                    "{\"error\":\"give ref or selector, one of them\"}".into(),
+                );
+            }
+            match crate::visual::add_mark(
+                &tab,
+                reference.as_deref(),
+                selector.as_deref(),
+                &field("note").unwrap_or_default(),
+                field("severity").as_deref(),
+            ) {
+                Ok(mark) => ("200 OK", "application/json", mark),
+                Err(e) => (
+                    "400 Bad Request",
+                    "application/json",
+                    format!("{{\"error\":{}}}", json_string(&e)),
+                ),
+            }
+        }
+        ("GET", "/v1/marks") => {
+            let marks = crate::visual::marks_of(&tab);
+            if form_value(query(full_path), "format") == "md" {
+                (
+                    "200 OK",
+                    "text/markdown; charset=utf-8",
+                    crate::visual::marks_markdown(&marks),
+                )
+            } else {
+                (
+                    "200 OK",
+                    "application/json",
+                    crate::visual::marks_json(&marks),
+                )
+            }
+        }
+        ("DELETE", "/v1/marks") => (
+            "200 OK",
+            "application/json",
+            format!("{{\"cleared\":{}}}", crate::visual::clear_marks(&tab)),
+        ),
         // Act on snapshot refs. `/v1/act` takes a batch; `/v1/click` and
         // `/v1/type` are the same thing for a single action.
         ("POST", "/v1/act") => act(&tab, crate::actions::parse_batch(body)),
@@ -1727,7 +1804,7 @@ fn screenshot(tab: &Tab, query: &str) -> (&'static str, &'static str, String) {
     };
     let png = options.png;
     let format = if png { "png" } else { "jpeg" };
-    let result = capture(tab, &options);
+    let result = capture_annotated(tab, &options);
     if options.emulates() {
         // Restore the browser's own viewport even if the capture failed.
         let _ = tab.command("Emulation.clearDeviceMetricsOverride", "{}");
@@ -1765,6 +1842,11 @@ pub struct ShotOptions {
     pub reference: Option<String>,
     pub selector: Option<String>,
     pub padding: f64,
+    /// Snapshot refs to box and label on the image (`annotate=e1,e4`), or
+    /// every ref of the last snapshot (`annotate=all`).
+    pub annotate: Option<Vec<String>>,
+    /// Box this tab's QA marks on the page, numbered like the report.
+    pub marks: bool,
 }
 
 /// Largest viewport side accepted, in CSS pixels.
@@ -1828,6 +1910,25 @@ impl ShotOptions {
             reference: get("ref"),
             selector: get("selector"),
             padding,
+            annotate: get("annotate")
+                .map(|v| {
+                    let refs: Vec<String> = v
+                        .split(',')
+                        .map(|r| r.trim().to_string())
+                        .filter(|r| !r.is_empty())
+                        .collect();
+                    match refs
+                        .iter()
+                        .find(|r| *r != "all" && !crate::actions::valid_ref(r))
+                    {
+                        Some(bad) => Err(format!(
+                            "annotate takes snapshot refs (e1,e4) or all, got {bad}"
+                        )),
+                        None => Ok(refs),
+                    }
+                })
+                .transpose()?,
+            marks: matches!(form_value(query, "marks").as_str(), "1" | "true"),
         };
         if options.reference.is_some() && options.selector.is_some() {
             return Err("give ref or selector, not both".into());
@@ -1839,6 +1940,67 @@ impl ShotOptions {
     pub fn emulates(&self) -> bool {
         self.width.is_some() || self.height.is_some() || self.scale.is_some()
     }
+}
+
+/// [`capture`] with the overlays the options ask for drawn on the page for
+/// this one image and removed right after it, whatever the capture did.
+fn capture_annotated(tab: &Tab, options: &ShotOptions) -> Result<(String, String), String> {
+    let mut items = Vec::new();
+    if let Some(refs) = &options.annotate {
+        let refs = if refs.iter().any(|r| r == "all") {
+            snapshot_refs(tab)
+        } else {
+            refs.clone()
+        };
+        if refs.is_empty() {
+            return Err("no refs to annotate; take a snapshot first".into());
+        }
+        items.extend(crate::visual::ref_items(&refs));
+    }
+    if options.marks {
+        let url = crate::visual::current_url(tab);
+        items.extend(crate::visual::mark_items(
+            &crate::visual::marks_of(tab),
+            &url,
+        ));
+    }
+    if items.is_empty() {
+        return capture(tab, options);
+    }
+    // The viewport changes before the boxes are measured, or they would sit
+    // where the elements were at the old size.
+    if options.emulates() {
+        tab.command(
+            "Emulation.setDeviceMetricsOverride",
+            &format!(
+                "{{\"width\":{},\"height\":{},\"deviceScaleFactor\":{},\"mobile\":false}}",
+                options.width.unwrap_or(0),
+                options.height.unwrap_or(0),
+                options.scale.unwrap_or(0.0)
+            ),
+        )?;
+    }
+    let drawn = crate::visual::draw(tab, &items)?;
+    let result = capture(tab, options);
+    crate::visual::clear(&drawn);
+    let (reply, size) = result?;
+    let labels: Vec<String> = drawn.labels.iter().map(|l| json_string(l)).collect();
+    Ok((
+        reply,
+        format!("{size}\"annotated\":[{}],", labels.join(",")),
+    ))
+}
+
+/// The refs of `tab`'s last snapshot, in the order they were handed out.
+pub fn snapshot_refs(tab: &Tab) -> Vec<String> {
+    let mut refs: Vec<String> = ref_frames()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(tab)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    refs.sort_by_key(|r| r[1..].parse::<u64>().unwrap_or(u64::MAX));
+    refs
 }
 
 /// Run the capture: override the viewport, measure the clip, take the shot.
@@ -3638,6 +3800,23 @@ pub fn decode_base64(s: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_screenshot_can_ask_for_ref_labels_and_qa_marks() {
+        let options = ShotOptions::parse("annotate=e1%2Ce4&marks=1").expect("parses");
+        assert_eq!(
+            options.annotate,
+            Some(vec!["e1".to_string(), "e4".to_string()])
+        );
+        assert!(options.marks);
+        let all = ShotOptions::parse("annotate=all").expect("parses");
+        assert_eq!(all.annotate, Some(vec!["all".to_string()]));
+        assert!(!all.marks);
+        let plain = ShotOptions::parse("").expect("parses");
+        assert_eq!(plain.annotate, None);
+        let bad = ShotOptions::parse("annotate=e1,button").unwrap_err();
+        assert!(bad.contains("got button"), "{bad}");
+    }
 
     #[test]
     fn header_lookup_is_case_insensitive() {
