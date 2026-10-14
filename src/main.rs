@@ -373,9 +373,18 @@ fn request(method: &str, path: &str, body: Option<&str>) -> Result<String, Strin
         }
     }
     ensure_daemon()?;
-    let config = fs::read_to_string(&daemon_config)
-        .map_err(|_| "the daemon did not come up (see ~/.cu/daemon/daemon.log)")?;
-    request_config(&config, method, path, body)
+    // The freshly started daemon rewrites server.json (new token) as it
+    // binds; a config read racing that write would auth against a dead
+    // token, so re-read and retry once.
+    for _ in 0..2 {
+        let config = fs::read_to_string(&daemon_config)
+            .map_err(|_| "the daemon did not come up (see ~/.cu/daemon/daemon.log)")?;
+        match request_config(&config, method, path, body) {
+            Ok(reply) => return Ok(reply),
+            Err(_) => thread::sleep(Duration::from_millis(300)),
+        }
+    }
+    Err("the daemon is up but refused the request (see ~/.cu/daemon/daemon.log)".into())
 }
 
 /// The `(port, token)` a `server.json` describes, if it parses.
