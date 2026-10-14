@@ -281,8 +281,22 @@ fn start(args: &[String]) -> Result<(), String> {
     let cdp_port = cdp_port_from_env().unwrap_or(DEFAULT_CDP_PORT);
     // One daemon per profile: a second one would clear the first one's
     // browser locks and overwrite its server.json.
+    // Already served by a live daemon (e.g. the CLI auto-started one before
+    // systemd got to it)? Then this invocation is done: exit cleanly so a
+    // `Restart=on-failure` unit does not fight the running process.
+    if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+        let _ = stream
+            .write_all(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let mut reply = String::new();
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        if stream.read_to_string(&mut reply).is_ok() && reply.contains("running") {
+            eprintln!("cu: a daemon already answers on {port}; nothing to do");
+            return Ok(());
+        }
+    }
     cu::session::claim_owner(&data, port, cdp_port)?;
-    let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("port {port}: {e} (is another cu instance on it?)"))?;
     let token = server::random_token();
     fs::write(
         data.join("server.json"),
@@ -473,6 +487,25 @@ fn request_daemon(
 fn ensure_daemon() -> Result<(), String> {
     let dir = daemon_dir();
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // On a host with the `cu.service` unit installed, systemd is the owner:
+    // starting it there survives reboots and logouts, so prefer it and fall
+    // back to a detached spawn only where systemctl is not usable.
+    if std::path::Path::new("/etc/systemd/system/cu.service").exists() {
+        let _ = Command::new("sudo")
+            .args(["-n", "systemctl", "start", "cu"])
+            .status();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok(config) = fs::read_to_string(dir.join("server.json"))
+                && let Some((port, _)) = endpoint(&config)
+                && TcpStream::connect(("127.0.0.1", port)).is_ok()
+            {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        eprintln!("cu: systemd did not bring the daemon up; spawning it directly");
+    }
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let log = fs::OpenOptions::new()
         .create(true)
@@ -723,8 +756,22 @@ fn daemon(args: &[String]) -> Result<(), String> {
         Some(port) => port,
         None => free_port_from(DAEMON_CDP_BASE),
     };
+    // Already served by a live daemon (e.g. the CLI auto-started one before
+    // systemd got to it)? Then this invocation is done: exit cleanly so a
+    // `Restart=on-failure` unit does not fight the running process.
+    if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+        let _ = stream
+            .write_all(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let mut reply = String::new();
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        if stream.read_to_string(&mut reply).is_ok() && reply.contains("running") {
+            eprintln!("cu: a daemon already answers on {port}; nothing to do");
+            return Ok(());
+        }
+    }
     cu::session::claim_owner(&data, port, cdp_port)?;
-    let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("port {port}: {e} (is another cu instance on it?)"))?;
     let token = server::random_token();
     fs::write(
         data.join("server.json"),
