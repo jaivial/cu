@@ -45,6 +45,7 @@
   <h1>cu vault</h1>
   <input id="search" placeholder="Search domain, label, notes…">
   <button class="primary" id="new">New credential</button>
+  <button id="requests">Requests <span id="req-badge" hidden style="background:#7f1d1d;color:#fecaca;border-radius:8px;padding:0 0.4rem;font-size:0.8rem"></span></button>
   <button id="sessions">Sessions</button>
   <button id="logout">Log out</button>
 </header>
@@ -86,6 +87,17 @@
   <h2 style="margin-top:0">Saved sessions</h2>
   <table><thead><tr><th>Domain</th><th>Updated</th><th></th></tr></thead><tbody id="session-rows"></tbody></table>
   <div class="row" style="margin-top:0.8rem"><button id="sessions-close">Close</button></div>
+</dialog>
+
+<dialog id="requests-dialog">
+  <h2 style="margin-top:0">Agent secret requests</h2>
+  <p class="muted" style="margin-top:0">An agent asked for a credential. Approving hands that
+  credential (with its values) to whoever holds the daemon's API token; denying — or doing
+  nothing for 15 minutes — hands over nothing.</p>
+  <table><thead><tr><th>#</th><th>Domain</th><th>Reason</th><th>Asked by</th><th>Credential</th><th></th></tr></thead>
+  <tbody id="request-rows"></tbody></table>
+  <p class="muted" id="requests-empty" hidden>No pending requests.</p>
+  <div class="row" style="margin-top:0.8rem"><button id="requests-close">Close</button></div>
 </dialog>
 
 <div class="toast" id="toast"></div>
@@ -225,7 +237,68 @@ $('sessions-close').onclick = () => $('sessions-dialog').close();
 $('reveal-close').onclick = () => $('reveal').close();
 $('logout').onclick = async () => { await fetch('/v1/vault/ui/logout', { method: 'POST' }); location.href = '/vault'; };
 
+// ---- agent secret requests ----
+let pendingRequests = [];
+
+async function loadRequests() {
+  const reply = await fetch('/v1/vault/requests?status=pending');
+  if (reply.status === 401) { location.href = '/vault'; return; }
+  pendingRequests = (await reply.json()).requests;
+  const badge = $('req-badge');
+  badge.hidden = pendingRequests.length === 0;
+  badge.textContent = pendingRequests.length;
+  renderRequests();
+}
+
+function credentialOptions(domain) {
+  // Credentials covering the requested domain (exact or parent), newest first
+  // — the API already matched them the same way.
+  const matching = creds.filter(c =>
+    domain.endsWith(c.domain) || c.domain.endsWith(domain));
+  return matching.length ? matching : creds;
+}
+
+function renderRequests() {
+  $('requests-empty').hidden = pendingRequests.length > 0;
+  $('request-rows').innerHTML = pendingRequests.map(r => {
+    const options = credentialOptions(r.domain)
+      .map(c => `<option value="${c.id}">${esc(c.domain)} / ${esc(c.label)}</option>`)
+      .join('');
+    return `
+    <tr>
+      <td class="muted">${r.id}</td>
+      <td>${esc(r.domain)}</td>
+      <td class="muted">${esc((r.reason || '').slice(0, 60))}</td>
+      <td class="muted">${esc(r.requested_by || '—')}</td>
+      <td><select id="cred-for-${r.id}">${options}</select></td>
+      <td class="actions">
+        <button class="primary" onclick="decide(${r.id}, true)">Approve</button>
+        <button class="danger" onclick="decide(${r.id}, false)">Deny</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+async function decide(id, approve) {
+  const body = approve
+    ? { credential_id: Number(document.getElementById(`cred-for-${id}`).value) }
+    : {};
+  const reply = await fetch(`/v1/vault/requests/${id}/${approve ? 'approve' : 'deny'}`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  if (!reply.ok) { toast((await reply.json()).error || 'Could not decide'); return; }
+  toast(approve ? 'Approved — the agent can pick the credential up' : 'Denied');
+  loadRequests();
+}
+
+$('requests').onclick = () => { renderRequests(); $('requests-dialog').showModal(); };
+$('requests-close').onclick = () => $('requests-dialog').close();
+
 load();
+loadRequests();
+// A request that arrives while the vault is open should show up on its own.
+setInterval(loadRequests, 10000);
 </script>
 </body>
 </html>

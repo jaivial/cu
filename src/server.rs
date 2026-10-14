@@ -703,9 +703,12 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
         ("200 OK", "text/html", login_page())
     } else if path == "/login" && method == "POST" {
         ("200 OK", "text/html", login_submit(body, &state))
-    } else if is_vault_path(path) && !authorized {
+    } else if is_vault_path(path) && (!authorized || is_vault_ui_only(path)) {
         // The vault UI authenticates with its own cookie (master password
         // behind nginx basic auth); the local CLI keeps using the bearer.
+        // Approve/deny are UI-only even for a bearer caller: every agent on
+        // this machine holds the same bearer token, so an agent allowed to
+        // answer its own secret request would make the approval theatre.
         let (status, kind, response, cookie) =
             vault_route(method, path, body, &state, header_value(head, "cookie"));
         set_cookie = cookie;
@@ -764,6 +767,16 @@ pub fn host_allowed(
 /// the only paths the vault host answers).
 fn is_vault_path(path: &str) -> bool {
     path == "/vault" || path.starts_with("/vault/") || path.starts_with("/v1/vault")
+}
+
+/// Whether a vault route may be answered only to a live UI session, never to
+/// the bearer token: deciding a secret request. The bearer token sits in
+/// `server.json`, readable by every process of this user — every agent this
+/// daemon serves included — so an agent that could answer its own request
+/// would reduce the human's approval to a formality. Approving or denying is
+/// for the person in front of the vault UI.
+fn is_vault_ui_only(path: &str) -> bool {
+    path.ends_with("/approve") || path.ends_with("/deny")
 }
 
 /// Normalise a public base URL (`https://login.example.com[:port][/]`) and
@@ -1073,7 +1086,12 @@ pub fn route(
             let inject = !body.contains("\"inject\":false")
                 && !body.contains("\"inject\": \"off\"")
                 && !body.contains("\"inject\":\"off\"");
-            navigate_with_vault(state, &tab, &url, inject)
+            // The basic-auth responder is on like the injector, and off with
+            // `"auth":false` for a caller that wants the raw challenge.
+            let auth_enabled = !body.contains("\"auth\":false")
+                && !body.contains("\"auth\": \"off\"")
+                && !body.contains("\"auth\":\"off\"");
+            navigate_with_vault(state, &tab, &url, inject, auth_enabled)
         }
         ("GET", "/v1/screenshot") => screenshot(&tab, query(full_path)),
         // Visual QA references (see `crate::visual`): what an element is,
@@ -1338,7 +1356,11 @@ fn context_session(
 /// assess, and retry a 429/503 or a transient network error within the
 /// budget (see [`crate::scheduler`]). A challenge or a block is never
 /// retried.
-fn navigate_scheduled(tab: &Tab, url: &str) -> (&'static str, &'static str, String) {
+fn navigate_scheduled(
+    tab: &Tab,
+    url: &str,
+    auth: Option<(String, String)>,
+) -> (&'static str, &'static str, String) {
     let refused =
         |r: crate::scheduler::Refused| ("429 Too Many Requests", "application/json", r.json());
     let retries = crate::scheduler::budget().retries;
@@ -1349,7 +1371,7 @@ fn navigate_scheduled(tab: &Tab, url: &str) -> (&'static str, &'static str, Stri
             Err(r) => return refused(r),
         };
         let queued = permit.as_ref().map(|p| p.waited).unwrap_or_default();
-        let (result, document) = match navigate_observed(tab, url) {
+        let (result, document, auth_handled) = match navigate_observed(tab, url, auth.clone()) {
             Ok(pair) => pair,
             Err(error) => {
                 return (
@@ -1479,6 +1501,11 @@ fn navigate_scheduled(tab: &Tab, url: &str) -> (&'static str, &'static str, Stri
             continue;
         }
         let mut extra = String::new();
+        if auth_handled {
+            // A challenge was met with the vault's credentials; the status
+            // above is the post-auth response, not the bare 401.
+            extra.push_str(",\"basic_auth\":\"responded\"");
+        }
         if let Some(a) = &assessment {
             extra.push_str(&format!(",\"challenge\":{}", a.json()));
         }
@@ -1510,10 +1537,21 @@ fn navigate_scheduled(tab: &Tab, url: &str) -> (&'static str, &'static str, Stri
 /// `Page.navigate` on a connection that has `Network` on just for the
 /// navigation, so the main document's status and `Retry-After` are seen.
 /// Only those two values are kept from the response.
+///
+/// With `auth` set (the vault has a user/password pair for this host), the
+/// connection also has `Fetch` interception on, scoped to the host: an
+/// `authRequired` event — the 401 + `WWW-Authenticate` challenge a headless
+/// browser would otherwise sit on with no dialog to answer — is answered
+/// with `Fetch.continueWithAuth` and the vault's pair, and every paused
+/// request is continued, all without ever stopping to read a command's
+/// reply inline (a reply read for would swallow concurrent events and leave
+/// a request paused for ever). The third element of the result says whether
+/// a challenge was answered.
 fn navigate_observed(
     tab: &Tab,
     url: &str,
-) -> Result<(String, Option<crate::scheduler::DocumentResponse>), String> {
+    auth: Option<(String, String)>,
+) -> Result<(String, Option<crate::scheduler::DocumentResponse>, bool), String> {
     let mut connection = checkout(tab)?;
     // Small buffers: the bodies are never fetched, only headers are needed.
     let enabled = connection
@@ -1528,14 +1566,33 @@ fn navigate_observed(
                 "{\"maxTotalBufferSize\":0,\"maxResourceBufferSize\":0}",
             )
         });
+    let auth_on = auth.is_some() && enabled.is_ok();
+    if auth_on {
+        if connection
+            .call("Fetch.enable", &fetch_enable_params(&url_host(url)))
+            .is_err()
+        {
+            // The Fetch domain refused (an interception is somehow already
+            // armed on this pooled connection): a fresh connection does not
+            // carry it.
+            connection = open_connection(tab)?;
+            let _ = connection.call(
+                "Network.enable",
+                "{\"maxTotalBufferSize\":0,\"maxResourceBufferSize\":0}",
+            );
+            let _ = connection.call("Fetch.enable", &fetch_enable_params(&url_host(url)));
+        }
+    }
     // Every document response seen; the main document's is the one whose
     // request id is the navigation's loader id. Taking the first one was
     // wrong: a frame of the previous page still loading (DataDome's CAPTCHA
     // iframe answers 200) could arrive first and stand in for a 403.
-    let mut documents = Vec::new();
+    // Shared between the two observers (the command stream's and the auth
+    // window's), which never run at once.
+    let documents = std::cell::RefCell::new(Vec::new());
     let mut see = |event: &str| {
         if let Some(d) = crate::scheduler::document_response(event) {
-            documents.push(d);
+            documents.borrow_mut().push(d);
         }
     };
     let reply = connection.call_observed(
@@ -1543,16 +1600,75 @@ fn navigate_observed(
         &format!("{{\"url\":{}}}", json_string(url)),
         &mut see,
     );
-    if reply.is_ok() && enabled.is_ok() {
-        // The response event can trail the reply by a hair; one round trip
-        // drains what is already queued.
-        let _ = connection.call_observed("Network.disable", "{}", &mut see);
-        checkin(tab, connection);
+    let mut auth_handled = false;
+    if let Ok(reply_text) = &reply {
+        if auth_on {
+            let loader = json_string_value(reply_text, "loaderId");
+            let frame = json_string_value(reply_text, "frameId");
+            let deadline = std::time::Instant::now() + AUTH_WINDOW;
+            let outcome = connection.handle_events(deadline, &mut |event, conn| {
+                if let Some(d) = crate::scheduler::document_response(event) {
+                    documents.borrow_mut().push(d);
+                }
+                if let Some(rid) = auth_required_id(event) {
+                    conn.send(
+                        "Fetch.continueWithAuth",
+                        &continue_with_auth_params(&rid, &auth),
+                    );
+                    auth_handled = true;
+                } else if let Some(rid) = paused_request_id(event) {
+                    conn.send(
+                        "Fetch.continueRequest",
+                        &format!("{{\"requestId\":{}}}", json_string(&rid)),
+                    );
+                }
+                // Done when the document this navigation is for has landed:
+                // without a challenge, any response for it; with one, the
+                // response that followed the credentials (the pre-auth 401
+                // shares the request id, so the last one wins).
+                let guard = documents.borrow();
+                let main = guard.iter().rev().find(|d| {
+                    loader.as_deref() == Some(d.request_id.as_str())
+                        || frame.as_deref().is_some_and(|f| !f.is_empty())
+                            && frame.as_deref() == Some(d.frame_id.as_str())
+                });
+                match main {
+                    Some(d) => !auth_handled || d.status != 401,
+                    None => false,
+                }
+            });
+            if outcome != Ok(true) {
+                // The window closed on a still-unsettled page (or the stream
+                // went away). A short grace lets the requests already paused
+                // be continued before interception is torn down, so the
+                // settle wait that follows sees an unintercepted browser.
+                let _ = connection.handle_events(
+                    std::time::Instant::now() + Duration::from_millis(400),
+                    &mut |_event, conn| {
+                        if let Some(rid) = paused_request_id(_event) {
+                            conn.send(
+                                "Fetch.continueRequest",
+                                &format!("{{\"requestId\":{}}}", json_string(&rid)),
+                            );
+                        }
+                        false
+                    },
+                );
+            }
+            let _ = connection.call("Fetch.disable", "{}");
+        }
+        if enabled.is_ok() {
+            // The response event can trail the reply by a hair; one round trip
+            // drains what is already queued.
+            let _ = connection.call_observed("Network.disable", "{}", &mut see);
+            checkin(tab, connection);
+        }
     }
     let reply = reply?;
+    let documents = documents.into_inner();
     let loader = json_string_value(&reply, "loaderId");
     let frame = json_string_value(&reply, "frameId");
-    let document = documents
+    let mut document = documents
         .iter()
         .find(|d| loader.as_deref() == Some(d.request_id.as_str()))
         .or_else(|| {
@@ -1561,7 +1677,82 @@ fn navigate_observed(
                 .find(|d| frame.as_deref() == Some(d.frame_id.as_str()))
         })
         .cloned();
-    Ok((reply, document))
+    if auth_handled {
+        // The challenge replays the request: the 401 and the response after
+        // the credentials share a request id, and the report — like the done
+        // condition above — must speak for the one that answered.
+        let replayed = documents
+            .iter()
+            .rev()
+            .find(|d| {
+                loader.as_deref() == Some(d.request_id.as_str())
+                    || frame.as_deref().is_some_and(|f| !f.is_empty())
+                        && frame.as_deref() == Some(d.frame_id.as_str())
+            })
+            .cloned();
+        if let Some(replayed) = replayed {
+            document = Some(replayed);
+        }
+    }
+    Ok((reply, document, auth_handled))
+}
+
+/// How long a navigation may keep answering auth challenges and continuing
+/// intercepted requests before the page is handed back to the normal settle
+/// wait (which then reports `settled:false` if it is still coming).
+const AUTH_WINDOW: Duration = Duration::from_secs(20);
+
+/// `Fetch.authRequired`: the request id of an HTTP auth challenge.
+fn auth_required_id(event: &str) -> Option<String> {
+    if !event.contains("\"Fetch.authRequired\"") {
+        return None;
+    }
+    json_string_value(event, "requestId")
+}
+
+/// `Fetch.requestPaused`: the request id of an intercepted request.
+fn paused_request_id(event: &str) -> Option<String> {
+    if !event.contains("\"Fetch.requestPaused\"") {
+        return None;
+    }
+    json_string_value(event, "requestId")
+}
+
+/// `Fetch.enable` scoped to one host: only its URLs (and subdomains') are
+/// intercepted, so the rest of the page's origins load untouched. Auth
+/// challenges are reported for those requests too.
+fn fetch_enable_params(host: &str) -> String {
+    let mut patterns = Vec::new();
+    for scheme in ["http", "https"] {
+        for pattern in [
+            format!("{scheme}://{host}/*"),
+            format!("{scheme}://*.{host}/*"),
+        ] {
+            patterns.push(format!("{{\"urlPattern\":{}}}", json_string(&pattern)));
+        }
+    }
+    format!(
+        "{{\"handleAuthRequests\":true,\"patterns\":[{}]}}",
+        patterns.join(",")
+    )
+}
+
+/// The `Fetch.continueWithAuth` answer to a challenge: the vault's pair when
+/// there is one, a silent cancel otherwise (headless has no dialog to offer,
+/// and `Default` would leave the page waiting for exactly that).
+fn continue_with_auth_params(request_id: &str, auth: &Option<(String, String)>) -> String {
+    match auth {
+        Some((user, password)) => format!(
+            "{{\"requestId\":{},\"response\":\"ProvideCredentials\",\"username\":{},\"password\":{}}}",
+            json_string(request_id),
+            json_string(user),
+            json_string(password)
+        ),
+        None => format!(
+            "{{\"requestId\":{},\"response\":\"CancelAuth\"}}",
+            json_string(request_id)
+        ),
+    }
 }
 
 /// A one-action batch from a `/v1/click` or `/v1/type` body.
@@ -3488,6 +3679,50 @@ impl CdpConnection {
         Ok(clean)
     }
 
+    /// Read events until `done` says stop or `deadline` passes, with the
+    /// connection itself handed to `handle` so an event can be answered
+    /// before the next one is read (`Fetch.authRequired` must be, or the
+    /// page waits for ever). Returns `false` if the deadline cut a read
+    /// short: the stream may then hold half a frame, so the caller must not
+    /// pool the connection again.
+    pub(crate) fn handle_events(
+        &mut self,
+        deadline: std::time::Instant,
+        handle: &mut dyn FnMut(&str, &mut CdpConnection) -> bool,
+    ) -> Result<bool, String> {
+        let clean = loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break false;
+            }
+            let _ = self.stream.set_read_timeout(Some(left));
+            match self.next_message(MAX_CDP_MESSAGE) {
+                Ok(text) => {
+                    if message_id(&text).is_none() && handle(&text, self) {
+                        break true;
+                    }
+                }
+                Err(_) => break false,
+            }
+        };
+        let _ = self.stream.set_read_timeout(Some(CDP_HTTP_TIMEOUT));
+        Ok(clean)
+    }
+
+    /// Fire one command without reading for its reply: the reply comes back
+    /// through the event loop that is calling us. Answering interception
+    /// events this way never stops reading the stream — a command read for
+    /// inline would swallow the events arriving while it waited, and a
+    /// request paused for ever is a page hung for ever.
+    pub(crate) fn send(&mut self, method: &str, params: &str) {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        let message = format!("{{\"id\":{id},\"method\":\"{method}\",\"params\":{params}}}");
+        let _ = self
+            .stream
+            .write_all(&encode_client_frame(message.as_bytes()));
+    }
+
     fn next_message(&mut self, limit: usize) -> Result<String, String> {
         let payload = read_frame(&mut self.stream, limit)?;
         String::from_utf8(payload).map_err(|e| e.to_string())
@@ -4216,6 +4451,99 @@ fn vault_api(
                 Err(e) => error_json(&e),
             }
         }
+        ("GET", "/v1/vault/requests") => {
+            let status = form_value(query(path), "status");
+            match vault.list_requests((!status.is_empty()).then_some(status.as_str())) {
+                Ok(body) => ("200 OK", "application/json", body),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("POST", "/v1/vault/requests") => {
+            // An agent asks for a secret: the request records who is asking
+            // and why, and reveals nothing until a person approves it in the
+            // vault UI (or denies it, or lets it expire).
+            let field = |k: &str| json_value(body, k).unwrap_or_default();
+            let domain = field("domain");
+            if domain.is_empty() {
+                return error_json("domain is required");
+            }
+            match vault.create_request(&domain, &field("reason"), &field("requested_by")) {
+                Ok(id) => (
+                    "200 OK",
+                    "application/json",
+                    format!("{{\"id\":{id},\"status\":\"pending\"}}"),
+                ),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("GET", p) if p.starts_with("/v1/vault/requests/") => {
+            let tail = &p["/v1/vault/requests/".len()..];
+            let Ok(id) = tail.parse::<i64>() else {
+                return error_json("request id must be a number");
+            };
+            match vault.get_request(id) {
+                // An approved request carries the credential with its
+                // values — the payoff the flow exists for. Pending, denied
+                // and expired requests carry none.
+                Ok(Some(body)) => ("200 OK", "application/json", body),
+                Ok(None) => error_json("no such request"),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("POST", p) if p.starts_with("/v1/vault/requests/") => {
+            // Reached only with a live UI session (see `is_vault_ui_only`):
+            // this is the person's decision, never the asking agent's.
+            let tail = &p["/v1/vault/requests/".len()..];
+            let (id_part, action) = match tail.rsplit_once('/') {
+                Some((id, action)) => (id, action),
+                None => return error_json("POST /v1/vault/requests/{id}/approve|deny"),
+            };
+            let Ok(id) = id_part.parse::<i64>() else {
+                return error_json("request id must be a number");
+            };
+            let approve = match action {
+                "approve" => true,
+                "deny" => false,
+                _ => return error_json("POST /v1/vault/requests/{id}/approve|deny"),
+            };
+            // Approval links a credential: the one the UI names, or — when it
+            // names none — the only credential the vault holds for the
+            // requested domain, so the common case is one click.
+            let credential_id =
+                json_value(body, "credential_id").and_then(|v| v.parse::<i64>().ok());
+            let credential_id = if approve && credential_id.is_none() {
+                let domain = vault
+                    .get_request(id)
+                    .ok()
+                    .flatten()
+                    .and_then(|r| json_string_value(&r, "domain"))
+                    .unwrap_or_default();
+                let options = vault.credentials_for_domain(&domain).unwrap_or_default();
+                match options.len() {
+                    1 => Some(options[0].0),
+                    0 => return error_json("no credential for this domain to approve with"),
+                    _ => {
+                        return error_json(
+                            "several credentials cover this domain; pass credential_id",
+                        );
+                    }
+                }
+            } else {
+                credential_id
+            };
+            match vault.decide_request(id, approve, credential_id) {
+                Ok(true) => (
+                    "200 OK",
+                    "application/json",
+                    format!(
+                        "{{\"id\":{id},\"status\":\"{}\"}}",
+                        if approve { "approved" } else { "denied" }
+                    ),
+                ),
+                Ok(false) => error_json("no such request"),
+                Err(e) => error_json(&e),
+            }
+        }
         _ => (
             "404 Not Found",
             "application/json",
@@ -4355,16 +4683,30 @@ fn navigate_with_vault(
     tab: &Tab,
     url: &str,
     inject: bool,
+    auth_enabled: bool,
 ) -> (&'static str, &'static str, String) {
     let host = url_host(url);
     let vault = crate::vault::Vault::open(&state.data_dir).ok();
     let (mut injected, mut session_hint, mut credentials) = (false, "none", 0usize);
     let mut local_storage = String::new();
+    // The basic-auth pair the vault holds for this host, if the caller did
+    // not turn the responder off: handed to the navigation, which answers an
+    // HTTP auth challenge with it instead of leaving the headless browser on
+    // a dialog it cannot see.
+    let mut auth = None;
     if let Some(vault) = vault.as_ref()
         && !host.is_empty()
     {
         let session = vault.get_session(&host).ok().flatten();
         credentials = vault.count_credentials(&host);
+        if auth_enabled {
+            for (_id, _domain, fields) in vault.credentials_for_domain(&host).unwrap_or_default() {
+                if let Some(pair) = crate::vault::basic_auth_pair(&fields) {
+                    auth = Some(pair);
+                    break;
+                }
+            }
+        }
         if let Some(session) = session {
             session_hint = "saved";
             local_storage = session.local_storage.clone();
@@ -4378,7 +4720,7 @@ fn navigate_with_vault(
             }
         }
     }
-    let (status, kind, mut body) = navigate_scheduled(tab, url);
+    let (status, kind, mut body) = navigate_scheduled(tab, url, auth);
     if injected && !local_storage.is_empty() && local_storage != "{}" {
         // localStorage is origin-bound JavaScript state: write it on the
         // loaded page, then reload once so the site boots with it.
@@ -4517,6 +4859,57 @@ mod tests {
         assert_eq!(find(b"abc\r\n\r\nxyz", b"\r\n\r\n"), Some(3));
         assert_eq!(find(b"abc", b"\r\n\r\n"), None);
         assert_eq!(find(b"", b"\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn vault_ui_only_paths_are_the_decisions() {
+        assert!(is_vault_ui_only("/v1/vault/requests/7/approve"));
+        assert!(is_vault_ui_only("/v1/vault/requests/7/deny"));
+        assert!(!is_vault_ui_only("/v1/vault/requests/7"));
+        assert!(!is_vault_ui_only("/v1/vault/requests"));
+        assert!(!is_vault_ui_only("/v1/vault/credentials"));
+    }
+
+    #[test]
+    fn fetch_enable_is_scoped_to_the_host() {
+        let params = fetch_enable_params("example.com");
+        assert!(params.contains("\"handleAuthRequests\":true"));
+        assert!(params.contains("\"https://example.com/*\""));
+        assert!(params.contains("\"https://*.example.com/*\""));
+        assert!(params.contains("\"http://example.com/*\""));
+        assert!(!params.contains("other.com"));
+    }
+
+    #[test]
+    fn auth_challenge_answers_carry_the_pair_or_cancel() {
+        let auth = Some(("jaime".into(), "p@ss\"word".into()));
+        let params = continue_with_auth_params("42", &auth);
+        assert!(params.contains("\"response\":\"ProvideCredentials\""));
+        assert!(params.contains("\"requestId\":\"42\""));
+        // The pair is JSON-escaped: a quote in a password must survive.
+        assert!(params.contains("\"p@ss\\\"word\""));
+        assert_eq!(
+            continue_with_auth_params("42", &None),
+            "{\"requestId\":\"42\",\"response\":\"CancelAuth\"}"
+        );
+    }
+
+    #[test]
+    fn interception_events_are_told_apart() {
+        let challenge = r#"{"method":"Fetch.authRequired","params":{"requestId":"interception-job-1.0","request":{"url":"https://example.com/"}},"sessionId":"s"}"#;
+        let paused = r#"{"method":"Fetch.requestPaused","params":{"requestId":"interception-job-2.0","request":{"url":"https://example.com/x.css"}}}"#;
+        let network = r#"{"method":"Network.responseReceived","params":{"requestId":"abc"}}"#;
+        assert_eq!(
+            auth_required_id(challenge).as_deref(),
+            Some("interception-job-1.0")
+        );
+        assert_eq!(auth_required_id(paused), None);
+        assert_eq!(
+            paused_request_id(paused).as_deref(),
+            Some("interception-job-2.0")
+        );
+        assert_eq!(paused_request_id(challenge), None);
+        assert_eq!(auth_required_id(network), None);
     }
 }
 

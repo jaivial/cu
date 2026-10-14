@@ -38,6 +38,31 @@
 - Chromium's own renderer refusal page reads as `blocked` with vendor `chrome-deny`
   (see the 1.1.2 entry above).
 
+### Added
+
+- HTTP basic auth, answered (`src/server.rs`): when the vault holds a
+  user/password credential for a domain, `cu navigate` arms CDP
+  `Fetch.authRequired` interception scoped to that host for the length of the
+  navigation and answers a 401 + `WWW-Authenticate` challenge with the
+  vault's pair (`Fetch.continueWithAuth`) — a headless browser has no dialog
+  to offer, and Chrome strips URL-embedded credentials from subresource
+  fetches, so pages behind nginx-style basic auth used to be unreachable.
+  Every intercepted request is continued on the fly without ever stopping to
+  read a command's reply inline. The reply gains `"basic_auth":"responded"`
+  and the post-auth document status; `"auth":false` in the navigate body
+  turns the responder off.
+
+- Agent secret requests (`src/vault.rs`, `src/main.rs`, `src/vault_app.html`):
+  `cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait]` asks for a
+  credential by API; the request sits pending in the vault (15-minute TTL),
+  shows up in the vault UI's new Requests panel (badge + polling), and only a
+  person there can approve (linking a credential — the only one for the
+  domain by default) or deny. Approve/deny refuse the bearer token outright:
+  every agent holds the same token, so an agent that could answer its own
+  request would make the approval theatre. `GET /v1/vault/requests/{id}`
+  returns the credential with its values only once approved;
+  `cu vault request --wait` polls and prints that payoff.
+
 ## [1.1.0] - 2026-10-13
 
 ### Added
