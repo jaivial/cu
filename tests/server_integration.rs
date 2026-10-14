@@ -155,6 +155,8 @@ impl TestServer {
             cdp_port,
             browser: Arc::clone(&browser_state),
             public_host: None,
+            vault_host: None,
+            daemon: false,
         });
         std::thread::spawn(move || server::serve(state, listener));
         Self {

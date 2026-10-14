@@ -5,3 +5,8 @@ edition = "2024"
 
 [dependencies]
 chacha20poly1305 = "0.10.1"
+# The vault store and its at-rest encryption.
+rusqlite = { version = "0.37", features = ["bundled"] }
+aes-gcm = "0.10.3"
+sha2 = "0.10"
+hmac = "0.12"

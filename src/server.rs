@@ -24,6 +24,13 @@ pub struct AppState {
     /// Host (lower-case, no port) of the public URL a reverse proxy serves
     /// `/login` under (`CU_PUBLIC_URL` / `--public-url`), if any.
     pub public_host: Option<String>,
+    /// Host the vault UI is served under (`cu-vault.menustudioai.com`,
+    /// `CU_VAULT_HOST`), when a reverse proxy forwards it. Only `/vault`
+    /// paths answer that host; the API stays loopback-named.
+    pub vault_host: Option<String>,
+    /// This process is the canonical daemon (`cu daemon`): the CLI may open
+    /// a tab per invocation and the tab garbage collector runs.
+    pub daemon: bool,
 }
 
 /// Whether the persistent browser is up, or why it never came up.
@@ -683,7 +690,9 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
         header_value(head, "host"),
         path,
         state.public_host.as_deref(),
+        state.vault_host.as_deref(),
     );
+    let mut set_cookie: Option<String> = None;
     let (status, content_type, response) = if !host_ok {
         (
             "421 Misdirected Request",
@@ -694,6 +703,13 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
         ("200 OK", "text/html", login_page())
     } else if path == "/login" && method == "POST" {
         ("200 OK", "text/html", login_submit(body, &state))
+    } else if is_vault_path(path) && !authorized {
+        // The vault UI authenticates with its own cookie (master password
+        // behind nginx basic auth); the local CLI keeps using the bearer.
+        let (status, kind, response, cookie) =
+            vault_route(method, path, body, &state, header_value(head, "cookie"));
+        set_cookie = cookie;
+        (status, kind, response)
     } else if !authorized {
         (
             "401 Unauthorized",
@@ -703,11 +719,15 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
     } else {
         route(method, path, body, &state)
     };
-    let _ = write!(
-        stream,
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+    let mut head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
         response.len()
     );
+    if let Some(cookie) = set_cookie {
+        head.push_str(&format!("Set-Cookie: {cookie}\r\n"));
+    }
+    head.push_str("\r\n");
+    let _ = write!(stream, "{head}{response}");
 }
 
 /// Whether a request's `Host` header is one this daemon answers.
@@ -717,7 +737,12 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
 /// host a reverse proxy forwards is accepted for `/login` only, which is all
 /// the documented proxy exposes. Any other host is refused, which also keeps a
 /// DNS-rebinding page from reaching the API through a browser.
-pub fn host_allowed(host: Option<&str>, path: &str, public_host: Option<&str>) -> bool {
+pub fn host_allowed(
+    host: Option<&str>,
+    path: &str,
+    public_host: Option<&str>,
+    vault_host: Option<&str>,
+) -> bool {
     let Some(host) = host else { return true };
     let host = host.trim().to_ascii_lowercase();
     let name = if let Some(rest) = host.strip_prefix('[') {
@@ -729,7 +754,16 @@ pub fn host_allowed(host: Option<&str>, path: &str, public_host: Option<&str>) -
     if matches!(name, "localhost" | "127.0.0.1" | "::1") {
         return true;
     }
-    path == "/login" && public_host == Some(name)
+    if path == "/login" && public_host == Some(name) {
+        return true;
+    }
+    is_vault_path(path) && vault_host == Some(name)
+}
+
+/// Whether a path belongs to the vault UI/API (cookie- or bearer-gated, and
+/// the only paths the vault host answers).
+fn is_vault_path(path: &str) -> bool {
+    path == "/vault" || path.starts_with("/vault/") || path.starts_with("/v1/vault")
 }
 
 /// Normalise a public base URL (`https://login.example.com[:port][/]`) and
@@ -785,6 +819,11 @@ pub fn route(
     // A query string selects options (`?format=png`), never a different
     // resource, so the match below is on the path alone.
     let path = full_path.split('?').next().unwrap_or("");
+    // A CLI-created tab stays owned as long as its agent keeps using it.
+    let wanted_tab = form_value(query(full_path), "tab");
+    if !wanted_tab.is_empty() {
+        touch_tab_lease(&wanted_tab);
+    }
     // Only the routes that drive the page wait for the browser: `status`, the
     // login form and the 401/404 paths answer instantly whatever Chromium is
     // doing, which is what makes `cu start` return at once.
@@ -808,6 +847,7 @@ pub fn route(
             | ("GET", "/v1/marks")
             | ("POST", "/v1/marks")
             | ("DELETE", "/v1/marks")
+            | ("POST", "/v1/vault/sessions/save")
     ) || (method == "DELETE"
         && (path.starts_with("/v1/contexts/") || path.starts_with("/v1/tabs/")));
     if needs_browser && let Err(error) = wait_until_ready(state) {
@@ -908,6 +948,53 @@ pub fn route(
                 format!("{{\"error\":{}}}", json_string(&e)),
             ),
         },
+        // A fresh tab for this invocation to work in (`cu daemon` mode: the
+        // CLI opens one per command so two agents never share a page).
+        ("POST", "/v1/tabs") => {
+            let url = {
+                let asked = json_value(body, "url").unwrap_or_default();
+                if asked.is_empty() {
+                    "about:blank".to_string()
+                } else {
+                    asked
+                }
+            };
+            let owner = json_value(body, "owner_pid").and_then(|p| p.parse::<u32>().ok());
+            match browser_command(
+                state.cdp_port,
+                "Target.createTarget",
+                &format!("{{\"url\":{},\"background\":true}}", json_string(&url)),
+            ) {
+                Ok(reply) => {
+                    let id = json_string_value(&reply, "targetId").unwrap_or_default();
+                    if !id.is_empty() {
+                        if let Some(pid) = owner {
+                            register_tab_lease(&id, pid);
+                        }
+                        (
+                            "200 OK",
+                            "application/json",
+                            format!(
+                                "{{\"id\":{},\"tab\":{}}}",
+                                json_string(&id),
+                                json_string(&id)
+                            ),
+                        )
+                    } else {
+                        (
+                            "502 Bad Gateway",
+                            "application/json",
+                            format!("{{\"error\":{}}}", json_string(&reply)),
+                        )
+                    }
+                }
+                Err(e) => (
+                    "502 Bad Gateway",
+                    "application/json",
+                    format!("{{\"error\":{}}}", json_string(&e)),
+                ),
+            }
+        }
         ("DELETE", p) if p.starts_with("/v1/tabs/") => {
             match close_tab(state.cdp_port, &p["/v1/tabs/".len()..]) {
                 Ok(()) => ("200 OK", "application/json", "{\"closed\":true}".into()),
@@ -980,7 +1067,13 @@ pub fn route(
                     "{\"error\":\"url is required\"}".into(),
                 );
             }
-            navigate_scheduled(&tab, &url)
+            // Vault injection is on unless the caller asked for a clean page
+            // (`--inject off`: the body carries `"inject":false`, which the
+            // string-only JSON reader cannot see).
+            let inject = !body.contains("\"inject\":false")
+                && !body.contains("\"inject\": \"off\"")
+                && !body.contains("\"inject\":\"off\"");
+            navigate_with_vault(state, &tab, &url, inject)
         }
         ("GET", "/v1/screenshot") => screenshot(&tab, query(full_path)),
         // Visual QA references (see `crate::visual`): what an element is,
@@ -1132,6 +1225,9 @@ pub fn route(
                 format!("{{\"{verb}\":true,\"storage\":\"{storage}\"}}"),
             )
         }
+        // Bearer-authorized vault access (the local CLI, an agent). The
+        // full path: the vault API reads its own query (`?tab=`, `?query=`).
+        (_, p) if p.starts_with("/v1/vault") => vault_api(method, full_path, body, state),
         _ => (
             "404 Not Found",
             "application/json",
@@ -3797,8 +3893,464 @@ pub fn decode_base64(s: &str) -> Result<Vec<u8>, String> {
     }
     Ok(out)
 }
+/// The vault UI routes, for a request that arrived without the bearer token
+/// (a browser). Page routes answer whatever the cookie says (the pages
+/// themselves decide by fetching data); data routes 401 without a live UI
+/// session. `cookie` is the request's `Cookie:` header value if it had one.
+fn vault_route(
+    method: &str,
+    path: &str,
+    body: &str,
+    state: &AppState,
+    cookie: Option<&str>,
+) -> (&'static str, &'static str, String, Option<String>) {
+    match (method, path) {
+        ("GET", "/vault") => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            LOGIN_PAGE.into(),
+            None,
+        ),
+        ("GET", "/vault/app") => ("200 OK", "text/html; charset=utf-8", APP_PAGE.into(), None),
+        ("POST", "/v1/vault/ui/login") => {
+            if !crate::vault::login_allowed() {
+                return (
+                    "429 Too Many Requests",
+                    "application/json",
+                    "{\"error\":\"too many attempts; wait five minutes\"}".into(),
+                    None,
+                );
+            }
+            let password = json_value(body, "password").unwrap_or_default();
+            if password.is_empty() {
+                return (
+                    "400 Bad Request",
+                    "application/json",
+                    "{\"error\":\"password is required\"}".into(),
+                    None,
+                );
+            }
+            let vault = match crate::vault::Vault::open(&state.data_dir) {
+                Ok(v) => v,
+                Err(e) => {
+                    return (
+                        "500 Internal Server Error",
+                        "application/json",
+                        format!("{{\"error\":{}}}", json_string(&e)),
+                        None,
+                    );
+                }
+            };
+            // First run: the first password a person types becomes it.
+            let outcome = if vault.has_password() {
+                vault.verify_password(&password)
+            } else {
+                vault.set_password(None, &password).is_ok()
+            };
+            if !outcome {
+                return (
+                    "401 Unauthorized",
+                    "application/json",
+                    "{\"error\":\"wrong master password\"}".into(),
+                    None,
+                );
+            }
+            let token = crate::vault::ui_session_create();
+            (
+                "200 OK",
+                "application/json",
+                "{\"ok\":true}".into(),
+                Some(format!(
+                    "cu_vault_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200"
+                )),
+            )
+        }
+        ("POST", "/v1/vault/ui/logout") => {
+            crate::vault::ui_session_drop(cookie.and_then(crate::vault::cookie_token).as_deref());
+            (
+                "200 OK",
+                "application/json",
+                "{\"ok\":true}".into(),
+                Some("cu_vault_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0".into()),
+            )
+        }
+        _ => {
+            let live = crate::vault::ui_session_valid(
+                cookie.and_then(crate::vault::cookie_token).as_deref(),
+            );
+            if !live {
+                return (
+                    "401 Unauthorized",
+                    "application/json",
+                    "{\"error\":\"vault: log in first\"}".into(),
+                    None,
+                );
+            }
+            let (status, kind, response) = vault_api(method, path, body, state);
+            (status, kind, response, None)
+        }
+    }
+}
+
+const LOGIN_PAGE: &str = include_str!("vault_login.html");
+const APP_PAGE: &str = include_str!("vault_app.html");
+
+/// The vault data API. Reached either with the bearer token (the local CLI,
+/// an agent) or with a live UI session cookie (the vault UI through nginx).
+fn vault_api(
+    method: &str,
+    path: &str,
+    body: &str,
+    state: &AppState,
+) -> (&'static str, &'static str, String) {
+    let vault = match crate::vault::Vault::open(&state.data_dir) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                "500 Internal Server Error",
+                "application/json",
+                format!("{{\"error\":{}}}", json_string(&e)),
+            );
+        }
+    };
+    let path_only = path.split('?').next().unwrap_or(path);
+    match (method, path_only) {
+        ("GET", "/v1/vault/ui/state") => (
+            "200 OK",
+            "application/json",
+            format!("{{\"has_password\":{}}}", vault.has_password()),
+        ),
+        ("GET", "/v1/vault/status") => {
+            let sessions = vault.list_sessions().unwrap_or_default();
+            let credentials = vault.list_credentials("").unwrap_or_default();
+            (
+                "200 OK",
+                "application/json",
+                format!(
+                    "{{\"open\":true,\"sessions\":{},\"credentials\":{}}}",
+                    sessions.matches("\"domain\"").count(),
+                    credentials.matches("\"id\"").count()
+                ),
+            )
+        }
+        ("GET", "/v1/vault/sessions") => match vault.list_sessions() {
+            Ok(body) => ("200 OK", "application/json", body),
+            Err(e) => error_json(&e),
+        },
+        ("POST", "/v1/vault/sessions/save") => {
+            // The session of one tab: `?tab=ID` says which; without it the
+            // tab the default resolves to.
+            let id = form_value(query(path), "tab");
+            let tab = if id.is_empty() {
+                Tab::default_for(state.cdp_port)
+            } else {
+                Tab {
+                    cdp_port: state.cdp_port,
+                    target: Some(id.clone()),
+                }
+            };
+            let discovery = match tabs_json(state.cdp_port) {
+                Ok(d) => d,
+                Err(e) => return error_json(&e),
+            };
+            // `tabs_json` wraps the array in {"tabs":[...]}; the object reader
+            // wants the bare array.
+            let listed = json_array(&discovery, "tabs").unwrap_or_default();
+            let url = json_objects(&listed)
+                .into_iter()
+                .find(|o| json_string_value(o, "id").as_deref() == Some(id.as_str()))
+                .and_then(|o| json_string_value(&o, "url"))
+                .unwrap_or_default();
+            let domain = {
+                let asked = form_value(query(path), "domain");
+                if asked.is_empty() {
+                    url_host(&url)
+                } else {
+                    asked
+                }
+            };
+            if domain.is_empty() {
+                return error_json("cannot tell which domain this tab is on");
+            }
+            let cookies = match cdp_browser_command(state.cdp_port, "Storage.getCookies", "{}") {
+                Ok(reply) => json_array(&reply, "cookies").unwrap_or_else(|| "[]".into()),
+                Err(e) => return error_json(&e),
+            };
+            let cookie_list = json_objects(&cookies);
+            let cookies = filter_cookies(&cookie_list, &domain);
+            let storage = tab
+                .command(
+                    "Runtime.evaluate",
+                    "{\"expression\":\"JSON.stringify(localStorage)\",\"returnByValue\":true}",
+                )
+                .ok()
+                .and_then(|reply| evaluated_string(&reply))
+                .unwrap_or_else(|| "{}".into());
+            match vault.save_session(&domain, &cookies, &storage, None) {
+                Ok(()) => (
+                    "200 OK",
+                    "application/json",
+                    format!(
+                        "{{\"saved\":true,\"domain\":{},\"cookies\":{},\"local_storage\":{}}}",
+                        json_string(&domain),
+                        cookies.matches("\"name\"").count(),
+                        storage.matches(':').count()
+                    ),
+                ),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("DELETE", p) if p.starts_with("/v1/vault/sessions/") => {
+            let domain = url_decode(&p["/v1/vault/sessions/".len()..]);
+            match vault.forget_session(&domain) {
+                Ok(true) => ("200 OK", "application/json", "{\"forgotten\":true}".into()),
+                Ok(false) => error_json("no such session"),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("GET", "/v1/vault/credentials") => {
+            let q = form_value(query(path), "query");
+            match vault.list_credentials(&q) {
+                Ok(body) => ("200 OK", "application/json", body),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("POST", "/v1/vault/credentials") => {
+            let field = |k: &str| json_value(body, k).unwrap_or_default();
+            let (domain, label) = (field("domain"), field("label"));
+            let fields = json_array(body, "fields").unwrap_or_else(|| "[]".into());
+            if domain.is_empty() || label.is_empty() {
+                return error_json("domain and label are required");
+            }
+            let id = json_value(body, "id").and_then(|v| v.parse::<i64>().ok());
+            match vault.put_credential(id, &domain, &label, fields.trim(), &field("notes")) {
+                Ok(id) => (
+                    "200 OK",
+                    "application/json",
+                    format!("{{\"id\":{id},\"saved\":true}}"),
+                ),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("GET", p) if p.starts_with("/v1/vault/credentials/") => {
+            let Ok(id) = p["/v1/vault/credentials/".len()..].parse::<i64>() else {
+                return error_json("credential id must be a number");
+            };
+            match vault.get_credential(id) {
+                Ok(Some(body)) => ("200 OK", "application/json", body),
+                Ok(None) => error_json("no such credential"),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("DELETE", p) if p.starts_with("/v1/vault/credentials/") => {
+            let Ok(id) = p["/v1/vault/credentials/".len()..].parse::<i64>() else {
+                return error_json("credential id must be a number");
+            };
+            match vault.delete_credential(id) {
+                Ok(true) => ("200 OK", "application/json", "{\"deleted\":true}".into()),
+                Ok(false) => error_json("no such credential"),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("POST", "/v1/vault/passwd") => {
+            let old = json_value(body, "old").unwrap_or_default();
+            let new = json_value(body, "new").unwrap_or_default();
+            match vault.set_password((!old.is_empty()).then_some(old.as_str()), &new) {
+                Ok(()) => ("200 OK", "application/json", "{\"ok\":true}".into()),
+                Err(e) => error_json(&e),
+            }
+        }
+        _ => (
+            "404 Not Found",
+            "application/json",
+            "{\"error\":\"not found\"}".into(),
+        ),
+    }
+}
+
+fn error_json(error: &str) -> (&'static str, &'static str, String) {
+    (
+        "400 Bad Request",
+        "application/json",
+        format!("{{\"error\":{}}}", json_string(error)),
+    )
+}
+
+/// The cookies of a DevTools `Storage.getCookies` array that belong to
+/// `domain` (its own or a parent's), as a JSON array string.
+fn filter_cookies(cookies: &[String], domain: &str) -> String {
+    let kept: Vec<&str> = cookies
+        .iter()
+        .map(String::as_str)
+        .filter(|cookie| {
+            json_string_value(cookie, "domain")
+                .map(|d| domain_matches_cookie(domain, &d))
+                .unwrap_or(false)
+        })
+        .collect();
+    format!("[{}]", kept.join(","))
+}
+
+/// `.example.com` / `example.com` cover `app.example.com` and itself.
+fn domain_matches_cookie(host: &str, cookie_domain: &str) -> bool {
+    let d = cookie_domain.trim_start_matches('.');
+    let h = host.trim_start_matches("www.");
+    h == d || h.ends_with(&format!(".{d}"))
+}
+
+/// The host of a URL, lower-cased, without port, path or credentials.
+pub fn url_host(url: &str) -> String {
+    let rest = url.split("://").nth(1).unwrap_or("");
+    let rest = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    host.rsplit_once(':')
+        .map_or(host, |(h, _)| h)
+        .to_ascii_lowercase()
+}
+
+/// Tabs the CLI created for an invocation, with the pid that owns them.
+///
+/// A tab is never closed out from under a live owner: collection needs both
+/// a dead pid and a long idle time. This is what keeps two agents working in
+/// the same daemon from touching each other's pages.
+pub struct TabLease {
+    pub owner_pid: u32,
+    pub used: Instant,
+}
+
+/// Idle age after which an orphaned (owner-dead) tab is collected.
+const TAB_GC_IDLE: Duration = Duration::from_secs(10 * 60);
+
+fn tab_leases() -> &'static Mutex<HashMap<String, TabLease>> {
+    static LEASES: OnceLock<Mutex<HashMap<String, TabLease>>> = OnceLock::new();
+    LEASES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_tab_lease(id: &str, owner_pid: u32) {
+    tab_leases()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            id.to_string(),
+            TabLease {
+                owner_pid,
+                used: Instant::now(),
+            },
+        );
+}
+
+fn touch_tab_lease(id: &str) {
+    if let Some(lease) = tab_leases()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(id)
+    {
+        lease.used = Instant::now();
+    }
+}
+
+fn pid_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// The daemon's background collector: every minute, close tabs whose owning
+/// CLI process is gone and that have been idle past [`TAB_GC_IDLE`]. Tabs of
+/// live owners and tabs someone is still using are never touched; a tab the
+/// browser already closed just leaves the registry.
+pub fn spawn_tab_gc(cdp_port: u16) {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(60));
+            let leases = tab_leases().lock().unwrap_or_else(|e| e.into_inner());
+            let stale: Vec<String> = leases
+                .iter()
+                .filter(|(_, lease)| {
+                    !pid_alive(lease.owner_pid) && lease.used.elapsed() > TAB_GC_IDLE
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            drop(leases);
+            for id in stale {
+                match close_tab(cdp_port, &id) {
+                    Ok(()) => eprintln!("cu: collected orphaned tab {id}"),
+                    Err(e) if e.contains("no such tab") => {}
+                    Err(e) => {
+                        eprintln!("cu: could not collect tab {id}: {e}");
+                        continue;
+                    }
+                }
+                tab_leases()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id);
+            }
+        }
+    });
+}
+
+/// `POST /v1/navigate` with the vault considered: a saved session for the
+/// domain is injected before the page loads (cookies) and settled after it
+/// (localStorage, then one reload), unless the caller asked for a clean
+/// page. The reply gains a `"vault"` note saying what was found — so an
+/// agent navigating to a login it has credentials for hears about them
+/// without the vault leaking anything into the page itself.
+fn navigate_with_vault(
+    state: &AppState,
+    tab: &Tab,
+    url: &str,
+    inject: bool,
+) -> (&'static str, &'static str, String) {
+    let host = url_host(url);
+    let vault = crate::vault::Vault::open(&state.data_dir).ok();
+    let (mut injected, mut session_hint, mut credentials) = (false, "none", 0usize);
+    let mut local_storage = String::new();
+    if let Some(vault) = vault.as_ref()
+        && !host.is_empty()
+    {
+        let session = vault.get_session(&host).ok().flatten();
+        credentials = vault.count_credentials(&host);
+        if let Some(session) = session {
+            session_hint = "saved";
+            local_storage = session.local_storage.clone();
+            if inject && !session.cookies.trim().is_empty() && session.cookies != "[]" {
+                let set = cdp_browser_command(
+                    state.cdp_port,
+                    "Storage.setCookies",
+                    &format!("{{\"cookies\":{}}}", session.cookies),
+                );
+                injected = set.is_ok();
+            }
+        }
+    }
+    let (status, kind, mut body) = navigate_scheduled(tab, url);
+    if injected && !local_storage.is_empty() && local_storage != "{}" {
+        // localStorage is origin-bound JavaScript state: write it on the
+        // loaded page, then reload once so the site boots with it.
+        let script = format!(
+            "{{\"expression\":\"(() => {{ const o = JSON.parse(atob('{b64}')); for (const [k, v] of Object.entries(o)) localStorage.setItem(k, v); return 'ok' }})()\",\"returnByValue\":true}}",
+            b64 = crate::vault::base64_encode(local_storage.as_bytes())
+        );
+        if tab.command("Runtime.evaluate", &script).is_ok() {
+            let _ = tab.command("Page.reload", "{}");
+            wait_for_page_on(tab, SETTLE_MAX);
+        }
+    }
+    if body.ends_with('}') {
+        let state_word = match (injected, session_hint) {
+            (_, "none") => "none",
+            (true, _) => "injected",
+            (false, _) => "saved-not-injected",
+        };
+        let note =
+            format!(",\"vault\":{{\"session\":\"{state_word}\",\"credentials\":{credentials}}}");
+        body.insert_str(body.len() - 1, &note);
+    }
+    (status, kind, body)
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -3873,6 +4425,8 @@ mod tests {
     #[test]
     fn a_login_page_rejects_empty_credentials() {
         let state = AppState {
+            vault_host: None,
+            daemon: false,
             data_dir: std::env::temp_dir().join("cu-login-test"),
             token: "t".into(),
             cdp_port: 1,
@@ -3887,6 +4441,8 @@ mod tests {
     #[test]
     fn a_session_cannot_be_read_out_of_the_login_response() {
         let state = AppState {
+            vault_host: None,
+            daemon: false,
             data_dir: std::env::temp_dir().join("cu-login-test"),
             token: "t".into(),
             cdp_port: 1,

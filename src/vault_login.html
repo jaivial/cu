@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cu vault</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font: 15px/1.5 system-ui, sans-serif; background: #0f1115; color: #e6e6e6;
+         display: grid; place-items: center; min-height: 100vh; margin: 0; }
+  .card { background: #171a21; border: 1px solid #2a2f3a; border-radius: 12px;
+          padding: 2rem; width: min(24rem, 92vw); }
+  h1 { font-size: 1.2rem; margin: 0 0 1rem; }
+  input { width: 100%; padding: 0.6rem 0.7rem; border-radius: 8px; border: 1px solid #2a2f3a;
+          background: #0f1115; color: inherit; margin-bottom: 0.9rem; font-size: 1rem; }
+  button { padding: 0.55rem 1rem; border-radius: 8px; border: 1px solid #3b82f6;
+           background: #3b82f6; color: white; font-size: 1rem; cursor: pointer; width: 100%; }
+  button:hover { filter: brightness(1.1); }
+  .error { color: #f87171; min-height: 1.4rem; margin: 0 0 0.6rem; font-size: 0.9rem; }
+  .hint { color: #8b93a7; font-size: 0.85rem; margin-top: 1rem; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1 id="title">cu vault</h1>
+  <p class="error" id="error"></p>
+  <form id="form">
+    <input type="password" id="password" placeholder="Master password" autocomplete="current-password" autofocus>
+    <input type="password" id="confirm" placeholder="Repeat it" style="display:none" autocomplete="new-password">
+    <button type="submit" id="submit">Unlock</button>
+  </form>
+  <p class="hint" id="hint"></p>
+</div>
+<script>
+const error = document.getElementById('error');
+fetch('/v1/vault/ui/state').then(r => r.json()).then(s => {
+  if (!s.has_password) {
+    document.getElementById('title').textContent = 'cu vault — first run';
+    document.getElementById('confirm').style.display = 'block';
+    document.getElementById('hint').textContent =
+      'No master password yet: the first one you type here becomes it.';
+  }
+});
+document.getElementById('form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const password = document.getElementById('password').value;
+  const confirm = document.getElementById('confirm');
+  if (confirm.style.display !== 'none' && password !== confirm.value) {
+    error.textContent = 'The two passwords do not match.';
+    return;
+  }
+  const reply = await fetch('/v1/vault/ui/login', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({password})
+  });
+  if (reply.ok) { location.href = '/vault/app'; return; }
+  if (reply.status === 429) { error.textContent = 'Too many attempts — wait five minutes.'; return; }
+  const body = await reply.json().catch(() => ({}));
+  error.textContent = body.error || 'Login failed.';
+});
+</script>
+</body>
+</html>
