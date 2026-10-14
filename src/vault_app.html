@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cu vault — credentials</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { font: 15px/1.5 system-ui, sans-serif; background: #0f1115; color: #e6e6e6; margin: 0; }
+  header { display: flex; gap: 1rem; align-items: center; padding: 0.8rem 1.2rem;
+           background: #171a21; border-bottom: 1px solid #2a2f3a; position: sticky; top: 0; }
+  header h1 { font-size: 1.05rem; margin: 0; flex: 0 0 auto; }
+  #search { flex: 1; max-width: 26rem; padding: 0.45rem 0.7rem; border-radius: 8px;
+            border: 1px solid #2a2f3a; background: #0f1115; color: inherit; }
+  main { max-width: 60rem; margin: 1.2rem auto; padding: 0 1rem; }
+  button { padding: 0.4rem 0.8rem; border-radius: 8px; border: 1px solid #2a2f3a;
+           background: #232936; color: inherit; cursor: pointer; font-size: 0.9rem; }
+  button.primary { background: #3b82f6; border-color: #3b82f6; color: white; }
+  button.danger { border-color: #7f1d1d; color: #f87171; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid #232936; }
+  th { color: #8b93a7; font-weight: 500; font-size: 0.85rem; }
+  td.actions { white-space: nowrap; text-align: right; }
+  dialog { background: #171a21; color: inherit; border: 1px solid #2a2f3a;
+           border-radius: 12px; width: min(34rem, 94vw); padding: 1.4rem; }
+  dialog::backdrop { background: rgba(0,0,0,0.6); }
+  label { display: block; font-size: 0.85rem; color: #8b93a7; margin: 0.7rem 0 0.2rem; }
+  input, textarea, select { width: 100%; padding: 0.45rem 0.6rem; border-radius: 8px;
+           border: 1px solid #2a2f3a; background: #0f1115; color: inherit; font-size: 0.95rem; }
+  textarea { font-family: ui-monospace, monospace; min-height: 4rem; }
+  .field-row { display: grid; grid-template-columns: 1fr 1.4fr 7rem auto auto; gap: 0.4rem;
+               align-items: center; margin-bottom: 0.4rem; }
+  .field-row .mini { width: auto; padding: 0.35rem 0.5rem; }
+  .row { display: flex; gap: 0.6rem; }
+  .row > * { flex: 1; }
+  .secret-value { font-family: ui-monospace, monospace; }
+  .toast { position: fixed; bottom: 1rem; right: 1rem; background: #166534; color: #dcfce7;
+           padding: 0.5rem 0.9rem; border-radius: 8px; display: none; }
+  .muted { color: #8b93a7; }
+</style>
+</head>
+<body>
+<header>
+  <h1>cu vault</h1>
+  <input id="search" placeholder="Search domain, label, notes…">
+  <button class="primary" id="new">New credential</button>
+  <button id="sessions">Sessions</button>
+  <button id="logout">Log out</button>
+</header>
+<main>
+  <table>
+    <thead><tr><th>Domain</th><th>Label</th><th>Fields</th><th>Notes</th><th></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <p class="muted" id="empty" hidden>No credentials yet.</p>
+</main>
+
+<dialog id="editor">
+  <h2 id="editor-title" style="margin-top:0">New credential</h2>
+  <div class="row">
+    <div><label>Domain</label><input id="f-domain" placeholder="example.com"></div>
+    <div><label>Label</label><input id="f-label" placeholder="main login"></div>
+  </div>
+  <label>Fields (one JSON array of {name, value, secret, type} — the UI form is generated from it)</label>
+  <textarea id="f-fields" placeholder='[{"name":"user","value":"you","secret":false,"type":"text"},{"name":"pass","value":"…","secret":true,"type":"password"}]'></textarea>
+  <label>Notes</label>
+  <textarea id="f-notes" style="min-height:2.5rem"></textarea>
+  <p class="error" id="editor-error" style="color:#f87171"></p>
+  <div class="row" style="margin-top:0.8rem">
+    <button id="cancel">Cancel</button>
+    <button class="primary" id="save">Save</button>
+  </div>
+</dialog>
+
+<dialog id="reveal">
+  <h2 id="reveal-title" style="margin-top:0"></h2>
+  <div id="reveal-fields"></div>
+  <p class="muted">Copied values clear from the clipboard after 30 s (best effort).</p>
+  <div class="row" style="margin-top:0.8rem">
+    <button id="reveal-close">Close</button>
+  </div>
+</dialog>
+
+<dialog id="sessions-dialog">
+  <h2 style="margin-top:0">Saved sessions</h2>
+  <table><thead><tr><th>Domain</th><th>Updated</th><th></th></tr></thead><tbody id="session-rows"></tbody></table>
+  <div class="row" style="margin-top:0.8rem"><button id="sessions-close">Close</button></div>
+</dialog>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let creds = [];
+const $ = (id) => document.getElementById(id);
+
+function toast(text) {
+  const el = $('toast');
+  el.textContent = text; el.style.display = 'block';
+  setTimeout(() => el.style.display = 'none', 2500);
+}
+
+async function load() {
+  const reply = await fetch('/v1/vault/credentials');
+  if (reply.status === 401) { location.href = '/vault'; return; }
+  creds = (await reply.json()).credentials;
+  render();
+}
+
+function render() {
+  const needle = $('search').value.toLowerCase();
+  const rows = creds.filter(c =>
+    !needle || [c.domain, c.label, c.notes].some(v => (v || '').toLowerCase().includes(needle)));
+  $('empty').hidden = rows.length > 0;
+  $('rows').innerHTML = rows.map(c => `
+    <tr>
+      <td>${esc(c.domain)}</td>
+      <td>${esc(c.label)}</td>
+      <td class="muted">${esc(c.fields || '')}</td>
+      <td class="muted">${esc((c.notes || '').slice(0, 60))}</td>
+      <td class="actions">
+        <button onclick="reveal(${c.id})">Reveal</button>
+        <button onclick="edit(${c.id})">Edit</button>
+        <button class="danger" onclick="remove(${c.id})">Delete</button>
+      </td>
+    </tr>`).join('');
+}
+
+function esc(value) {
+  const d = document.createElement('div');
+  d.textContent = value == null ? '' : String(value);
+  return d.innerHTML;
+}
+
+let editing = null;
+function edit(id) {
+  const c = creds.find(c => c.id === id);
+  editing = id || null;
+  $('editor-title').textContent = id ? `Edit ${c.domain} / ${c.label}` : 'New credential';
+  $('f-domain').value = c ? c.domain : '';
+  $('f-label').value = c ? c.label : '';
+  $('f-notes').value = c ? (c.notes || '') : '';
+  $('editor-error').textContent = '';
+  if (id) {
+    fetch(`/v1/vault/credentials/${id}`).then(r => r.json())
+      .then(full => $('f-fields').value = JSON.stringify(full.fields, null, 1));
+  } else {
+    $('f-fields').value = '';
+  }
+  $('editor').showModal();
+}
+
+$('new').onclick = () => edit(null);
+$('cancel').onclick = () => $('editor').close();
+$('search').oninput = render;
+
+$('save').onclick = async () => {
+  let fields;
+  try { fields = JSON.parse($('f-fields').value || '[]'); }
+  catch (e) { $('editor-error').textContent = `Fields is not valid JSON: ${e}`; return; }
+  if (!Array.isArray(fields)) { $('editor-error').textContent = 'Fields must be a JSON array.'; return; }
+  const reply = await fetch('/v1/vault/credentials', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ id: editing, domain: $('f-domain').value.trim(), label: $('f-label').value.trim(),
+                           fields, notes: $('f-notes').value })
+  });
+  if (!reply.ok) { $('editor-error').textContent = (await reply.json()).error; return; }
+  $('editor').close(); toast('Saved'); load();
+};
+
+async function remove(id) {
+  const c = creds.find(c => c.id === id);
+  if (!confirm(`Delete ${c.domain} / ${c.label}?`)) return;
+  await fetch(`/v1/vault/credentials/${id}`, { method: 'DELETE' });
+  toast('Deleted'); load();
+}
+
+async function reveal(id) {
+  const full = await (await fetch(`/v1/vault/credentials/${id}`)).json();
+  $('reveal-title').textContent = `${full.domain} / ${full.label}`;
+  $('reveal-fields').innerHTML = full.fields.map((f, i) => `
+    <div class="field-row">
+      <span class="muted">${esc(f.name)}</span>
+      <span class="${f.secret ? 'secret-value' : ''}" id="rv-${i}">${f.secret ? '••••••••' : esc(f.value)}</span>
+      <span class="muted">${esc(f.type || 'text')}</span>
+      <button class="mini" onclick="copyValue(${i})">Copy</button>
+      <button class="mini" onclick="toggleValue(${i}, ${f.secret ? 1 : 0})">Show</button>
+    </div>`).join('');
+  window._revealValues = full.fields;
+  $('reveal').showModal();
+}
+
+async function copyValue(i) {
+  const f = window._revealValues[i];
+  await navigator.clipboard.writeText(f.value);
+  toast(`Copied ${f.name} — clears in 30 s`);
+  setTimeout(async () => {
+    try {
+      const read = await navigator.clipboard.readText().catch(() => null);
+      if (read === null || read === f.value) await navigator.clipboard.writeText('');
+    } catch (e) { /* clipboard unreadable: nothing to clear safely */ }
+  }, 30000);
+}
+
+function toggleValue(i, secret) {
+  const el = $('rv-' + i);
+  el.textContent = el.textContent.startsWith('•') || secret && el.textContent === '••••••••'
+    ? window._revealValues[i].value : '••••••••';
+}
+
+async function loadSessions() {
+  const body = await (await fetch('/v1/vault/sessions')).json();
+  $('session-rows').innerHTML = body.sessions.map(s => `
+    <tr><td>${esc(s.domain)}</td><td class="muted">${new Date(s.updated_at * 1000).toLocaleString()}</td>
+    <td class="actions"><button class="danger" onclick="forget('${esc(s.domain)}')">Forget</button></td></tr>`).join('')
+    || '<tr><td colspan="3" class="muted">No saved sessions.</td></tr>';
+  $('sessions-dialog').showModal();
+}
+async function forget(domain) {
+  await fetch(`/v1/vault/sessions/${encodeURIComponent(domain)}`, { method: 'DELETE' });
+  loadSessions();
+}
+$('sessions').onclick = loadSessions;
+$('sessions-close').onclick = () => $('sessions-dialog').close();
+$('reveal-close').onclick = () => $('reveal').close();
+$('logout').onclick = async () => { await fetch('/v1/vault/ui/logout', { method: 'POST' }); location.href = '/vault'; };
+
+load();
+</script>
+</body>
+</html>

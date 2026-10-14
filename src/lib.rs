@@ -11,6 +11,7 @@ pub mod server;
 pub mod session;
 pub mod stealth;
 pub mod targets;
+pub mod vault;
 pub mod visual;
 use std::io::{Read, Write};
 use std::net::TcpStream;

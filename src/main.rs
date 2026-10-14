@@ -4,13 +4,18 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use cu::policy::{BrowserMode, BrowserPolicy};
 use cu::server::{self, AppState};
 
 const DEFAULT_PORT: u16 = 8787;
 const DEFAULT_CDP_PORT: u16 = 9222;
+const DAEMON_PORT: u16 = 8810;
+const DAEMON_CDP_BASE: u16 = 9362;
 
 fn main() {
     let mut args: Vec<String> = env::args().skip(1).collect();
@@ -32,7 +37,7 @@ fn main() {
     }
     // Append `tab=` to a page command's path, keeping any query it has.
     let on_tab = |path: &str| match &tab {
-        None => path.to_string(),
+        None => invocation_tab(path),
         Some(id) if path.contains('?') => format!("{path}&tab={id}"),
         Some(id) => format!("{path}?tab={id}"),
     };
@@ -49,15 +54,31 @@ fn main() {
         },
         Some("diagnostics") => request("GET", "/v1/diagnostics", None).map(|s| println!("{s}")),
         Some("targets") => request("GET", "/v1/targets", None).map(|s| println!("{s}")),
-        Some("navigate") => match args.get(1) {
-            Some(url) => request(
-                "POST",
-                &on_tab("/v1/navigate"),
-                Some(&format!("{{\"url\":\"{}\"}}", server::json_escape(url))),
-            )
-            .map(|s| println!("{s}")),
-            None => Err("usage: cu navigate <url> [--tab ID]".into()),
-        },
+        Some("navigate") => {
+            let inject = match args.iter().position(|a| a == "--inject") {
+                Some(i) => match args.get(i + 1) {
+                    Some(v) => v.eq_ignore_ascii_case("on"),
+                    None => {
+                        eprintln!("cu: --inject needs on or off; defaulting to on");
+                        true
+                    }
+                },
+                None => true,
+            };
+            match args.get(1) {
+                Some(url) => request(
+                    "POST",
+                    &on_tab("/v1/navigate"),
+                    Some(&format!(
+                        "{{\"url\":\"{}\",\"inject\":{}}}",
+                        server::json_escape(url),
+                        inject
+                    )),
+                )
+                .map(|s| println!("{s}")),
+                None => Err("usage: cu navigate <url> [--inject on|off] [--tab ID]".into()),
+            }
+        }
         Some("shot" | "screenshot") => shot_query(&args[1..]).and_then(|(query, file)| {
             request("GET", &on_tab(&format!("/v1/screenshot?{query}")), None)
                 .and_then(|s| write_screenshot(&s, file.as_deref()))
@@ -180,6 +201,10 @@ fn main() {
             Ok(())
         }
         Some("session") => session(&args[1..]),
+        Some("daemon") => daemon(&args[1..]),
+        // The global `--tab` lifter has already taken a `--tab ID` out of
+        // the arguments; the vault session save wants it.
+        Some("vault") => vault(&args[1..], tab.clone()),
         _ => {
             print_help();
             Ok(())
@@ -192,7 +217,7 @@ fn main() {
 }
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n\nPage commands take --tab ID to run in another tab (see `cu tabs`)."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n\nPage commands take --tab ID to run in another tab (see `cu tabs`). to run in another tab (see `cu tabs`)."
     );
 }
 
@@ -287,6 +312,10 @@ fn start(args: &[String]) -> Result<(), String> {
         cdp_port,
         browser,
         public_host: public.map(|(_, host)| host),
+        vault_host: env::var("CU_VAULT_HOST")
+            .ok()
+            .filter(|h| !h.trim().is_empty()),
+        daemon: false,
     });
     server::serve(state, listener);
     Ok(())
@@ -307,25 +336,179 @@ fn login_url() -> String {
         .unwrap_or(DEFAULT_PORT);
     format!("http://127.0.0.1:{port}/login")
 }
+/// One CLI request. Resolution order: a server started with `CU_DATA_DIR`
+/// (the legacy per-instance mode other agents' services use), the canonical
+/// daemon (`~/.cu/daemon`), a legacy `./.cu` in this directory — and if
+/// nothing answers, the daemon is started transparently and the request is
+/// retried, so a plain `cu ...` works on a fresh boot without anyone having
+/// run `cu daemon` by hand.
 fn request(method: &str, path: &str, body: Option<&str>) -> Result<String, String> {
-    let data = env::var_os("CU_DATA_DIR").unwrap_or_else(|| ".cu".into());
-    let config = fs::read_to_string(PathBuf::from(data).join("server.json"))
-        .map_err(|_| "server not running (start it with `cu start`)")?;
-    let port = server::json_value(&config, "port").ok_or("invalid server state")?;
-    let token = server::json_value(&config, "token").ok_or("invalid server state")?;
+    if let Some(data) = env::var_os("CU_DATA_DIR") {
+        let config = fs::read_to_string(PathBuf::from(&data).join("server.json"))
+            .map_err(|_| "server not running (start it with `cu start`)")?;
+        return request_config(&config, method, path, body);
+    }
+    let daemon_config = daemon_dir().join("server.json");
+    let legacy_config = PathBuf::from(".cu").join("server.json");
+    for source in [&daemon_config, &legacy_config] {
+        if let Ok(config) = fs::read_to_string(source)
+            && let Some((port, _)) = endpoint(&config)
+            && TcpStream::connect(("127.0.0.1", port)).is_ok()
+        {
+            return request_config(&config, method, path, body);
+        }
+    }
+    ensure_daemon()?;
+    let config = fs::read_to_string(&daemon_config)
+        .map_err(|_| "the daemon did not come up (see ~/.cu/daemon/daemon.log)")?;
+    request_config(&config, method, path, body)
+}
+
+/// The `(port, token)` a `server.json` describes, if it parses.
+fn endpoint(config: &str) -> Option<(u16, String)> {
+    let port = server::json_value(config, "port")?.parse().ok()?;
+    let token = server::json_value(config, "token")?;
+    Some((port, token))
+}
+
+/// One request against a server described by its `server.json` contents.
+fn request_config(
+    config: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<String, String> {
+    let port = server::json_value(config, "port").ok_or("invalid server state")?;
+    let token = server::json_value(config, "token").ok_or("invalid server state")?;
     let mut stream = TcpStream::connect((
         "127.0.0.1",
         port.parse::<u16>().map_err(|_| "invalid port")?,
     ))
     .map_err(|e| e.to_string())?;
     let body = body.unwrap_or("");
-    write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).map_err(|e| e.to_string())?;
+    write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).map_err(|e| e.to_string())?;
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
         .map_err(|e| e.to_string())?;
-    Ok(response.split("\r\n\r\n").nth(1).unwrap_or("").into())
+    let ok = response.starts_with("HTTP/1.1 2");
+    let reply = response.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    if ok { Ok(reply) } else { Err(reply) }
 }
+
+/// The canonical daemon's data directory.
+fn daemon_dir() -> PathBuf {
+    if let Some(dir) = env::var_os("CU_DAEMON_DIR") {
+        return PathBuf::from(dir);
+    }
+    let home = env::var_os("HOME").unwrap_or_else(|| ".".into());
+    PathBuf::from(home).join(".cu").join("daemon")
+}
+
+/// The `(port, token)` of the canonical daemon, when one is configured and
+/// this is not a legacy `CU_DATA_DIR` invocation.
+fn daemon_config() -> Option<(u16, String)> {
+    if env::var_os("CU_DATA_DIR").is_some() {
+        return None;
+    }
+    let config = fs::read_to_string(daemon_dir().join("server.json")).ok()?;
+    if server::json_value(&config, "daemon").as_deref() != Some("true") {
+        return None;
+    }
+    let port = server::json_value(&config, "port")?.parse().ok()?;
+    let token = server::json_value(&config, "token")?;
+    Some((port, token))
+}
+
+/// A page command without `--tab`, talking to the daemon: open a fresh tab
+/// for this invocation and run there. Two agents invoking `cu` at the same
+/// moment then work on different pages by construction, and neither can
+/// touch the other's tab (nor a legacy instance's: `CU_DATA_DIR` callers
+/// keep the shared-default behaviour they were built on).
+fn invocation_tab(path: &str) -> String {
+    let Some((port, token)) = daemon_config() else {
+        return path.to_string();
+    };
+    let body = format!("{{\"owner_pid\":{}}}", std::process::id());
+    match request_daemon(port, &token, "POST", "/v1/tabs", Some(&body)) {
+        Ok(reply) => {
+            if let Some(id) = server::json_value(&reply, "id") {
+                eprintln!(
+                    "cu: working in a fresh tab ({id}); it is collected when this process exits"
+                );
+                return if path.contains('?') {
+                    format!("{path}&tab={id}")
+                } else {
+                    format!("{path}?tab={id}")
+                };
+            }
+            path.to_string()
+        }
+        Err(_) => path.to_string(),
+    }
+}
+
+fn request_daemon(
+    port: u16,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<String, String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+    let body = body.unwrap_or("");
+    write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).map_err(|e| e.to_string())?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| e.to_string())?;
+    let ok = response.starts_with("HTTP/1.1 2");
+    let reply = response.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    if ok { Ok(reply) } else { Err(reply) }
+}
+
+/// Spawn the daemon detached (own process group, output into its data
+/// directory) and wait for it to answer. `cu daemon` itself runs under
+/// systemd in normal operation; this is the fallback for a bare CLI call.
+fn ensure_daemon() -> Result<(), String> {
+    let dir = daemon_dir();
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("daemon.log"))
+        .map_err(|e| e.to_string())?;
+    let log_err = log.try_clone().map_err(|e| e.to_string())?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("daemon").stdout(log).stderr(log_err);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn()
+        .map_err(|e| format!("could not spawn the daemon: {e}"))?;
+    eprintln!("cu: the daemon was not running; starting it (~/.cu/daemon)...");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while Instant::now() < deadline {
+        if let Ok(config) = fs::read_to_string(dir.join("server.json"))
+            && server::json_value(&config, "port").is_some()
+            && TcpStream::connect((
+                "127.0.0.1",
+                server::json_value(&config, "port")
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .unwrap_or(0),
+            ))
+            .is_ok()
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    Err("the daemon did not answer within 90 s (see ~/.cu/daemon/daemon.log)".into())
+}
+
 /// `cu shot [FILE] [--png] [--quality N] [--width N] [--height N] [--scale F]
 /// [--ref REF | --selector CSS] [--padding N]` as a `/v1/screenshot` query and
 /// the file to write. A FILE ending in `.png` asks for PNG.
@@ -483,6 +666,218 @@ fn session(args: &[String]) -> Result<(), String> {
         path.push_str(&format!("?context={context}"));
     }
     request("POST", &path, Some("{}")).map(|s| println!("{s}"))
+}
+
+/// Canonical always-on daemon: one process, one persistent headless Chrome,
+/// one tab per CLI invocation. The port defaults to 8810 and walks upward
+/// while something else holds it; the DevTools port is picked free the same
+/// way, so two daemons (this one and any legacy instance) never collide.
+fn daemon(args: &[String]) -> Result<(), String> {
+    let mut port = DAEMON_PORT;
+    let mut cdp_port = None;
+    let mut data = daemon_dir();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--port" => {
+                i += 1;
+                port = args
+                    .get(i)
+                    .ok_or("--port needs a value")?
+                    .parse()
+                    .map_err(|_| "invalid port")?;
+            }
+            "--cdp-port" => {
+                i += 1;
+                cdp_port = Some(
+                    args.get(i)
+                        .ok_or("--cdp-port needs a value")?
+                        .parse()
+                        .map_err(|_| "invalid port")?,
+                );
+            }
+            "--data" => {
+                i += 1;
+                data = PathBuf::from(args.get(i).ok_or("--data needs a value")?);
+            }
+            flag => return Err(format!("unknown option {flag}")),
+        }
+        i += 1;
+    }
+    let mode = BrowserMode::from_env()?;
+    // Headless is the point of the daemon: no display is looked for, no
+    // window is opened, whatever the host has (`CU_HEADLESS` said it too).
+    let mut policy = BrowserPolicy::resolve(mode)?;
+    policy.headless = true;
+    policy.display = None;
+    cu::scheduler::configure(cu::scheduler::Budget::for_mode(mode));
+    fs::create_dir_all(data.join("profiles/default")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(data.join("sessions")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(data.join("downloads")).map_err(|e| e.to_string())?;
+    // The vault must open (key file writable, schema sound) before anything
+    // listens: a daemon that cannot keep its vault honest should not start.
+    cu::vault::Vault::open(&data).map_err(|e| format!("vault: {e}"))?;
+    let data = fs::canonicalize(&data).unwrap_or(data);
+    let port = free_port_from(port);
+    let cdp_port = match cdp_port {
+        Some(port) => port,
+        None => free_port_from(DAEMON_CDP_BASE),
+    };
+    cu::session::claim_owner(&data, port, cdp_port)?;
+    let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| e.to_string())?;
+    let token = server::random_token();
+    fs::write(
+        data.join("server.json"),
+        format!("{{\"port\":{port},\"token\":\"{token}\",\"daemon\":\"true\"}}\n"),
+    )
+    .map_err(|e| e.to_string())?;
+    server::exit_on_signal(cdp_port);
+    let browser = server::BrowserState::new();
+    server::spawn_browser_thread(data.clone(), cdp_port, Arc::clone(&browser), policy);
+    server::spawn_tab_gc(cdp_port);
+    let vault_host = env::var("CU_VAULT_HOST")
+        .ok()
+        .filter(|h| !h.trim().is_empty());
+    eprintln!(
+        "cu daemon on http://127.0.0.1:{port}; browser DevTools on 127.0.0.1:{cdp_port}; vault at {}{}",
+        data.join("vault.db").display(),
+        vault_host
+            .as_deref()
+            .map(|h| format!("; vault host {h}"))
+            .unwrap_or_default()
+    );
+    let state = Arc::new(server::AppState {
+        data_dir: data,
+        token,
+        cdp_port,
+        browser,
+        public_host: None,
+        vault_host,
+        daemon: true,
+    });
+    server::serve(state, listener);
+    Ok(())
+}
+
+/// The first free port at or after `from` (25 candidates, then give up with
+/// the original, whose bind will produce the honest error).
+fn free_port_from(from: u16) -> u16 {
+    for candidate in from..from.saturating_add(25) {
+        if TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+            return candidate;
+        }
+    }
+    from
+}
+
+/// `cu vault`: the credential and session store, from the CLI.
+fn vault(args: &[String], tab: Option<String>) -> Result<(), String> {
+    let usage = "usage: cu vault status | sessions | session save [--tab ID] [DOMAIN] | session forget DOMAIN | creds [QUERY] | cred get ID | cred rm ID | cred add DOMAIN LABEL (fields JSON on stdin) | passwd";
+    let action = args.first().ok_or(usage)?;
+    match action.as_str() {
+        "status" => request("GET", "/v1/vault/status", None).map(|s| println!("{s}")),
+        "sessions" => request("GET", "/v1/vault/sessions", None).map(|s| println!("{s}")),
+        "session" => match args.get(1).map(String::as_str) {
+            Some("save") => {
+                let mut domain = None;
+                for arg in args[2..].iter() {
+                    if arg.as_str() != "--tab" {
+                        domain = Some(arg.to_string());
+                    }
+                }
+                let mut path = "/v1/vault/sessions/save".to_string();
+                if let Some(tab) = tab {
+                    path.push_str(&format!("?tab={}", url_encode(&tab)));
+                }
+                if let Some(domain) = domain {
+                    path.push_str(&if path.contains('?') { "&" } else { "?" });
+                    path.push_str(&format!("domain={}", url_encode(&domain)));
+                }
+                request("POST", &path, Some("{}")).map(|s| println!("{s}"))
+            }
+            Some("forget") => {
+                let domain = args.get(2).ok_or("usage: cu vault session forget DOMAIN")?;
+                request(
+                    "DELETE",
+                    &format!("/v1/vault/sessions/{}", url_encode(domain)),
+                    Some("{}"),
+                )
+                .map(|s| println!("{s}"))
+            }
+            _ => Err(
+                "usage: cu vault session save [--tab ID] [DOMAIN] | session forget DOMAIN".into(),
+            ),
+        },
+        "creds" => {
+            let query = args
+                .get(1)
+                .map(|q| format!("?query={}", url_encode(q)))
+                .unwrap_or_default();
+            request("GET", &format!("/v1/vault/credentials{query}"), None).map(|s| println!("{s}"))
+        }
+        "cred" => match args.get(1).map(String::as_str) {
+            Some("get") => {
+                let id = args.get(2).ok_or("usage: cu vault cred get ID")?;
+                request("GET", &format!("/v1/vault/credentials/{id}"), None)
+                    .map(|s| println!("{s}"))
+            }
+            Some("rm") => {
+                let id = args.get(2).ok_or("usage: cu vault cred rm ID")?;
+                request("DELETE", &format!("/v1/vault/credentials/{id}"), Some("{}"))
+                    .map(|s| println!("{s}"))
+            }
+            Some("add") => {
+                let domain = args.get(2).ok_or("usage: cu vault cred add DOMAIN LABEL")?;
+                let label = args.get(3).ok_or("usage: cu vault cred add DOMAIN LABEL")?;
+                let mut fields = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut fields)
+                    .map_err(|e| e.to_string())?;
+                let fields = fields.trim();
+                if !fields.starts_with('[') {
+                    return Err("fields must be a JSON array on stdin".into());
+                }
+                request(
+                    "POST",
+                    "/v1/vault/credentials",
+                    Some(&format!(
+                        "{{\"domain\":{},\"label\":{},\"fields\":{fields}}}",
+                        server::json_string(domain),
+                        server::json_string(label)
+                    )),
+                )
+                .map(|s| println!("{s}"))
+            }
+            _ => Err("usage: cu vault cred get ID | rm ID | add DOMAIN LABEL".into()),
+        },
+        "passwd" => {
+            eprint!("new master password: ");
+            let mut new = String::new();
+            std::io::stdin()
+                .read_line(&mut new)
+                .map_err(|e| e.to_string())?;
+            let new = new.trim().to_string();
+            if new.len() < 8 {
+                return Err("the master password must be at least 8 characters".into());
+            }
+            eprint!("old master password (empty on first run): ");
+            let mut old = String::new();
+            std::io::stdin()
+                .read_line(&mut old)
+                .map_err(|e| e.to_string())?;
+            request(
+                "POST",
+                "/v1/vault/passwd",
+                Some(&format!(
+                    "{{\"old\":{},\"new\":{}}}",
+                    server::json_string(old.trim()),
+                    server::json_string(&new)
+                )),
+            )
+            .map(|s| println!("{s}"))
+        }
+        _ => Err(usage.into()),
+    }
 }
 
 #[cfg(test)]
