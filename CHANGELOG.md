@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Chromium's own renderer refusal page (`chrome-error://chromewebdata/`, "Access to
+  <site> was denied / HTTP ERROR 403") reads as `blocked` with vendor `chrome-deny`,
+  and is checked before the `not an http(s) page -> ready` branch. It is what
+  X/Twitter and other origins that refuse the client outright return (measured
+  today against https://x.com/login and https://x.com/account/begin_password_reset);
+  before this, the refusal page read as ready. It never carries a URL path worth
+  keeping, so the replied URL stays the renderer's. (`src/challenge.rs`)
+
 ## [1.1.0] - 2026-10-13
 
 ### Added

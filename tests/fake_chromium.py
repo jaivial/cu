@@ -10,6 +10,7 @@ import base64
 import hashlib
 import json
 import os
+import struct
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +32,7 @@ CLOSED = set()
 # Every Browser.setDownloadBehavior call, as the params it arrived with, so a
 # test can see whether the daemon gave a named context a directory of its own.
 DOWNLOAD_BEHAVIOUR = []
+DENY_ON = {"on": False}
 # Big enough to force the 64-bit websocket length form that a real screenshot
 # uses, so the frame reader cannot get away with the 16-bit one alone.
 PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"fake-png-bytes" * 8000).decode()
@@ -40,6 +42,7 @@ GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 # When the page under test has an iframe, the frame tree gains a child and
 # walks run in its isolated world (context id 7), like a real Chromium.
 FRAMES_ON = {"on": False}
+# Whether the page is Chromium's own renderer refuse page (see DENY_URL).
 CHILD_SNAPSHOT = json.dumps(
     {
         "url": "https://example.test/child",
@@ -51,6 +54,15 @@ CHILD_SNAPSHOT = json.dumps(
     separators=(",", ":"),
 )
 CHILD_WORDS = "words from inside the frame"
+# When the page is Chromium's own "the site refused you" renderer error page
+# (`chrome-error://chromewebdata/`), the probe still runs in it and the
+# classification must say Blocked, not the "not an http(s) page" ready it
+# used to read as. A navigate to any `deny://` URL makes the fake serve it.
+DENY_URL = "chrome-error://chromewebdata/"
+DENY_TEXT = (
+    "access to x.com was denied you don't have authorization to view this "
+    "page. http error 403"
+)
 # Execution context id of the iframe's isolated world.
 CHILD_CONTEXT = 7
 FAKE_SNAPSHOT = json.dumps(
@@ -223,6 +235,12 @@ class Handler(BaseHTTPRequestHandler):
                         "errorText": "net::ERR_NAME_NOT_RESOLVED",
                     }
                 }
+            # A site that refuses the client outright leaves Chromium on its
+            # own renderer error page (`chrome-error://chromewebdata/`), with
+            # the refusal wording inside it. The navigation itself answered 0
+            # (the error is renderer-internal); the wording is what the probe
+            # has to work with.
+            DENY_ON["on"] = url.startswith("deny://")
             FRAMES_ON["on"] = "frames" in url
             return {"id": 1, "result": {"frameId": "f", "url": "https://example.test"}}
         if method == "Browser.setDownloadBehavior":
@@ -247,6 +265,8 @@ class Handler(BaseHTTPRequestHandler):
                 del CONTEXT_TABS[target]
             return {"result": {}}
         if method == "Page.getFrameTree":
+            if DENY_ON["on"]:
+                return {"result": {"frameTree": {"frame": {"id": "MAINFRAME", "url": DENY_URL}}}}
             if FRAMES_ON["on"]:
                 return {
                     "result": {
@@ -283,6 +303,23 @@ class Handler(BaseHTTPRequestHandler):
             return {"id": 1, "result": {"data": PNG}}
         if method == "Runtime.evaluate":
             expr = (params or {}).get("expression", "")
+            if "challenge" in expr and "location.href" in expr and DENY_ON["on"]:
+                # The challenge probe (PROBE_JS) on Chromium's error page: the
+                # URL is the renderer's, the title the site's name and the
+                # body its wording. No vendor marker anywhere.
+                value = json.dumps(
+                    {
+                        "url": DENY_URL,
+                        "title": "x.com",
+                        "ready": "complete",
+                        "status": 200,
+                        "text": DENY_TEXT,
+                        "markers": [],
+                        "frames": [],
+                    },
+                    separators=(",", ":"),
+                )
+                return {"id": 1, "result": {"result": {"type": "string", "value": value}}}
             if "cuAgentSnapshot" in expr:
                 # The walk: in an iframe's isolated world it shows the frame,
                 # in the main world the page itself. (The walk embeds the

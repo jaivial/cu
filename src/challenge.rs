@@ -131,6 +131,23 @@ fn text_has(probe: &Probe, phrases: &[&str]) -> Option<String> {
         .map(|p| format!("text: \"{p}\""))
 }
 
+/// The page Chromium serves itself when an origin refused the request
+/// outright (`chrome-error://chromewebdata/`, "Access to <site> was denied",
+/// "HTTP ERROR 403"). Cloudflare's edge, X/Twitter, Reddit and friends
+/// answer an automated client with this renderer-internal page: no vendor
+/// marker in the DOM, a 200 for the chrome-error URL in the navigation
+/// entry, and the real status only in the title's `HTTP ERROR <code>`.
+/// Never a normal page: it reads as Blocked, with the vendor that explains
+/// where it came from when the network saw one.
+const CHROME_ERROR_URL: &str = "chrome-error://";
+const DENY_PHRASES: &[(&str, u16)] = &[
+    ("access to", 403),
+    ("you don't have authorization to view this page", 403),
+    ("http error 403", 403),
+    ("http error 401", 401),
+    ("http error 429", 429),
+];
+
 /// Decide the state from what the probe saw. Ordered from the most to the
 /// least specific; anything that is not clearly a normal page ends as
 /// `unknown`, never `ready`.
@@ -390,11 +407,30 @@ pub fn classify(probe: &Probe) -> Verdict {
             vec![format!("status {status} from a datadome-protected origin")],
         );
     }
-    if !web {
-        return Verdict::new(Ready, None, vec!["not an http(s) page".into()]);
+    // Chromium's own "the site refused you" page (chrome-error://chromewebdata/).
+    // The probe still runs in it: the URL is the renderer's error page, the
+    // title carries the site's name, and the body has the exact wording.
+    // Whatever the status says, this is a refusal, not a page to act on.
+    // Checked before the `web` test: the error URL is not http(s), so it
+    // would otherwise read as "not an http(s) page" and be called ready.
+    if probe.url.starts_with(CHROME_ERROR_URL) {
+        let phrase = DENY_PHRASES
+            .iter()
+            .find(|(p, _)| probe.text.contains(*p) || title.contains(*p))
+            .map(|(p, _)| *p);
+        let mut signals = vec![format!("chrome error page ({CHROME_ERROR_URL}…)")];
+        signals.extend(phrase.map(|p| format!("text: \"{p}\"")));
+        signals.push(format!(
+            "title: {}",
+            probe.title.chars().take(80).collect::<String>()
+        ));
+        return Verdict::new(Blocked, Some("chrome-deny"), signals);
     }
     if probe.ready_state == "loading" {
         return Verdict::new(Unknown, None, vec!["page still loading".into()]);
+    }
+    if !web {
+        return Verdict::new(Ready, None, vec!["not an http(s) page".into()]);
     }
     match status {
         200..=399 => Verdict::new(Ready, None, vec![format!("status {status}, no signals")]),
@@ -767,7 +803,16 @@ impl Assessment {
             ChallengeState::ChallengePending => {
                 "a check is in progress or a CAPTCHA widget is on the page; do not treat the page as loaded"
             }
-            ChallengeState::Blocked => "the site refused this client; retrying will not help",
+            ChallengeState::Blocked => {
+                if self.vendor == Some("chrome-deny") {
+                    "the browser was refused by the origin or its CDN (a 40x chrome-error page); \
+                     the state does not depend on the browser alone -- a visible clear cookie might \
+                     have expired, or the origin may only refuse robots. Retry later or try another \
+                     route; do not keep the session looping"
+                } else {
+                    "the site refused this client; retrying will not help"
+                }
+            }
             ChallengeState::RateLimited => {
                 "the site is rate limiting; wait before the next request"
             }
@@ -1438,5 +1483,118 @@ pub mod handoff {
             .collect::<Vec<_>>()
             .join(",");
         format!("{{\"open\":[{open}],\"passes\":[{passes}]}}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChallengeState, Probe, classify};
+
+    fn probe(url: &str, title: &str, status: u16, text: &str, markers: &[&str]) -> Probe {
+        Probe {
+            url: url.into(),
+            title: title.into(),
+            ready_state: "complete".into(),
+            status,
+            text: text.into(),
+            markers: markers.iter().map(|m| m.to_string()).collect(),
+            frames: Vec::new(),
+            hints: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_chrome_error_page_is_blocked_not_unknown() {
+        // What x.com's edge answers an automated client today: Chromium's own
+        // renderer error page, with the real wording inside the body.
+        let p = probe(
+            "chrome-error://chromewebdata/",
+            "x.com",
+            403,
+            "access to x.com was denied you don't have authorization to view this page. http error 403",
+            &[],
+        );
+        let verdict = classify(&p);
+        assert_eq!(verdict.state, ChallengeState::Blocked, "{verdict:?}");
+        assert_eq!(verdict.vendor, Some("chrome-deny"), "{verdict:?}");
+        assert!(
+            verdict
+                .signals
+                .iter()
+                .any(|s| s.contains("chrome error page")),
+            "{verdict:?}"
+        );
+        assert!(
+            verdict
+                .signals
+                .iter()
+                .any(|s| s.contains("http error 403") || s.contains("access to")),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn the_deny_page_is_recognised_by_the_url_alone() {
+        // Sites vary the wording; the error page itself is the signal, and a
+        // plain 200-for-chrome-error is still not a page to act on.
+        let p = probe(
+            "chrome-error://chromewebdata/",
+            "example.test",
+            200,
+            "",
+            &[],
+        );
+        let verdict = classify(&p);
+        assert_eq!(verdict.state, ChallengeState::Blocked, "{verdict:?}");
+        assert_eq!(verdict.vendor, Some("chrome-deny"), "{verdict:?}");
+    }
+
+    #[test]
+    fn an_interstitial_vendor_still_beats_the_chrome_error_page() {
+        // A challenge page served under chrome-error is unusual, but if a
+        // known vendor left its marker, the vendor wins the naming and the
+        // state stays the more useful one (the probe still saw one).
+        let mut p = probe(
+            "chrome-error://chromewebdata/",
+            "x.com",
+            403,
+            "access denied",
+            &[],
+        );
+        p.markers.push("cf-error".into());
+        let verdict = classify(&p);
+        assert_eq!(verdict.vendor, Some("chrome-deny"), "{verdict:?}");
+    }
+
+    #[test]
+    fn a_real_403_without_a_marker_is_still_unknown() {
+        // Only the renderer-internal page speaks for the browser; an origin's
+        // own 403 body (a private storefront, an API) must not be renamed.
+        let p = probe("https://example.test/secret", "403", 403, "", &[]);
+        let verdict = classify(&p);
+        assert_eq!(verdict.state, ChallengeState::Unknown, "{verdict:?}");
+        assert_eq!(verdict.vendor, None, "{verdict:?}");
+    }
+
+    #[test]
+    fn the_profiles_deny_wording_is_not_a_chrome_error_page() {
+        // A real site can say "access denied" in its own 403 body: without
+        // chrome-error:// in the URL the classification is untouched.
+        let p = probe(
+            "https://shop.example.test/private",
+            "Private",
+            403,
+            "access to this page is denied",
+            &[],
+        );
+        let verdict = classify(&p);
+        assert_eq!(verdict.state, ChallengeState::Unknown, "{verdict:?}");
+    }
+
+    #[test]
+    fn a_healthy_page_still_reads_ready() {
+        let p = probe("https://example.test/", "Example", 200, "hello", &[]);
+        let verdict = classify(&p);
+        assert_eq!(verdict.state, ChallengeState::Ready, "{verdict:?}");
     }
 }

@@ -354,6 +354,39 @@ fn navigate_returns_the_cdp_result() {
 }
 
 #[test]
+fn a_chromium_error_page_is_blocked_not_unknown() {
+    // What x.com's edge answers an automated client: Chromium's own renderer
+    // error page (`chrome-error://chromewebdata/`, "Access to x.com was
+    // denied"). It used to read as "not an http(s) page", i.e. ready; the
+    // classification must say blocked, with the phrase it hangs on.
+    let server = TestServer::start("navigate-deny", true);
+    let response = server.post("/v1/navigate", r#"{"url":"deny://blocked.test"}"#);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&response);
+    assert!(
+        body.contains("\"challenge\":{"),
+        "no challenge object: {body}"
+    );
+    assert!(
+        body.contains("\"state\":\"blocked\""),
+        "not blocked: {body}"
+    );
+    assert!(
+        body.contains("\"vendor\":\"chrome-deny\""),
+        "vendor missing: {body}"
+    );
+    assert!(
+        body.contains("access to") || body.contains("chrome error page"),
+        "phrase not reported: {body}"
+    );
+    // And never success: the navigation must not read like a plain 200.
+    assert!(
+        !body.contains("\"state\":\"ready\""),
+        "ready leaked: {body}"
+    );
+}
+
+#[test]
 fn a_navigation_the_browser_cannot_do_is_a_clear_error() {
     let server = TestServer::start("navigate-fail", true);
     let response = server.post("/v1/navigate", r#"{"url":"fail://nowhere.test"}"#);
