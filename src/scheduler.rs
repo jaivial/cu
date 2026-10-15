@@ -299,6 +299,32 @@ pub fn transient(error: &str) -> bool {
     .any(|e| error.contains(e))
 }
 
+/// An HTTP-level navigation failure: the origin did answer (with a status
+/// Chromium refuses to render: `net::ERR_HTTP_RESPONSE_CODE_FAILURE`, a
+/// malformed response, a response with no content), so the tab is left on the
+/// browser's own error page rather than on a transport failure. These are the
+/// failures a bot defence produces: X/Twitter's edge answers an automated
+/// client with a 403 that Chromium reports exactly this way, and the message
+/// is the only thing that distinguishes it from a name that will not resolve.
+/// Unlike [`transient`], one of these is never retried by itself -- the page
+/// it leaves behind is assessed instead.
+pub fn http_level_failure(error: &str) -> bool {
+    [
+        "ERR_HTTP_RESPONSE_CODE_FAILURE",
+        "ERR_INVALID_HTTP_RESPONSE",
+        "ERR_RESPONSE_HEADERS_MULTIPLE_CONTENT_LENGTH",
+        "ERR_RESPONSE_HEADERS_MULTIPLE_CONTENT_DISPOSITION",
+        "ERR_RESPONSE_HEADERS_TOO_BIG",
+        "ERR_INVALID_HTTP_RESPONSE",
+        "ERR_HTTP2_SERVER_REFUSED_STREAM",
+        "ERR_EMPTY_RESPONSE",
+        "ERR_CONTENT_LENGTH_MISMATCH",
+        "ERR_INCOMPLETE_CHUNKED_ENCODING",
+    ]
+    .iter()
+    .any(|e| error.contains(e))
+}
+
 /// Pause before retry number `attempt` (1-based) after a transient error.
 pub fn retry_pause(attempt: u32) -> Duration {
     Duration::from_millis(500).saturating_mul(1 << attempt.saturating_sub(1).min(4))
@@ -430,4 +456,28 @@ pub fn json() -> String {
         budget.max_wait.as_millis(),
         list.join(",")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{http_level_failure, transient};
+
+    #[test]
+    fn an_http_level_failure_is_classified_not_retried() {
+        // X/Twitter's edge answers an automated client this way: the origin
+        // returned a status Chromium will not render. It must be assessed as
+        // the refusal it is, not retried like a dropped connection.
+        assert!(http_level_failure("net::ERR_HTTP_RESPONSE_CODE_FAILURE"));
+        assert!(http_level_failure("net::ERR_INVALID_HTTP_RESPONSE"));
+        assert!(!transient("net::ERR_HTTP_RESPONSE_CODE_FAILURE"));
+        assert!(http_level_failure("net::ERR_EMPTY_RESPONSE"));
+    }
+
+    #[test]
+    fn a_transport_failure_is_not_an_http_level_one() {
+        // Nothing answered, so there is no page to assess: 502 as before.
+        assert!(!http_level_failure("net::ERR_NAME_NOT_RESOLVED"));
+        assert!(!http_level_failure("net::ERR_CONNECTION_REFUSED"));
+        assert!(transient("net::ERR_CONNECTION_RESET"));
+    }
 }

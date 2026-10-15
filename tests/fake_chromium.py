@@ -235,6 +235,17 @@ class Handler(BaseHTTPRequestHandler):
                         "errorText": "net::ERR_NAME_NOT_RESOLVED",
                     }
                 }
+            # A refusal at the HTTP level: the origin answered (403), Chromium
+            # refuses to render it and leaves its own error page on the tab.
+            # The navigate call itself reports the failure, like Chromium.
+            if url.startswith("httpfail://"):
+                DENY_ON["on"] = True
+                return {
+                    "result": {
+                        "frameId": "f",
+                        "errorText": "net::ERR_HTTP_RESPONSE_CODE_FAILURE",
+                    }
+                }
             # A site that refuses the client outright leaves Chromium on its
             # own renderer error page (`chrome-error://chromewebdata/`), with
             # the refusal wording inside it. The navigation itself answered 0

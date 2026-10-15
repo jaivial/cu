@@ -1,8 +1,29 @@
 # Changelog
 
-## [Unreleased]
+## [1.1.2] - 2026-10-15
 
 ### Fixed
+
+- **An HTTP-level navigation failure is reported as the refusal it is.** Chromium
+  answers `net::ERR_HTTP_RESPONSE_CODE_FAILURE` when the origin returns a status it
+  will not render — X/Twitter's 403 to an automated client — and `/v1/navigate`
+  returned a bare `502 navigation failed`, hiding a block the agent could act on.
+  The tab is left on the browser's own error page, so the navigation is now
+  assessed first: a refusal comes back as `200` with `navigated:false`, the
+  browser's `error`, `"challenge"` (`state` `blocked`, vendor `chrome-deny`, the
+  `status` the network saw, the signals) and the hint; a transport failure
+  (`ERR_NAME_NOT_RESOLVED`, `ERR_CONNECTION_REFUSED`) keeps its `502` — nothing
+  answered, so there is no page to classify. `crate::scheduler::http_level_failure`
+  holds the list, and those errors are never auto-retried. (`src/server.rs`,
+  `src/scheduler.rs`)
+
+  Measured on the deployed daemon (`cu.service`, `CU_HEADLESS=1`, Chrome 145):
+  `https://x.com/account/begin_password_reset` answered
+  `{\"navigated\":false,\"error\":\"navigation failed: net::ERR_HTTP_RESPONSE_CODE_FAILURE\",
+  \"challenge\":{\"state\":\"blocked\",\"vendor\":\"chrome-deny\",\"status\":403,...}}`;
+  `https://no-such-host-xyz.test/` still answered `502`; `https://example.com/`
+  still `ready`; `https://help.x.com/es/forms/account-access/regain-access` still
+  `human_required` / `cloudflare` after the `cf-mitigated: challenge` header.
 
 - Chromium's own renderer refusal page (`chrome-error://chromewebdata/`, "Access to
   <site> was denied / HTTP ERROR 403") reads as `blocked` with vendor `chrome-deny`,
@@ -11,6 +32,11 @@
   today against https://x.com/login and https://x.com/account/begin_password_reset);
   before this, the refusal page read as ready. It never carries a URL path worth
   keeping, so the replied URL stays the renderer's. (`src/challenge.rs`)
+
+## [1.1.1] - 2026-10-15
+
+- Chromium's own renderer refusal page reads as `blocked` with vendor `chrome-deny`
+  (see the 1.1.2 entry above).
 
 ## [1.1.0] - 2026-10-13
 

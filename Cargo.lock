@@ -134,7 +134,7 @@ dependencies = [
 
 [[package]]
 name = "cu"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",

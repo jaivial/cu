@@ -1369,6 +1369,62 @@ fn navigate_scheduled(tab: &Tab, url: &str) -> (&'static str, &'static str, Stri
                 thread::sleep(crate::scheduler::retry_pause(attempt));
                 continue;
             }
+            // An HTTP-level refusal is not a transport failure: the origin
+            // answered (403, 4xx), Chromium refused to render it and left its
+            // own error page on the tab. `ERR_HTTP_RESPONSE_CODE_FAILURE` and
+            // friends are exactly what X/Twitter's edge produces today, and
+            // reporting them as a bare `502 navigation failed` hid a block
+            // the agent could have understood. Assess the page the browser is
+            // on: if it is a refusal, say so with the state, the vendor, the
+            // status the network saw and the signals, plus the browser error.
+            let http_level = crate::scheduler::http_level_failure(&error);
+            let assessment = (http_level && crate::challenge::enabled()).then(|| {
+                let assessment = crate::challenge::assess_response(
+                    |m, p| tab.command(m, p),
+                    crate::challenge::wait_budget(),
+                    document.as_ref(),
+                );
+                crate::challenge::record(tab, &assessment);
+                assessment
+            });
+            let refusal = assessment
+                .as_ref()
+                .filter(|a| {
+                    matches!(
+                        a.state,
+                        crate::challenge::ChallengeState::Blocked
+                            | crate::challenge::ChallengeState::RateLimited
+                    )
+                })
+                .cloned();
+            if let Some(refusal) = refusal {
+                crate::scheduler::report(&crate::scheduler::Outcome {
+                    url,
+                    status: document
+                        .as_ref()
+                        .map(|d| d.status)
+                        .unwrap_or(refusal.status),
+                    retry_after: document.as_ref().and_then(|d| d.retry_after),
+                    state: refusal.state,
+                });
+                let status = document.as_ref().map(|d| d.status).unwrap_or(0);
+                let mut body = format!(
+                    "{{\"navigated\":false,\"error\":{},\"challenge\":{}",
+                    json_string(&format!("navigation failed: {error}")),
+                    refusal.json()
+                );
+                if status != 0 {
+                    body.push_str(&format!(",\"status\":{status}"));
+                }
+                if attempt > 0 {
+                    body.push_str(&format!(",\"retries\":{attempt}"));
+                }
+                if !queued.is_zero() {
+                    body.push_str(&format!(",\"queued_ms\":{}", queued.as_millis()));
+                }
+                body.push('}');
+                return ("200 OK", "application/json", body);
+            }
             return (
                 "502 Bad Gateway",
                 "application/json",

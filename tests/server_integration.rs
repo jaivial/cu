@@ -354,6 +354,55 @@ fn navigate_returns_the_cdp_result() {
 }
 
 #[test]
+fn an_http_level_navigation_failure_is_reported_as_the_block_it_is() {
+    // Chromium answers `net::ERR_HTTP_RESPONSE_CODE_FAILURE` when the origin
+    // returns a status it will not render (X/Twitter's 403 to an automated
+    // client). That used to reach the agent as a bare `502 navigation failed`;
+    // the browser is sitting on a refusal page, and the agent must be told what
+    // it is (state + vendor + status), not just that something failed.
+    let server = TestServer::start("navigate-httpfail", true);
+    let response = server.post("/v1/navigate", r#"{"url":"httpfail://x.test/login"}"#);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&response);
+    assert!(body.contains("\"navigated\":false"), "got {body}");
+    assert!(
+        body.contains("ERR_HTTP_RESPONSE_CODE_FAILURE"),
+        "the browser error is not reported: {body}"
+    );
+    assert!(
+        body.contains("\"challenge\":{"),
+        "no challenge object: {body}"
+    );
+    assert!(
+        body.contains("\"state\":\"blocked\""),
+        "not blocked: {body}"
+    );
+    assert!(
+        body.contains("\"vendor\":\"chrome-deny\""),
+        "vendor missing: {body}"
+    );
+    assert!(body.contains("\"next\":"), "no hint for the agent: {body}");
+}
+#[test]
+fn a_dns_failure_is_still_a_plain_error() {
+    // The transport failures keep the 502 they had: there is no page to
+    // classify, and inventing a block would be worse than saying it failed.
+    let server = TestServer::start("navigate-fail-http", true);
+    let response = server.post("/v1/navigate", r#"{"url":"fail://nowhere.test"}"#);
+    assert_eq!(status_code(&response), "502", "got {}", body_of(&response));
+    assert!(
+        body_of(&response).contains("navigation failed"),
+        "got {}",
+        body_of(&response)
+    );
+    assert!(
+        !body_of(&response).contains("challenge"),
+        "a transport failure is not a challenge: {}",
+        body_of(&response)
+    );
+}
+
+#[test]
 fn a_chromium_error_page_is_blocked_not_unknown() {
     // What x.com's edge answers an automated client: Chromium's own renderer
     // error page (`chrome-error://chromewebdata/`, "Access to x.com was
