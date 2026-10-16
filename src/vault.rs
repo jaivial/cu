@@ -150,13 +150,63 @@ impl Vault {
             key,
         };
         let conn = vault.connect()?;
-        conn.execute_batch(SCHEMA)
+        vault.migrate(&conn)?;
+        // The secret-requests DDL goes first so the migration (which may
+        // have just created the table in the current shape) and a fresh
+        // database end up with the same schema.
+        conn.execute_batch(&format!("{SECRET_REQUESTS_DDL}{SCHEMA}"))
             .map_err(|e| format!("vault schema: {e}"))?;
         let _ = conn.execute(
             "INSERT OR REPLACE INTO vault_meta(key, value) VALUES ('schema_version', '1')",
             [],
         );
         Ok(vault)
+    }
+
+    /// Bring a database written by an older build up to the current schema.
+    /// `CREATE TABLE IF NOT EXISTS` silently keeps an old shape, so a table
+    /// that predates the current `secret_requests` columns is renamed and
+    /// its rows copied across before the schema runs.
+    fn migrate(&self, conn: &Connection) -> Result<(), String> {
+        let columns: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(secret_requests)")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| e.to_string())?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        let current = !columns.is_empty()
+            && columns.iter().any(|c| c == "requested_by")
+            && columns.iter().any(|c| c == "status");
+        if columns.is_empty() || current {
+            return Ok(());
+        }
+        conn.execute(
+            "ALTER TABLE secret_requests RENAME TO secret_requests_old",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+        // The rename freed the name, so the current shape can be created
+        // here, before the copy — the full schema batch runs after us.
+        conn.execute_batch(SECRET_REQUESTS_DDL)
+            .map_err(|e| e.to_string())?;
+        // Rows are only worth copying when the old shape is the one this
+        // project once shipped; anything stranger is dropped with the table.
+        if columns.contains(&"requester".to_string()) && columns.contains(&"state".to_string()) {
+            conn.execute(
+                "INSERT INTO secret_requests
+                     (id, domain, reason, requested_by, status, created_at, decided_at)
+                 SELECT id, domain, reason, requester, state, created_at, decided_at
+                 FROM secret_requests_old",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        conn.execute("DROP TABLE secret_requests_old", [])
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     fn connect(&self) -> Result<Connection, String> {
@@ -406,6 +456,206 @@ impl Vault {
             .count()
     }
 
+    // ---- secret requests (an agent asks, a person approves in the UI) ----
+
+    /// Record an agent's request for a secret covering `domain`. The request
+    /// carries no secret: it is a question a person answers in the vault UI.
+    pub fn create_request(
+        &self,
+        domain: &str,
+        reason: &str,
+        requested_by: &str,
+    ) -> Result<i64, String> {
+        let conn = self.connect()?;
+        conn.execute(
+            "INSERT INTO secret_requests(domain, reason, requested_by, status, created_at)
+             VALUES (?1, ?2, ?3, 'pending', ?4)",
+            rusqlite::params![domain, reason, requested_by, now()],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Requests newest first, optionally filtered by status, without secrets.
+    pub fn list_requests(&self, status: Option<&str>) -> Result<String, String> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, domain, reason, requested_by, status, credential_id, created_at, decided_at
+                 FROM secret_requests ORDER BY id DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, domain, reason, requested_by, st, credential_id, created_at, decided_at) =
+                row.map_err(|e| e.to_string())?;
+            if let Some(want) = status
+                && st != want
+            {
+                continue;
+            }
+            out.push(format!(
+                "{{\"id\":{id},\"domain\":{},\"reason\":{},\"requested_by\":{},\"status\":\"{st}\",\
+                 \"credential_id\":{},\"created_at\":{created_at},\"decided_at\":{}}}",
+                json_string(&domain),
+                json_string(&reason),
+                json_string(&requested_by),
+                credential_id
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "null".into()),
+                decided_at
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "null".into()),
+            ));
+        }
+        Ok(format!("{{\"requests\":[{}]}}", out.join(",")))
+    }
+
+    /// One request, expired if it sat pending too long. An approved request
+    /// carries the credential with its values revealed — that reveal is the
+    /// whole point of the flow, and the routes that reach here are the ones
+    /// the bearer token or a live UI session already guard.
+    pub fn get_request(&self, id: i64) -> Result<Option<String>, String> {
+        let conn = self.connect()?;
+        let row = conn
+            .query_row(
+                "SELECT domain, reason, requested_by, status, credential_id, created_at, decided_at
+                 FROM secret_requests WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                    ))
+                },
+            )
+            .ok();
+        let Some((domain, reason, requested_by, mut st, credential_id, created_at, decided_at)) =
+            row
+        else {
+            return Ok(None);
+        };
+        if st == "pending" && now() - created_at > REQUEST_TTL_SECS {
+            conn.execute(
+                "UPDATE secret_requests SET status='expired' WHERE id=?1 AND status='pending'",
+                [id],
+            )
+            .map_err(|e| e.to_string())?;
+            st = "expired".into();
+        }
+        let credential = match (st.as_str(), credential_id) {
+            ("approved", Some(cid)) => self.get_credential(cid)?,
+            _ => None,
+        };
+        Ok(Some(format!(
+            "{{\"id\":{id},\"domain\":{},\"reason\":{},\"requested_by\":{},\"status\":\"{st}\",\
+             \"credential_id\":{},\"created_at\":{created_at},\"decided_at\":{},\"credential\":{}}}",
+            json_string(&domain),
+            json_string(&reason),
+            json_string(&requested_by),
+            credential_id
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "null".into()),
+            decided_at
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "null".into()),
+            credential.unwrap_or_else(|| "null".into()),
+        )))
+    }
+
+    /// Approve or deny a pending request. Approval must name (or imply) the
+    /// credential to hand over; nothing is revealed here, only linked.
+    pub fn decide_request(
+        &self,
+        id: i64,
+        approve: bool,
+        credential_id: Option<i64>,
+    ) -> Result<bool, String> {
+        if approve && credential_id.is_none() {
+            return Err(
+                "approval needs a credential_id (none was given and none is implied)".to_string(),
+            );
+        }
+        let conn = self.connect()?;
+        let n = conn
+            .execute(
+                "UPDATE secret_requests SET status=?2, credential_id=COALESCE(?3, credential_id), \
+                 decided_at=?4 WHERE id=?1 AND status='pending'",
+                rusqlite::params![
+                    id,
+                    if approve { "approved" } else { "denied" },
+                    credential_id,
+                    now()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            // Distinguish "already decided" from "never existed" for the API.
+            let exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM secret_requests WHERE id = ?1",
+                    [id],
+                    |r| r.get::<_, i64>(0).map(|c| c > 0),
+                )
+                .unwrap_or(false);
+            if exists {
+                return Err("request is not pending any more".into());
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Credentials for `domain` with their field values, decrypted, most
+    /// recently updated first. For the basic-auth responder and the
+    /// approve-with-default: both are server-side, and both are guarded
+    /// routes.
+    pub fn credentials_for_domain(
+        &self,
+        domain: &str,
+    ) -> Result<Vec<(i64, String, String)>, String> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare("SELECT id, domain, fields FROM credentials ORDER BY updated_at DESC")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, stored, fields) = row.map_err(|e| e.to_string())?;
+            if domain_matches(domain, &stored) {
+                out.push((id, stored, unseal(&self.key, &fields).unwrap_or_default()));
+            }
+        }
+        Ok(out)
+    }
+
     // ---- master password ----
 
     pub fn has_password(&self) -> bool {
@@ -511,6 +761,103 @@ fn now() -> i64 {
         .unwrap_or_default()
         .as_secs() as i64
 }
+
+/// How long a secret request may sit pending before reading it reports (and
+/// marks) it expired: an approval a person never got to see should not be
+/// answered by an agent that checks back the next day.
+pub const REQUEST_TTL_SECS: i64 = 15 * 60;
+
+const USER_FIELD_NAMES: &[&str] = &["username", "user", "email", "login", "login_username"];
+const PASSWORD_FIELD_NAMES: &[&str] = &["password", "pass", "pwd"];
+
+/// The `(user, password)` a fields JSON array carries, for HTTP basic auth:
+/// the first field whose name reads as a username and the first whose name
+/// reads as a password, case-insensitively. `None` unless both are there.
+pub fn basic_auth_pair(fields: &str) -> Option<(String, String)> {
+    let find = |names: &[&str]| {
+        fields.split("\"name\"").skip(1).find_map(|chunk| {
+            let rest = chunk.trim_start_matches(|c: char| c != '"');
+            let rest = rest.strip_prefix('"')?;
+            let end = string_body_end(rest)?;
+            let name = rest[..end].to_ascii_lowercase();
+            if !names.contains(&name.as_str()) {
+                return None;
+            }
+            // The value follows the next `"value"` in this chunk.
+            let value_part = rest[end..].split("\"value\"").nth(1)?;
+            let value_rest = value_part.trim_start_matches(|c: char| c != '"');
+            let value_rest = value_rest.strip_prefix('"')?;
+            let value_end = string_body_end(value_rest)?;
+            Some(unescape_json(&value_rest[..value_end]))
+        })
+    };
+    let user = find(USER_FIELD_NAMES)?;
+    let password = find(PASSWORD_FIELD_NAMES)?;
+    Some((user, password))
+}
+
+/// Index of the closing quote of a JSON string body (the text between the
+/// quotes), honouring `\"` escapes.
+fn string_body_end(body: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (i, c) in body.char_indices() {
+        if escaped {
+            escaped = false;
+        } else {
+            match c {
+                '\\' => escaped = true,
+                '"' => return Some(i),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// The JSON escapes a sealed fields value may carry. The vault's hand-rolled
+/// parser never unescaped, and a literal `\n` in a password would not
+/// authenticate.
+fn unescape_json(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                if let Ok(code) = u32::from_str_radix(&hex, 16)
+                    && let Some(c) = char::from_u32(code)
+                {
+                    out.push(c);
+                }
+            }
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// The current `secret_requests` shape, on its own so the migration can
+/// create it mid-flight (see [`Vault::migrate`]).
+const SECRET_REQUESTS_DDL: &str = "
+CREATE TABLE IF NOT EXISTS secret_requests (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  domain        TEXT NOT NULL,
+  reason        TEXT NOT NULL DEFAULT '',
+  requested_by  TEXT NOT NULL DEFAULT '',
+  status        TEXT NOT NULL DEFAULT 'pending',
+  credential_id INTEGER,
+  created_at    INTEGER NOT NULL,
+  decided_at    INTEGER
+);
+";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS vault_meta (
@@ -700,5 +1047,156 @@ mod tests {
         assert!(!ui_session_valid(Some(&token)));
         assert!(!ui_session_valid(Some("bogus")));
         assert!(!ui_session_valid(None));
+    }
+
+    #[test]
+    fn an_old_secret_requests_table_is_migrated() {
+        let dir = std::env::temp_dir().join(format!("cu-vault-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // What an unreleased build left behind: other column names.
+        {
+            let conn = Connection::open(dir.join("vault.db")).unwrap();
+            conn.execute(
+                "CREATE TABLE secret_requests (
+                   id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                   domain     TEXT NOT NULL,
+                   reason     TEXT NOT NULL DEFAULT '',
+                   requester  TEXT NOT NULL DEFAULT '',
+                   state      TEXT NOT NULL DEFAULT 'pending',
+                   created_at INTEGER NOT NULL,
+                   decided_at INTEGER
+                 )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO secret_requests(domain, reason, requester, state, created_at)
+                 VALUES ('old.example.com', 'left over', 'agent-x', 'pending', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let vault = Vault::open(&dir).expect("opens over the old shape");
+        let listed = vault.list_requests(None).unwrap();
+        assert!(listed.contains("old.example.com"), "{listed}");
+        assert!(listed.contains("agent-x"));
+        assert!(listed.contains("pending"));
+        // And the migrated table behaves like a fresh one.
+        let id = vault.create_request("example.com", "", "").unwrap();
+        assert!(id > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const QA_FIELDS: &str = r#"[{"name":"user","value":"jaime","secret":false,"type":"text"},
+                                {"name":"Password","value":"hunter2","secret":true,"type":"password"}]"#;
+
+    #[test]
+    fn secret_requests_roundtrip_and_gate_the_reveal() {
+        let vault = tmp_vault("requests");
+        let id = vault
+            .create_request("example.com", "QA of the basic-auth flow", "agent-a")
+            .unwrap();
+        let listed = vault.list_requests(None).unwrap();
+        assert!(listed.contains("example.com"));
+        assert!(listed.contains("pending"));
+        // Filtering works, and a list never carries a secret value.
+        assert_eq!(
+            vault
+                .list_requests(Some("pending"))
+                .unwrap()
+                .matches("example.com")
+                .count(),
+            1
+        );
+        assert!(
+            !vault
+                .list_requests(Some("denied"))
+                .unwrap()
+                .contains("example.com")
+        );
+
+        // A pending request reveals nothing.
+        let pending = vault.get_request(id).unwrap().unwrap();
+        assert!(pending.contains("\"status\":\"pending\""));
+        assert!(pending.contains("\"credential\":null"));
+
+        // Approval without a credential is refused; with one it links it.
+        assert!(vault.decide_request(id, true, None).is_err());
+        let cid = vault
+            .put_credential(None, "example.com", "main", QA_FIELDS, "")
+            .unwrap();
+        assert!(vault.decide_request(id, true, Some(cid)).unwrap());
+        let approved = vault.get_request(id).unwrap().unwrap();
+        assert!(approved.contains("\"status\":\"approved\""));
+        assert!(
+            approved.contains("hunter2"),
+            "an approved request hands the credential over"
+        );
+        // Deciding twice is refused, and the first decision stands.
+        assert!(
+            vault
+                .decide_request(id, false, None)
+                .unwrap_err()
+                .contains("not pending")
+        );
+        // Denial never reveals anything.
+        let did = vault.create_request("other.com", "", "agent-b").unwrap();
+        assert!(vault.decide_request(did, false, None).unwrap());
+        let denied = vault.get_request(did).unwrap().unwrap();
+        assert!(denied.contains("\"status\":\"denied\""));
+        assert!(!vault.get_request(9999).unwrap().is_some());
+    }
+
+    #[test]
+    fn an_approved_request_is_the_only_one_that_reveals() {
+        let vault = tmp_vault("requests-reveal");
+        let cid = vault
+            .put_credential(None, "example.com", "main", QA_FIELDS, "")
+            .unwrap();
+        let id = vault.create_request("example.com", "", "agent").unwrap();
+        assert!(vault.decide_request(id, true, Some(cid)).unwrap());
+        let body = vault.get_request(id).unwrap().unwrap();
+        // The request names its domain and the credential's domain agrees.
+        assert!(body.contains("\"domain\":\"example.com\""));
+    }
+
+    #[test]
+    fn basic_auth_pair_reads_user_and_password_fields() {
+        let (user, pass) = basic_auth_pair(QA_FIELDS).unwrap();
+        assert_eq!(user, "jaime");
+        assert_eq!(pass, "hunter2");
+        // JSON escapes in a stored value are decoded for the challenge.
+        let escaped = r#"[{"name":"user","value":"jaime","secret":false},
+                           {"name":"password","value":"h\u0075nter2","secret":true}]"#;
+        assert_eq!(basic_auth_pair(escaped).unwrap().1, "hunter2");
+        assert!(basic_auth_pair(r#"[{"name":"user","value":"x","secret":false}]"#).is_none());
+        assert!(basic_auth_pair(r#"[{"name":"password","value":"x","secret":true}]"#).is_none());
+        assert!(basic_auth_pair("not json").is_none());
+        assert!(basic_auth_pair(
+            r#"[{"name":"token","value":"abc","secret":true},{"name":"api_key","value":"k","secret":true}]"#
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn credentials_for_domain_match_subdomains() {
+        let vault = tmp_vault("for-domain");
+        vault
+            .put_credential(None, "example.com", "main", QA_FIELDS, "")
+            .unwrap();
+        assert_eq!(
+            vault
+                .credentials_for_domain("app.example.com")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            vault
+                .credentials_for_domain("notexample.com")
+                .unwrap()
+                .is_empty()
+        );
     }
 }

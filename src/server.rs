@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
@@ -703,9 +703,12 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
         ("200 OK", "text/html", login_page())
     } else if path == "/login" && method == "POST" {
         ("200 OK", "text/html", login_submit(body, &state))
-    } else if is_vault_path(path) && !authorized {
+    } else if is_vault_path(path) && (!authorized || is_vault_ui_only(path)) {
         // The vault UI authenticates with its own cookie (master password
         // behind nginx basic auth); the local CLI keeps using the bearer.
+        // Approve/deny are UI-only even for a bearer caller: every agent on
+        // this machine holds the same bearer token, so an agent allowed to
+        // answer its own secret request would make the approval theatre.
         let (status, kind, response, cookie) =
             vault_route(method, path, body, &state, header_value(head, "cookie"));
         set_cookie = cookie;
@@ -764,6 +767,16 @@ pub fn host_allowed(
 /// the only paths the vault host answers).
 fn is_vault_path(path: &str) -> bool {
     path == "/vault" || path.starts_with("/vault/") || path.starts_with("/v1/vault")
+}
+
+/// Whether a vault route may be answered only to a live UI session, never to
+/// the bearer token: deciding a secret request. The bearer token sits in
+/// `server.json`, readable by every process of this user — every agent this
+/// daemon serves included — so an agent that could answer its own request
+/// would reduce the human's approval to a formality. Approving or denying is
+/// for the person in front of the vault UI.
+fn is_vault_ui_only(path: &str) -> bool {
+    path.ends_with("/approve") || path.ends_with("/deny")
 }
 
 /// Normalise a public base URL (`https://login.example.com[:port][/]`) and
@@ -1073,7 +1086,12 @@ pub fn route(
             let inject = !body.contains("\"inject\":false")
                 && !body.contains("\"inject\": \"off\"")
                 && !body.contains("\"inject\":\"off\"");
-            navigate_with_vault(state, &tab, &url, inject)
+            // The basic-auth responder is on like the injector, and off with
+            // `"auth":false` for a caller that wants the raw challenge.
+            let auth_enabled = !body.contains("\"auth\":false")
+                && !body.contains("\"auth\": \"off\"")
+                && !body.contains("\"auth\":\"off\"");
+            navigate_with_vault(state, &tab, &url, inject, auth_enabled)
         }
         ("GET", "/v1/screenshot") => screenshot(&tab, query(full_path)),
         // Visual QA references (see `crate::visual`): what an element is,
@@ -1338,7 +1356,11 @@ fn context_session(
 /// assess, and retry a 429/503 or a transient network error within the
 /// budget (see [`crate::scheduler`]). A challenge or a block is never
 /// retried.
-fn navigate_scheduled(tab: &Tab, url: &str) -> (&'static str, &'static str, String) {
+fn navigate_scheduled(
+    tab: &Tab,
+    url: &str,
+    auth: Option<(String, String)>,
+) -> (&'static str, &'static str, String) {
     let refused =
         |r: crate::scheduler::Refused| ("429 Too Many Requests", "application/json", r.json());
     let retries = crate::scheduler::budget().retries;
@@ -1349,7 +1371,7 @@ fn navigate_scheduled(tab: &Tab, url: &str) -> (&'static str, &'static str, Stri
             Err(r) => return refused(r),
         };
         let queued = permit.as_ref().map(|p| p.waited).unwrap_or_default();
-        let (result, document) = match navigate_observed(tab, url) {
+        let (result, document, auth_handled) = match navigate_observed(tab, url, auth.clone()) {
             Ok(pair) => pair,
             Err(error) => {
                 return (
@@ -1479,6 +1501,11 @@ fn navigate_scheduled(tab: &Tab, url: &str) -> (&'static str, &'static str, Stri
             continue;
         }
         let mut extra = String::new();
+        if auth_handled {
+            // A challenge was met with the vault's credentials; the status
+            // above is the post-auth response, not the bare 401.
+            extra.push_str(",\"basic_auth\":\"responded\"");
+        }
         if let Some(a) = &assessment {
             extra.push_str(&format!(",\"challenge\":{}", a.json()));
         }
@@ -1510,10 +1537,21 @@ fn navigate_scheduled(tab: &Tab, url: &str) -> (&'static str, &'static str, Stri
 /// `Page.navigate` on a connection that has `Network` on just for the
 /// navigation, so the main document's status and `Retry-After` are seen.
 /// Only those two values are kept from the response.
+///
+/// With `auth` set (the vault has a user/password pair for this host), the
+/// connection also has `Fetch` interception on, scoped to the host: an
+/// `authRequired` event — the 401 + `WWW-Authenticate` challenge a headless
+/// browser would otherwise sit on with no dialog to answer — is answered
+/// with `Fetch.continueWithAuth` and the vault's pair, and every paused
+/// request is continued, all without ever stopping to read a command's
+/// reply inline (a reply read for would swallow concurrent events and leave
+/// a request paused for ever). The third element of the result says whether
+/// a challenge was answered.
 fn navigate_observed(
     tab: &Tab,
     url: &str,
-) -> Result<(String, Option<crate::scheduler::DocumentResponse>), String> {
+    auth: Option<(String, String)>,
+) -> Result<(String, Option<crate::scheduler::DocumentResponse>, bool), String> {
     let mut connection = checkout(tab)?;
     // Small buffers: the bodies are never fetched, only headers are needed.
     let enabled = connection
@@ -1528,21 +1566,182 @@ fn navigate_observed(
                 "{\"maxTotalBufferSize\":0,\"maxResourceBufferSize\":0}",
             )
         });
+    let auth_on = auth.is_some() && enabled.is_ok();
+    if auth_on {
+        // This navigation arms `Fetch` itself, so the tab's background
+        // responder has to let go first: two sessions intercepting the same
+        // host would both have to answer every request.
+        stop_auth_keeper(tab);
+    }
+    if auth_on
+        && connection
+            .call("Fetch.enable", &fetch_enable_params(&url_host(url)))
+            .is_err()
+    {
+        // The Fetch domain refused (an interception is somehow already armed
+        // on this pooled connection): a fresh connection does not carry it.
+        connection = open_connection(tab)?;
+        let _ = connection.call(
+            "Network.enable",
+            "{\"maxTotalBufferSize\":0,\"maxResourceBufferSize\":0}",
+        );
+        let _ = connection.call("Fetch.enable", &fetch_enable_params(&url_host(url)));
+    }
     // Every document response seen; the main document's is the one whose
     // request id is the navigation's loader id. Taking the first one was
     // wrong: a frame of the previous page still loading (DataDome's CAPTCHA
     // iframe answers 200) could arrive first and stand in for a 403.
-    let mut documents = Vec::new();
+    let documents = std::cell::RefCell::new(Vec::new());
     let mut see = |event: &str| {
         if let Some(d) = crate::scheduler::document_response(event) {
-            documents.push(d);
+            documents.borrow_mut().push(d);
         }
     };
-    let reply = connection.call_observed(
-        "Page.navigate",
-        &format!("{{\"url\":{}}}", json_string(url)),
-        &mut see,
-    );
+    // One interception event, answered as it is read: `send` never stops to
+    // read a reply, so the stream keeps flowing and no event is lost.
+    let answer = |text: &str, connection: &mut CdpConnection, auth_handled: &mut bool| {
+        if let Some(rid) = auth_required_id(text) {
+            connection.send(
+                "Fetch.continueWithAuth",
+                &continue_with_auth_params(&rid, &auth),
+            );
+            *auth_handled = true;
+        } else if let Some(rid) = paused_request_id(text) {
+            connection.send(
+                "Fetch.continueRequest",
+                &format!("{{\"requestId\":{}}}", json_string(&rid)),
+            );
+        }
+    };
+    let (reply, auth_handled) = if !auth_on {
+        (
+            connection.call_observed(
+                "Page.navigate",
+                &format!("{{\"url\":{}}}", json_string(url)),
+                &mut see,
+            ),
+            false,
+        )
+    } else {
+        // With interception armed, the challenge must be answered while the
+        // navigation is in flight: Chrome does not deliver the
+        // `Page.navigate` reply while the document request sits paused, so
+        // reading the reply first would starve it (five seconds, then
+        // EAGAIN). The navigation is sent unread instead, and this loop
+        // takes everything the stream offers — its reply as well as the
+        // interception events, each answered as it is read.
+        connection.send(
+            "Page.navigate",
+            &format!("{{\"url\":{}}}", json_string(url)),
+        );
+        let deadline = std::time::Instant::now() + AUTH_WINDOW;
+        let mut auth_handled = false;
+        let mut nav_reply: Option<String> = None;
+        let mut frame: Option<String> = None;
+        loop {
+            // Done: the reply is in and the document this navigation is for
+            // has landed — without a challenge, any response for its frame;
+            // with one, the response that followed the credentials (the
+            // pre-auth 401 shares the request id, so the last one is the
+            // real one).
+            let settled = match (&nav_reply, frame.as_deref()) {
+                (Some(_), Some(f)) => {
+                    match documents.borrow().iter().rev().find(|d| d.frame_id == f) {
+                        Some(d) => !auth_handled || d.status != 401,
+                        None => false,
+                    }
+                }
+                _ => false,
+            };
+            if settled {
+                break;
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            connection.set_read_timeout(left);
+            let Ok(text) = connection.next_message(MAX_CDP_MESSAGE) else {
+                break;
+            };
+            if message_id(&text).is_some() {
+                // The navigation's reply (the only command outstanding).
+                frame = json_string_value(&text, "frameId");
+                nav_reply = Some(text);
+                continue;
+            }
+            if let Some(d) = crate::scheduler::document_response(&text) {
+                documents.borrow_mut().push(d);
+            }
+            answer(&text, &mut connection, &mut auth_handled);
+        }
+        // A short grace: requests paused when the loop ended get continued
+        // before interception is torn down, so the settle wait that follows
+        // sees an unintercepted browser.
+        let grace = std::time::Instant::now() + Duration::from_millis(400);
+        loop {
+            let left = grace.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            connection.set_read_timeout(left);
+            let Ok(text) = connection.next_message(MAX_CDP_MESSAGE) else {
+                break;
+            };
+            if message_id(&text).is_some() {
+                if nav_reply.is_none() {
+                    nav_reply = Some(text);
+                }
+                continue;
+            }
+            answer(&text, &mut connection, &mut auth_handled);
+        }
+        // Interception is torn down once the document has settled: Chrome
+        // caches the credential it was handed for the realm, and answers the
+        // page's own `fetch()` calls with it from then on.
+        //
+        // Leaving it armed is what the first cut did, and it wedges pages: an
+        // intercepted request stays paused until a CDP client reads the event
+        // and answers it, and between commands nobody is reading the tab's
+        // connection. A page whose first request comes after the navigation
+        // (every SPA boot) then hangs until some later command happens to
+        // drain the stream. Verified against the live daemon: with the
+        // responder left armed, `fetch()` to a protected path never resolved
+        // while the daemon sat idle, and the pending request stayed paused
+        // across commands.
+        //
+        // A short late window still answers a challenge that lands just after
+        // the document — a redirect chain finishing, or a page whose very
+        // first request beats the credential cache — so the handshake that
+        // populates that cache is not lost by a hair.
+        let late = std::time::Instant::now() + AUTH_LATE_WINDOW;
+        loop {
+            let left = late.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            connection.set_read_timeout(left);
+            let Ok(text) = connection.next_message(MAX_CDP_MESSAGE) else {
+                break;
+            };
+            if message_id(&text).is_some() {
+                continue;
+            }
+            answer(&text, &mut connection, &mut auth_handled);
+        }
+        let _ = connection.call("Fetch.disable", "{}");
+        connection.set_read_timeout(CDP_HTTP_TIMEOUT);
+        // Hand the host to a responder of its own: from here the page's
+        // requests are answered even while no command is running (see
+        // [`AuthKeeper`]).
+        if let Some(pair) = auth.clone() {
+            start_auth_keeper(tab, &url_host(url), pair);
+        }
+        (
+            nav_reply.ok_or_else(|| "navigation did not answer within the auth window".to_string()),
+            auth_handled,
+        )
+    };
     if reply.is_ok() && enabled.is_ok() {
         // The response event can trail the reply by a hair; one round trip
         // drains what is already queued.
@@ -1550,9 +1749,10 @@ fn navigate_observed(
         checkin(tab, connection);
     }
     let reply = reply?;
+    let documents = documents.into_inner();
     let loader = json_string_value(&reply, "loaderId");
     let frame = json_string_value(&reply, "frameId");
-    let document = documents
+    let mut document = documents
         .iter()
         .find(|d| loader.as_deref() == Some(d.request_id.as_str()))
         .or_else(|| {
@@ -1561,7 +1761,99 @@ fn navigate_observed(
                 .find(|d| frame.as_deref() == Some(d.frame_id.as_str()))
         })
         .cloned();
-    Ok((reply, document))
+    if auth_handled {
+        // The challenge replays the request: the 401 and the response after
+        // the credentials share a request id, and the report — like the done
+        // condition above — must speak for the one that answered.
+        let replayed = documents
+            .iter()
+            .rev()
+            .find(|d| {
+                loader.as_deref() == Some(d.request_id.as_str())
+                    || frame.as_deref().is_some_and(|f| !f.is_empty())
+                        && frame.as_deref() == Some(d.frame_id.as_str())
+            })
+            .cloned();
+        if let Some(replayed) = replayed {
+            document = Some(replayed);
+        }
+    }
+    Ok((reply, document, auth_handled))
+}
+
+/// How long a navigation may keep answering auth challenges and continuing
+/// intercepted requests before the page is handed back to the normal settle
+/// wait (which then reports `settled:false` if it is still coming).
+const AUTH_WINDOW: Duration = Duration::from_secs(20);
+
+/// How long after the document settles a challenge may still arrive and be
+/// answered before interception is torn down: a redirect chain finishing, or
+/// a page whose first request beats the credential cache. Keeping
+/// interception on past this point is what wedges an idle page (see the
+/// comment in `navigate_observed`).
+const AUTH_LATE_WINDOW: Duration = Duration::from_millis(250);
+
+/// `Fetch.authRequired`: the request id of an HTTP auth challenge.
+fn auth_required_id(event: &str) -> Option<String> {
+    if !event.contains("\"Fetch.authRequired\"") {
+        return None;
+    }
+    json_string_value(event, "requestId")
+}
+
+/// `Fetch.requestPaused`: the request id of an intercepted request.
+fn paused_request_id(event: &str) -> Option<String> {
+    if !event.contains("\"Fetch.requestPaused\"") {
+        return None;
+    }
+    json_string_value(event, "requestId")
+}
+
+/// `Fetch.enable` scoped to one host: only its URLs (and subdomains') are
+/// intercepted, so the rest of the page's origins load untouched. Auth
+/// challenges are reported for those requests too.
+fn fetch_enable_params(host: &str) -> String {
+    let mut patterns = Vec::new();
+    for scheme in ["http", "https"] {
+        // A pattern without an explicit port only matches the scheme's
+        // default port (URLPattern semantics — `http://host/*` never sees
+        // `host:8893/`), so each host gets a bare and a `:*` pattern.
+        for host_part in [host.to_string(), format!("*.{host}")] {
+            for port in ["", ":*"] {
+                patterns.push(format!(
+                    "{{\"urlPattern\":{}}}",
+                    json_string(&format!("{scheme}://{host_part}{port}/*"))
+                ));
+            }
+        }
+    }
+    format!(
+        "{{\"handleAuthRequests\":true,\"patterns\":[{}]}}",
+        patterns.join(",")
+    )
+}
+
+/// The `Fetch.continueWithAuth` answer to a challenge: the vault's pair when
+/// there is one, a silent cancel otherwise (headless has no dialog to offer,
+/// and `Default` would leave the page waiting for exactly that). The answer
+/// rides in `authChallengeResponse` — the flat spelling this protocol once
+/// used is refused by current Chrome with a deserialisation error.
+fn continue_with_auth_params(request_id: &str, auth: &Option<(String, String)>) -> String {
+    let (response, extra) = match auth {
+        Some((user, password)) => (
+            "ProvideCredentials",
+            format!(
+                ",\"username\":{},\"password\":{}",
+                json_string(user),
+                json_string(password)
+            ),
+        ),
+        None => ("CancelAuth", String::new()),
+    };
+    format!(
+        "{{\"requestId\":{},\"authChallengeResponse\":{{\"response\":\"{response}\"{extra}}}}}",
+        json_string(request_id)
+    )
 }
 
 /// A one-action batch from a `/v1/click` or `/v1/type` body.
@@ -1631,6 +1923,11 @@ pub fn tabs_json(cdp_port: u16) -> Result<String, String> {
 
 /// Close a tab by id. The last page is refused: Chromium exits with it.
 pub fn close_tab(cdp_port: u16, id: &str) -> Result<(), String> {
+    // The tab's background auth responder goes with it.
+    stop_auth_keeper(&Tab {
+        cdp_port,
+        target: Some(id.to_string()),
+    });
     let discovery = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")?;
     // Every page target counts here, context tabs included: any of them keeps
     // Chromium alive, and a context's tab may be closed directly (the context
@@ -3488,9 +3785,48 @@ impl CdpConnection {
         Ok(clean)
     }
 
+    /// Fire one command without reading for its reply: the reply comes back
+    /// through the event loop that is calling us. Answering interception
+    /// events this way never stops reading the stream — a command read for
+    /// inline would swallow the events arriving while it waited, and a
+    /// request paused for ever is a page hung for ever.
+    pub(crate) fn send(&mut self, method: &str, params: &str) {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        let message = format!("{{\"id\":{id},\"method\":\"{method}\",\"params\":{params}}}");
+        let _ = self
+            .stream
+            .write_all(&encode_client_frame(message.as_bytes()));
+    }
+
     fn next_message(&mut self, limit: usize) -> Result<String, String> {
-        let payload = read_frame(&mut self.stream, limit)?;
+        let payload = read_frame(&mut self.stream, limit).map_err(|e| e.to_string())?;
         String::from_utf8(payload).map_err(|e| e.to_string())
+    }
+
+    /// Like [`Self::next_message`], but a read that timed out is `Ok(None)`
+    /// instead of an error: the background auth responder polls the stream
+    /// between answers and must tell "nothing to answer yet" from "this
+    /// connection is gone, stop".
+    fn next_message_optional(&mut self, limit: usize) -> Result<Option<String>, String> {
+        match read_frame(&mut self.stream, limit) {
+            Ok(payload) => String::from_utf8(payload)
+                .map(Some)
+                .map_err(|e| e.to_string()),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// How long the next read may wait: the auth window pumps the stream
+    /// directly and bounds each read by the time it has left.
+    pub(crate) fn set_read_timeout(&self, timeout: Duration) {
+        let _ = self.stream.set_read_timeout(Some(timeout));
     }
 }
 
@@ -3544,6 +3880,132 @@ pub fn checkin(tab: &Tab, connection: CdpConnection) {
     let pool = cdp_pool(tab);
     let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
     guard.put(connection);
+}
+
+/// How long the auth responder's read waits before it looks at its stop flag
+/// again.
+const AUTH_KEEPER_POLL: Duration = Duration::from_millis(500);
+
+/// One tab's background basic-auth responder.
+///
+/// Why it exists: a credential handed to the browser through
+/// `Fetch.continueWithAuth` is **not** reliably put in Chrome's HTTP auth
+/// cache. Measured on this machine against a real nginx-fronted origin over
+/// TLS: the realm was challenged again for the page's very next request.
+/// With the cache empty and no dialog in headless, that request then waits
+/// for ever. Answering every challenge means somebody has to be reading the
+/// tab's event stream at all times, which a task-driven agent cannot promise:
+/// between its commands nobody is reading, and a paused request only arrives
+/// when somebody is.
+///
+/// So the tab gets a reader of its own — a dedicated DevTools connection with
+/// `Fetch` armed for the credentialled host, answering challenges with the
+/// vault pair and continuing every other intercepted request. Its own
+/// connection keeps the pool free for commands, and a connection that dies
+/// (tab closed, browser restarted) takes its interception with it.
+struct AuthKeeper {
+    host: String,
+    pair: (String, String),
+    stop: Arc<AtomicBool>,
+    /// Set once the thread has let the interception go: whoever arms `Fetch`
+    /// next must not race a responder still holding it.
+    done: Arc<AtomicBool>,
+}
+
+fn auth_keepers() -> &'static Mutex<HashMap<String, Arc<AuthKeeper>>> {
+    static KEEPERS: OnceLock<Mutex<HashMap<String, Arc<AuthKeeper>>>> = OnceLock::new();
+    KEEPERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The key a tab's keeper is filed under.
+fn keeper_key(tab: &Tab) -> String {
+    tab.target
+        .clone()
+        .unwrap_or_else(|| format!("default:{}", tab.cdp_port))
+}
+
+/// Stop a tab's keeper, waiting (bounded) for it to give the interception
+/// back, so a navigation's own `Fetch.enable` is never a second interceptor
+/// on the same host.
+fn stop_auth_keeper(tab: &Tab) {
+    let key = keeper_key(tab);
+    let Some(keeper) = auth_keepers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key)
+    else {
+        return;
+    };
+    keeper.stop.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !keeper.done.load(Ordering::SeqCst) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Arm (or re-arm) the tab's responder for `host` with `pair`. A keeper
+/// already running for the tab is stopped first, so re-navigating to the same
+/// host replaces its credentials instead of racing them.
+fn start_auth_keeper(tab: &Tab, host: &str, pair: (String, String)) {
+    if host.is_empty() {
+        return;
+    }
+    stop_auth_keeper(tab);
+    let keeper = Arc::new(AuthKeeper {
+        host: host.to_string(),
+        pair,
+        stop: Arc::new(AtomicBool::new(false)),
+        done: Arc::new(AtomicBool::new(false)),
+    });
+    auth_keepers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(keeper_key(tab), Arc::clone(&keeper));
+    let tab = tab.clone();
+    thread::spawn(move || {
+        let mut connection = match CdpConnection::open(&tab) {
+            Ok(connection) => connection,
+            Err(_) => {
+                keeper.done.store(true, Ordering::SeqCst);
+                return;
+            }
+        };
+        if connection
+            .call("Fetch.enable", &fetch_enable_params(&keeper.host))
+            .is_err()
+        {
+            // Something else already answers for this host; leave it be.
+            keeper.done.store(true, Ordering::SeqCst);
+            return;
+        }
+        while !keeper.stop.load(Ordering::SeqCst) {
+            connection.set_read_timeout(AUTH_KEEPER_POLL);
+            match connection.next_message_optional(MAX_CDP_MESSAGE) {
+                Ok(Some(text)) => {
+                    if message_id(&text).is_some() {
+                        continue;
+                    }
+                    if let Some(rid) = auth_required_id(&text) {
+                        connection.send(
+                            "Fetch.continueWithAuth",
+                            &continue_with_auth_params(&rid, &Some(keeper.pair.clone())),
+                        );
+                    } else if let Some(rid) = paused_request_id(&text) {
+                        connection.send(
+                            "Fetch.continueRequest",
+                            &format!("{{\"requestId\":{}}}", json_string(&rid)),
+                        );
+                    }
+                }
+                // Nothing to answer yet.
+                Ok(None) => continue,
+                // The stream is gone: the interception dies with it.
+                Err(_) => break,
+            }
+        }
+        let _ = connection.call("Fetch.disable", "{}");
+        keeper.done.store(true, Ordering::SeqCst);
+    });
 }
 
 /// The string a `Runtime.evaluate` with `returnByValue` produced.
@@ -3701,26 +4163,26 @@ pub const SETTLE_MAX: Duration = Duration::from_millis(3000);
 /// forms used to be handled, so `Page.captureScreenshot` failed with
 /// "CDP response is too large". Payloads are also read to their full announced
 /// length, which a single `read()` does not guarantee.
-fn read_frame(stream: &mut TcpStream, limit: usize) -> Result<Vec<u8>, String> {
+fn read_frame(stream: &mut TcpStream, limit: usize) -> std::io::Result<Vec<u8>> {
     let mut head = [0; 2];
-    stream.read_exact(&mut head).map_err(|e| e.to_string())?;
+    stream.read_exact(&mut head)?;
     let opcode = head[0] & 0x0f;
     let mut len = (head[1] & 0x7f) as usize;
     if len == 126 {
         let mut b = [0; 2];
-        stream.read_exact(&mut b).map_err(|e| e.to_string())?;
+        stream.read_exact(&mut b)?;
         len = u16::from_be_bytes(b) as usize;
     } else if len == 127 {
         let mut b = [0; 8];
-        stream.read_exact(&mut b).map_err(|e| e.to_string())?;
+        stream.read_exact(&mut b)?;
         len = usize::try_from(u64::from_be_bytes(b))
-            .map_err(|_| "CDP response is too large".to_string())?;
+            .map_err(|_| std::io::Error::other("CDP response is too large"))?;
     }
     if len > limit {
-        return Err("CDP response is too large".into());
+        return Err(std::io::Error::other("CDP response is too large"));
     }
     let mut payload = vec![0; len];
-    stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
+    stream.read_exact(&mut payload)?;
     // Text frames carry the JSON; anything else (ping/close/pong) is not an
     // answer, so read the next frame instead of parsing it as a response.
     match opcode {
@@ -4030,6 +4492,25 @@ fn vault_route(
                 Some("cu_vault_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0".into()),
             )
         }
+        ("GET", "/v1/vault/ui/state") => {
+            // The login page reads this before any session exists: whether a
+            // master password is set decides first-run (repeat field) vs
+            // plain login. Nothing secret in the answer.
+            match crate::vault::Vault::open(&state.data_dir) {
+                Ok(v) => (
+                    "200 OK",
+                    "application/json",
+                    format!("{{\"has_password\":{}}}", v.has_password()),
+                    None,
+                ),
+                Err(e) => (
+                    "500 Internal Server Error",
+                    "application/json",
+                    format!("{{\"error\":{}}}", json_string(&e)),
+                    None,
+                ),
+            }
+        }
         _ => {
             let live = crate::vault::ui_session_valid(
                 cookie.and_then(crate::vault::cookie_token).as_deref(),
@@ -4071,11 +4552,8 @@ fn vault_api(
     };
     let path_only = path.split('?').next().unwrap_or(path);
     match (method, path_only) {
-        ("GET", "/v1/vault/ui/state") => (
-            "200 OK",
-            "application/json",
-            format!("{{\"has_password\":{}}}", vault.has_password()),
-        ),
+        // `/v1/vault/ui/state` is answered in `vault_route`: the login page
+        // reads it before any session exists.
         ("GET", "/v1/vault/status") => {
             let sessions = vault.list_sessions().unwrap_or_default();
             let credentials = vault.list_credentials("").unwrap_or_default();
@@ -4213,6 +4691,99 @@ fn vault_api(
             let new = json_value(body, "new").unwrap_or_default();
             match vault.set_password((!old.is_empty()).then_some(old.as_str()), &new) {
                 Ok(()) => ("200 OK", "application/json", "{\"ok\":true}".into()),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("GET", "/v1/vault/requests") => {
+            let status = form_value(query(path), "status");
+            match vault.list_requests((!status.is_empty()).then_some(status.as_str())) {
+                Ok(body) => ("200 OK", "application/json", body),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("POST", "/v1/vault/requests") => {
+            // An agent asks for a secret: the request records who is asking
+            // and why, and reveals nothing until a person approves it in the
+            // vault UI (or denies it, or lets it expire).
+            let field = |k: &str| json_value(body, k).unwrap_or_default();
+            let domain = field("domain");
+            if domain.is_empty() {
+                return error_json("domain is required");
+            }
+            match vault.create_request(&domain, &field("reason"), &field("requested_by")) {
+                Ok(id) => (
+                    "200 OK",
+                    "application/json",
+                    format!("{{\"id\":{id},\"status\":\"pending\"}}"),
+                ),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("GET", p) if p.starts_with("/v1/vault/requests/") => {
+            let tail = &p["/v1/vault/requests/".len()..];
+            let Ok(id) = tail.parse::<i64>() else {
+                return error_json("request id must be a number");
+            };
+            match vault.get_request(id) {
+                // An approved request carries the credential with its
+                // values — the payoff the flow exists for. Pending, denied
+                // and expired requests carry none.
+                Ok(Some(body)) => ("200 OK", "application/json", body),
+                Ok(None) => error_json("no such request"),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("POST", p) if p.starts_with("/v1/vault/requests/") => {
+            // Reached only with a live UI session (see `is_vault_ui_only`):
+            // this is the person's decision, never the asking agent's.
+            let tail = &p["/v1/vault/requests/".len()..];
+            let (id_part, action) = match tail.rsplit_once('/') {
+                Some((id, action)) => (id, action),
+                None => return error_json("POST /v1/vault/requests/{id}/approve|deny"),
+            };
+            let Ok(id) = id_part.parse::<i64>() else {
+                return error_json("request id must be a number");
+            };
+            let approve = match action {
+                "approve" => true,
+                "deny" => false,
+                _ => return error_json("POST /v1/vault/requests/{id}/approve|deny"),
+            };
+            // Approval links a credential: the one the UI names, or — when it
+            // names none — the only credential the vault holds for the
+            // requested domain, so the common case is one click.
+            let credential_id =
+                json_value(body, "credential_id").and_then(|v| v.parse::<i64>().ok());
+            let credential_id = if approve && credential_id.is_none() {
+                let domain = vault
+                    .get_request(id)
+                    .ok()
+                    .flatten()
+                    .and_then(|r| json_string_value(&r, "domain"))
+                    .unwrap_or_default();
+                let options = vault.credentials_for_domain(&domain).unwrap_or_default();
+                match options.len() {
+                    1 => Some(options[0].0),
+                    0 => return error_json("no credential for this domain to approve with"),
+                    _ => {
+                        return error_json(
+                            "several credentials cover this domain; pass credential_id",
+                        );
+                    }
+                }
+            } else {
+                credential_id
+            };
+            match vault.decide_request(id, approve, credential_id) {
+                Ok(true) => (
+                    "200 OK",
+                    "application/json",
+                    format!(
+                        "{{\"id\":{id},\"status\":\"{}\"}}",
+                        if approve { "approved" } else { "denied" }
+                    ),
+                ),
+                Ok(false) => error_json("no such request"),
                 Err(e) => error_json(&e),
             }
         }
@@ -4355,16 +4926,30 @@ fn navigate_with_vault(
     tab: &Tab,
     url: &str,
     inject: bool,
+    auth_enabled: bool,
 ) -> (&'static str, &'static str, String) {
     let host = url_host(url);
     let vault = crate::vault::Vault::open(&state.data_dir).ok();
     let (mut injected, mut session_hint, mut credentials) = (false, "none", 0usize);
     let mut local_storage = String::new();
+    // The basic-auth pair the vault holds for this host, if the caller did
+    // not turn the responder off: handed to the navigation, which answers an
+    // HTTP auth challenge with it instead of leaving the headless browser on
+    // a dialog it cannot see.
+    let mut auth = None;
     if let Some(vault) = vault.as_ref()
         && !host.is_empty()
     {
         let session = vault.get_session(&host).ok().flatten();
         credentials = vault.count_credentials(&host);
+        if auth_enabled {
+            for (_id, _domain, fields) in vault.credentials_for_domain(&host).unwrap_or_default() {
+                if let Some(pair) = crate::vault::basic_auth_pair(&fields) {
+                    auth = Some(pair);
+                    break;
+                }
+            }
+        }
         if let Some(session) = session {
             session_hint = "saved";
             local_storage = session.local_storage.clone();
@@ -4378,7 +4963,7 @@ fn navigate_with_vault(
             }
         }
     }
-    let (status, kind, mut body) = navigate_scheduled(tab, url);
+    let (status, kind, mut body) = navigate_scheduled(tab, url, auth);
     if injected && !local_storage.is_empty() && local_storage != "{}" {
         // localStorage is origin-bound JavaScript state: write it on the
         // loaded page, then reload once so the site boots with it.
@@ -4517,6 +5102,61 @@ mod tests {
         assert_eq!(find(b"abc\r\n\r\nxyz", b"\r\n\r\n"), Some(3));
         assert_eq!(find(b"abc", b"\r\n\r\n"), None);
         assert_eq!(find(b"", b"\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn vault_ui_only_paths_are_the_decisions() {
+        assert!(is_vault_ui_only("/v1/vault/requests/7/approve"));
+        assert!(is_vault_ui_only("/v1/vault/requests/7/deny"));
+        assert!(!is_vault_ui_only("/v1/vault/requests/7"));
+        assert!(!is_vault_ui_only("/v1/vault/requests"));
+        assert!(!is_vault_ui_only("/v1/vault/credentials"));
+    }
+
+    #[test]
+    fn fetch_enable_is_scoped_to_the_host() {
+        let params = fetch_enable_params("example.com");
+        assert!(params.contains("\"handleAuthRequests\":true"));
+        // Bare patterns hit default-port URLs; `:*` wildcards the rest.
+        assert!(params.contains("\"https://example.com/*\""));
+        assert!(params.contains("\"https://example.com:*/*\""));
+        assert!(params.contains("\"https://*.example.com/*\""));
+        assert!(params.contains("\"https://*.example.com:*/*\""));
+        assert!(params.contains("\"http://example.com:*/*\""));
+        assert!(!params.contains("other.com"));
+    }
+
+    #[test]
+    fn auth_challenge_answers_carry_the_pair_or_cancel() {
+        let auth = Some(("jaime".into(), "p@ss\"word".into()));
+        let params = continue_with_auth_params("42", &auth);
+        // Current Chrome wants the answer nested in `authChallengeResponse`.
+        assert!(params.contains("\"authChallengeResponse\":{\"response\":\"ProvideCredentials\""));
+        assert!(params.contains("\"requestId\":\"42\""));
+        // The pair is JSON-escaped: a quote in a password must survive.
+        assert!(params.contains("\"p@ss\\\"word\""));
+        assert_eq!(
+            continue_with_auth_params("42", &None),
+            "{\"requestId\":\"42\",\"authChallengeResponse\":{\"response\":\"CancelAuth\"}}"
+        );
+    }
+
+    #[test]
+    fn interception_events_are_told_apart() {
+        let challenge = r#"{"method":"Fetch.authRequired","params":{"requestId":"interception-job-1.0","request":{"url":"https://example.com/"}},"sessionId":"s"}"#;
+        let paused = r#"{"method":"Fetch.requestPaused","params":{"requestId":"interception-job-2.0","request":{"url":"https://example.com/x.css"}}}"#;
+        let network = r#"{"method":"Network.responseReceived","params":{"requestId":"abc"}}"#;
+        assert_eq!(
+            auth_required_id(challenge).as_deref(),
+            Some("interception-job-1.0")
+        );
+        assert_eq!(auth_required_id(paused), None);
+        assert_eq!(
+            paused_request_id(paused).as_deref(),
+            Some("interception-job-2.0")
+        );
+        assert_eq!(paused_request_id(challenge), None);
+        assert_eq!(auth_required_id(network), None);
     }
 }
 

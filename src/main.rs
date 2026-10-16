@@ -217,7 +217,7 @@ fn main() {
 }
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n\nPage commands take --tab ID to run in another tab (see `cu tabs`). to run in another tab (see `cu tabs`)."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n\nPage commands take --tab ID to run in another tab (see `cu tabs`). to run in another tab (see `cu tabs`)."
     );
 }
 
@@ -828,7 +828,7 @@ fn free_port_from(from: u16) -> u16 {
 
 /// `cu vault`: the credential and session store, from the CLI.
 fn vault(args: &[String], tab: Option<String>) -> Result<(), String> {
-    let usage = "usage: cu vault status | sessions | session save [--tab ID] [DOMAIN] | session forget DOMAIN | creds [QUERY] | cred get ID | cred rm ID | cred add DOMAIN LABEL (fields JSON on stdin) | passwd";
+    let usage = "usage: cu vault status | sessions | session save [--tab ID] [DOMAIN] | session forget DOMAIN | creds [QUERY] | cred get ID | cred rm ID | cred add DOMAIN LABEL (fields JSON on stdin) | passwd | request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S] | requests [STATUS]";
     let action = args.first().ok_or(usage)?;
     match action.as_str() {
         "status" => request("GET", "/v1/vault/status", None).map(|s| println!("{s}")),
@@ -906,6 +906,88 @@ fn vault(args: &[String], tab: Option<String>) -> Result<(), String> {
             }
             _ => Err("usage: cu vault cred get ID | rm ID | add DOMAIN LABEL".into()),
         },
+        "requests" => {
+            let status = args.get(1).map(|s| format!("?status={}", url_encode(s)));
+            let path = match status {
+                Some(q) => format!("/v1/vault/requests{q}"),
+                None => "/v1/vault/requests".to_string(),
+            };
+            request("GET", &path, None).map(|s| println!("{s}"))
+        }
+        "request" => {
+            let domain = args
+                .get(1)
+                .filter(|a| !a.starts_with("--"))
+                .ok_or("usage: cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]")?;
+            let mut reason = String::new();
+            let mut from = String::new();
+            let mut wait = false;
+            let mut timeout = 600.0f64;
+            let mut rest = &args[2..];
+            while let [flag, value, tail @ ..] = rest {
+                match flag.as_str() {
+                    "--reason" => {
+                        reason = value.clone();
+                        rest = tail;
+                    }
+                    "--from" => {
+                        from = value.clone();
+                        rest = tail;
+                    }
+                    "--timeout" => {
+                        timeout = value.parse().map_err(|_| "--timeout takes seconds")?;
+                        rest = tail;
+                    }
+                    _ => break,
+                }
+            }
+            if rest.first().map(String::as_str) == Some("--wait") {
+                wait = true;
+            }
+            let created = request(
+                "POST",
+                "/v1/vault/requests",
+                Some(&format!(
+                    "{{\"domain\":{},\"reason\":{},\"requested_by\":{}}}",
+                    server::json_string(domain),
+                    server::json_string(&reason),
+                    server::json_string(&from)
+                )),
+            )?;
+            let id = server::json_value(&created, "id")
+                .and_then(|v| v.parse::<i64>().ok())
+                .ok_or("daemon did not return a request id")?;
+            println!("{created}");
+            if !wait {
+                return Ok(());
+            }
+            // Poll until a person decides (or the request expires): what
+            // comes back on approval is the credential with its values —
+            // the only path a secret ever takes to an agent.
+            let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout);
+            loop {
+                if std::time::Instant::now() > deadline {
+                    return Err(format!("request {id} is still pending after {timeout:.0}s"));
+                }
+                thread::sleep(Duration::from_secs(2));
+                let body = request("GET", &format!("/v1/vault/requests/{id}"), None)?;
+                match server::json_string_value(&body, "status")
+                    .unwrap_or_default()
+                    .as_str()
+                {
+                    "approved" => {
+                        println!("{body}");
+                        return Ok(());
+                    }
+                    "denied" | "expired" => {
+                        println!("{body}");
+                        let status = server::json_string_value(&body, "status").unwrap_or_default();
+                        return Err(format!("request {id} was {status}"));
+                    }
+                    _ => continue,
+                }
+            }
+        }
         "passwd" => {
             eprint!("new master password: ");
             let mut new = String::new();
