@@ -125,6 +125,17 @@
   its connection dies. A navigation arms its own interception only after that
   responder has let go.
 
+  Covered by integration tests against a fake CDP `Fetch` peer
+  (`tests/fake_chromium.py`, `tests/server_integration.rs`): the challenge a
+  navigation meets is answered with the vault's pair, a challenge that lands
+  after the document has settled is answered by the responder with no command
+  in between, a host with no credential and `"auth":false` arm nothing, and
+  closing a tab gives its interception back. The responders are filed under
+  their tab *and* browser (`keeper_key`), the way the connection pool beside
+  them is: target ids are per browser while the map is per process, so two
+  browsers in one process used to share a `PAGE1` responder, and whichever
+  navigated second stopped the other's.
+
 - Agent secret requests (`src/vault.rs`, `src/main.rs`, `src/vault_app.html`):
   `cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait]` asks for a
   credential by API; the request sits pending in the vault (15-minute TTL),

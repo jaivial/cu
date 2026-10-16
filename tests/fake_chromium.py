@@ -8,8 +8,10 @@ without launching a real browser. Both run on a single port, like Chromium's
 """
 import base64
 import hashlib
+import itertools
 import json
 import os
+import socket
 import struct
 import sys
 import threading
@@ -27,6 +29,23 @@ CLOSED_MARKER = os.environ.get("FAKE_CHROMIUM_CLOSED")
 INPUT_LOG = []
 # Tabs opened in browser contexts: target id -> context id.
 CONTEXT_TABS = {}
+# --- CDP `Fetch`: the domain a basic-auth responder lives in ------------
+# Every `Fetch.*` command the daemon sent, in order, with the connection it
+# arrived on and the hosts it covers, served at /fetch-log. A test reads it to
+# see what was armed, answered and released.
+FETCH_LOG = []
+# A `Fetch.enable` that armed a host another live connection already had
+# armed. Two interceptors on one host is the state the responder must never
+# reach, so the fake counts it rather than modelling it as harmless.
+DOUBLE_ARMED = []
+# The open CDP websockets, so a test can push a challenge into the connection
+# the responder holds: a challenge that arrives with no command in between is
+# the whole reason that responder exists.
+SESSIONS = []
+SESSION_IDS = itertools.count(1)
+SESSION_LOCK = threading.Lock()
+# Request ids the fake hands out to challenges it pushes itself.
+REQUEST_IDS = itertools.count(1)
 # Targets closed with Target.closeTarget: gone from discovery, like Chromium.
 CLOSED = set()
 # Every Browser.setDownloadBehavior call, as the params it arrived with, so a
@@ -79,6 +98,165 @@ FAKE_SNAPSHOT = json.dumps(
 )
 
 
+def host_of(url):
+    """The host of a URL, without scheme, userinfo, port or path."""
+    rest = url.split("://", 1)[-1]
+    rest = rest.split("/", 1)[0]
+    return rest.rsplit("@", 1)[-1].rsplit(":", 1)[0].lower()
+
+
+def pattern_host(pattern):
+    """The host an `Fetch.enable` `urlPattern` covers, and whether it was a
+    `*.` wildcard (which covers subdomains too)."""
+    rest = pattern.split("://", 1)[-1]
+    host = rest.split("/", 1)[0]
+    if host.startswith("*."):
+        return host[2:].rsplit(":", 1)[0].lower(), True
+    return host.rsplit(":", 1)[0].lower(), False
+
+
+class Session:
+    """One CDP websocket, with the `Fetch` interception it has armed.
+
+    Two threads write to this socket: the connection's own read loop, which
+    answers commands, and whichever HTTP request a test fires to push a
+    challenge in -- so writes are serialised.
+    """
+
+    def __init__(self, sock, path):
+        self.id = next(SESSION_IDS)
+        self.sock = sock
+        self.path = path
+        self.lock = threading.Lock()
+        # The hosts this connection intercepts, and its `*.` wildcards.
+        self.hosts = set()
+        self.wilds = set()
+        # A navigation whose reply is held until its challenge is answered:
+        # Chromium does not answer `Page.navigate` while the document request
+        # sits paused waiting for credentials.
+        self.pending_nav = None  # type: dict | None
+        self.dead = False
+
+    def covers(self, host):
+        return host in self.hosts or any(host.endswith("." + w) for w in self.wilds)
+
+    def arm(self, hosts, wilds):
+        """Arm this connection, recording any host another live connection
+        already had armed -- two interceptors over one host."""
+        overlap = set()
+        with SESSION_LOCK:
+            for other in SESSIONS:
+                if other is self or other.dead or not (other.hosts | other.wilds):
+                    continue
+                overlap |= (hosts & other.hosts) | (hosts & other.wilds) | (wilds & other.hosts)
+            self.hosts |= hosts
+            self.wilds |= wilds
+        if overlap:
+            DOUBLE_ARMED.append(
+                {
+                    "session": self.id,
+                    "hosts": sorted(overlap),
+                    "with": sorted(
+                        s["id"]
+                        for s in SESSIONS
+                        if s is not self
+                        and not s.dead
+                        and (s.hosts | s.wilds) & overlap
+                    ),
+                }
+            )
+
+    def disarm(self):
+        self.hosts = set()
+        self.wilds = set()
+        self.pending_nav = None
+
+    def close(self):
+        """The target went away: Chromium drops the socket, and anything
+        reading it sees the stream end."""
+        with self.lock:
+            self.dead = True
+            self.hosts = set()
+            self.wilds = set()
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def frame(self, obj):
+        payload = json.dumps(obj, separators=(",", ":")).encode()
+        out = bytearray([0x81])
+        if len(payload) < 126:
+            out.append(len(payload))
+        elif len(payload) < 1 << 16:
+            out.append(126)
+            out += len(payload).to_bytes(2, "big")
+        else:
+            # Chromium answers a screenshot with a 64-bit length frame.
+            out.append(127)
+            out += len(payload).to_bytes(8, "big")
+        out += payload
+        with self.lock:
+            if self.dead:
+                return
+            try:
+                self.sock.sendall(bytes(out))
+            except OSError:
+                # The daemon dropped the connection: its interception died
+                # with it, and no challenge can be pushed in any more.
+                self.dead = True
+
+    def event(self, method, params):
+        self.frame({"method": method, "params": params})
+
+    def reply(self, message_id, result):
+        self.frame({"id": message_id, "result": result})
+
+    def document(self, request_id, url, status, frame="f"):
+        """`Network.responseReceived` for the main document: what the daemon
+        reads the navigation's status out of."""
+        self.event(
+            "Network.responseReceived",
+            {
+                "requestId": request_id,
+                "frameId": frame,
+                "loaderId": request_id,
+                "type": "Document",
+                "response": {
+                    "url": url,
+                    "status": status,
+                    "statusText": "",
+                    "headers": {"content-type": "text/html"},
+                },
+            },
+        )
+
+    def challenge(self, request_id, url, request_paused=True, document_status=401):
+        """What a host behind basic auth does to an intercepted request: it
+        pauses, answers 401 with `WWW-Authenticate`, and waits for
+        credentials."""
+        if request_paused:
+            self.event(
+                "Fetch.requestPaused",
+                {"requestId": request_id, "frameId": "f", "request": {"url": url}},
+            )
+        if document_status:
+            self.document(request_id, url, document_status)
+        self.event(
+            "Fetch.authRequired",
+            {
+                "requestId": request_id,
+                "frameId": "f",
+                "request": {"url": url},
+                "authChallenge": {
+                    "source": "Server",
+                    "origin": "http://%s" % host_of(url),
+                    "realm": "fake",
+                },
+            },
+        )
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -92,6 +270,29 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(INPUT_LOG)
         elif self.path == "/download-behaviour":
             self.send_json(DOWNLOAD_BEHAVIOUR)
+        elif self.path == "/fetch-log":
+            # Every `Fetch.*` command the daemon sent, in order.
+            self.send_json(FETCH_LOG)
+        elif self.path == "/fetch-overlaps":
+            # A `Fetch.enable` that landed while another live connection had
+            # the same host armed: two interceptors over one host.
+            self.send_json(DOUBLE_ARMED)
+        elif self.path == "/fetch-armed":
+            # Which connections are intercepting what, right now.
+            with SESSION_LOCK:
+                self.send_json(
+                    [
+                        {
+                            "session": s.id,
+                            "hosts": sorted(s.hosts),
+                            "wildcards": sorted(s.wilds),
+                        }
+                        for s in SESSIONS
+                        if not s.dead and (s.hosts or s.wilds)
+                    ]
+                )
+        elif self.path.startswith("/challenge?"):
+            self.send_json(self.challenge_now())
         elif self.path == "/json/version":
             self.send_json(
                 {
@@ -103,6 +304,25 @@ class Handler(BaseHTTPRequestHandler):
             self.serve_websocket()
         else:
             self.send_empty(404)
+
+    def challenge_now(self):
+        """Push a challenge to whoever is intercepting `host`, the way a page's
+        own request does once the document has settled: no command from the
+        daemon in between, so only a background responder can answer it.
+
+        `?host=` picks the host (required), `?request=` names the request id
+        (default: a counter) and `?paused=0` leaves out `Fetch.requestPaused`.
+        """
+        query = self.path.split("?", 1)[1]
+        args = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
+        host = (args.get("host") or "").lower()
+        request_id = args.get("request") or "late-%d" % next(REQUEST_IDS)
+        paused = args.get("paused", "1") != "0"
+        with SESSION_LOCK:
+            targets = [s for s in SESSIONS if not s.dead and s.covers(host)]
+        for session in targets:
+            session.challenge(request_id, "https://%s/late" % host, paused)
+        return {"host": host, "request": request_id, "challenged": len(targets)}
 
     def send_discovery(self):
         # Chromium pretty-prints this list and puts non-page targets (extension
@@ -161,22 +381,47 @@ class Handler(BaseHTTPRequestHandler):
     def serve_websocket(self):
         if not self.handshake():
             return
-        while True:
-            frame = self.read_frame()
-            if frame is None:
-                break
-            try:
-                message = json.loads(frame.decode())
-            except ValueError:
-                break
-            method = message.get("method", "")
-            reply = self.result_for(method, message.get("params"))
-            reply["id"] = message.get("id", 1)
-            self.reply(reply)
-            if method == "Browser.close":
-                if CLOSED_MARKER:
-                    open(CLOSED_MARKER, "w").write("closed\n")
-                os._exit(0)
+        # One `Session` per websocket: it is what holds this connection's
+        # `Fetch` interception, and a test pushes challenges into it by host.
+        session = Session(self.connection, self.path)
+        self.session = session
+        with SESSION_LOCK:
+            SESSIONS.append(session)
+        try:
+            while True:
+                frame = self.read_frame()
+                if frame is None:
+                    break
+                try:
+                    message = json.loads(frame.decode())
+                except ValueError:
+                    break
+                method = message.get("method", "")
+                self.after = []
+                reply = self.result_for(method, message.get("params"), message.get("id", 1))
+                # `None` means the reply is held back: an intercepted
+                # navigation is not answered while its document request sits
+                # paused waiting for credentials.
+                if reply is not None:
+                    reply["id"] = message.get("id", 1)
+                    self.reply(reply)
+                # What the command provoked goes out after its own reply, the
+                # way a browser orders it. It matters here: the daemon reads
+                # the last `id`-bearing message as the navigation's reply, so
+                # a navigation answered late must be the last thing written.
+                for extra in self.after:
+                    self.session.frame(extra)
+                self.after = []
+                if method == "Browser.close":
+                    if CLOSED_MARKER:
+                        open(CLOSED_MARKER, "w").write("closed\n")
+                    os._exit(0)
+        finally:
+            session.dead = True
+            session.disarm()
+            with SESSION_LOCK:
+                if session in SESSIONS:
+                    SESSIONS.remove(session)
 
     def handshake(self):
         key = (self.headers.get("Sec-WebSocket-Key") or "").strip()
@@ -222,8 +467,11 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return bytes(data[i] ^ mask[i % 4] for i in range(length))
 
-    @staticmethod
-    def result_for(method, params=None):
+    def result_for(self, method, params=None, message_id=1):
+        # `Fetch` first: an interception armed on this connection changes what
+        # a navigation to a covered host does.
+        if method.startswith("Fetch."):
+            return self.fetch_for(method, params or {})
         if method == "Page.navigate":
             # A URL the browser cannot load answers with `errorText`, like a
             # real Chromium against a name that does not resolve.
@@ -253,6 +501,15 @@ class Handler(BaseHTTPRequestHandler):
             # has to work with.
             DENY_ON["on"] = url.startswith("deny://")
             FRAMES_ON["on"] = "frames" in url
+            # A host this connection intercepts answers a challenge instead of
+            # the document straight away, and the reply waits for the
+            # credentials. Chromium holds the navigation open exactly this
+            # way, and the daemon's auth window depends on it.
+            if self.session.covers(host_of(url)):
+                request_id = "fake-nav-%d" % next(REQUEST_IDS)
+                self.session.challenge(request_id, url)
+                self.session.pending_nav = {"id": message_id, "request": request_id, "url": url}
+                return None
             return {"id": 1, "result": {"frameId": "f", "url": "https://example.test"}}
         if method == "Browser.setDownloadBehavior":
             DOWNLOAD_BEHAVIOUR.append(params or {})
@@ -269,6 +526,18 @@ class Handler(BaseHTTPRequestHandler):
             target = (params or {}).get("targetId")
             CLOSED.add(target)
             CONTEXT_TABS.pop(target, None)
+            # Closing a target drops its DevTools sockets, as in Chromium --
+            # nothing is sent to say so, the connections simply die and any
+            # interception on them goes with them. It is not a stand-in for
+            # `Fetch.disable`: a responder that gives its interception back
+            # before the close is visible in the log, one that never does is
+            # not.
+            with SESSION_LOCK:
+                doomed = [
+                    s for s in SESSIONS if s.path.endswith("/%s" % target) and not s.dead
+                ]
+            for session in doomed:
+                session.close()
             return {"result": {"success": True}}
         if method == "Target.disposeBrowserContext":
             ctx = (params or {}).get("browserContextId")
@@ -387,20 +656,90 @@ class Handler(BaseHTTPRequestHandler):
             return {"id": 1, "result": {"result": {"type": "undefined"}}}
         return {"id": 1, "result": {}}
 
+    def fetch_for(self, method, params):
+        """The `Fetch` domain: the basic-auth responder's whole world.
+
+        `Fetch.enable` arms this connection for the hosts its patterns cover
+        (`handleAuthRequests` is what makes Chromium report challenges at
+        all), `Fetch.disable` gives the interception back, and the two answer
+        commands record what was sent and release whatever the fake is holding
+        open on the client's behalf.
+        """
+        session = self.session
+        if method == "Fetch.enable":
+            hosts, wilds = set(), set()
+            for pattern in params.get("patterns") or []:
+                host, wild = pattern_host(pattern.get("urlPattern", ""))
+                if not host:
+                    continue
+                (wilds if wild else hosts).add(host)
+            session.arm(hosts, wilds)
+            FETCH_LOG.append(
+                {
+                    "session": session.id,
+                    "method": method,
+                    "handleAuthRequests": bool(params.get("handleAuthRequests")),
+                    "hosts": sorted(hosts),
+                    "wildcards": sorted(wilds),
+                }
+            )
+            return {"result": {}}
+        if method == "Fetch.disable":
+            session.disarm()
+            FETCH_LOG.append({"session": session.id, "method": method})
+            return {"result": {}}
+        if method == "Fetch.continueWithAuth":
+            answer = params.get("authChallengeResponse") or {}
+            FETCH_LOG.append(
+                {
+                    "session": session.id,
+                    "method": method,
+                    "requestId": params.get("requestId", ""),
+                    "response": answer.get("response", ""),
+                    "username": answer.get("username", ""),
+                    "password": answer.get("password", ""),
+                }
+            )
+            # Credentials in hand: the request is replayed, the document comes
+            # back 200, and the navigation this connection was holding open is
+            # answered -- both after this command's own reply, which is what
+            # the daemon reads the navigation's reply out of.
+            nav = session.pending_nav
+            if nav and nav["request"] == params.get("requestId"):
+                session.pending_nav = None
+                self.after.append(
+                    {
+                        "method": "Network.responseReceived",
+                        "params": {
+                            "requestId": nav["request"],
+                            "frameId": "f",
+                            "loaderId": nav["request"],
+                            "type": "Document",
+                            "response": {
+                                "url": nav["url"],
+                                "status": 200,
+                                "statusText": "",
+                                "headers": {"content-type": "text/html"},
+                            },
+                        },
+                    }
+                )
+                self.after.append({"id": nav["id"], "result": {"frameId": "f", "url": nav["url"]}})
+            return {"result": {}}
+        if method == "Fetch.continueRequest":
+            FETCH_LOG.append(
+                {
+                    "session": session.id,
+                    "method": method,
+                    "requestId": params.get("requestId", ""),
+                }
+            )
+            return {"result": {}}
+        # An interception command this fake does not model.
+        return {"error": {"code": -32601, "message": "%s not implemented" % method}}
+
     def reply(self, obj):
-        payload = json.dumps(obj, separators=(",", ":")).encode()
-        frame = bytearray([0x81])
-        if len(payload) < 126:
-            frame.append(len(payload))
-        elif len(payload) < 1 << 16:
-            frame.append(126)
-            frame += len(payload).to_bytes(2, "big")
-        else:
-            # Chromium answers a screenshot with a 64-bit length frame.
-            frame.append(127)
-            frame += len(payload).to_bytes(8, "big")
-        frame += payload
-        self.connection.sendall(bytes(frame))
+        self.session.frame(obj)
 
 
 class Server(ThreadingHTTPServer):

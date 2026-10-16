@@ -3917,11 +3917,20 @@ fn auth_keepers() -> &'static Mutex<HashMap<String, Arc<AuthKeeper>>> {
     KEEPERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The key a tab's keeper is filed under.
+/// The key a tab's keeper is filed under: the tab itself, like the pool of
+/// warm connections above and the pinned targets beside it.
+///
+/// The target id alone is not enough. Target ids are per browser, and this map
+/// is per process, so two browsers reachable from one process (which is what
+/// the integration tests do, one server each) file their `PAGE1` responder
+/// under one key -- and whichever tab navigates second stops the other's
+/// responder, a responder nobody asked to stop.
 fn keeper_key(tab: &Tab) -> String {
-    tab.target
-        .clone()
-        .unwrap_or_else(|| format!("default:{}", tab.cdp_port))
+    format!(
+        "{}:{}",
+        tab.cdp_port,
+        tab.target.clone().unwrap_or_else(|| "default".into())
+    )
 }
 
 /// Stop a tab's keeper, waiting (bounded) for it to give the interception

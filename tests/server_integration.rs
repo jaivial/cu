@@ -811,6 +811,498 @@ fn download_behaviour(server: &TestServer) -> String {
     .expect("download behaviour")
 }
 
+// --- basic auth: the per-tab responder, against a fake CDP `Fetch` -------
+//
+// The responder answers `Fetch.authRequired` on a connection of its own, so
+// the fake browser models the `Fetch` domain: it arms what it is told to arm,
+// it challenges intercepted requests, and it records every `Fetch` command the
+// daemon sent. These helpers are how a test sees that.
+
+/// Every `Fetch.*` command the daemon sent, in order.
+fn fetch_log(server: &TestServer) -> String {
+    server::http_get(&format!("127.0.0.1:{}", server.cdp_port), "/fetch-log").expect("fetch log")
+}
+
+/// A `Fetch.enable` that landed while another live connection already had the
+/// same host armed: two interceptors over one host, which every request on it
+/// would have to be answered twice for.
+fn fetch_overlaps(server: &TestServer) -> String {
+    server::http_get(&format!("127.0.0.1:{}", server.cdp_port), "/fetch-overlaps")
+        .expect("fetch overlaps")
+}
+
+/// Which connections are intercepting what, right now.
+fn fetch_armed(server: &TestServer) -> String {
+    server::http_get(&format!("127.0.0.1:{}", server.cdp_port), "/fetch-armed")
+        .expect("fetch armed")
+}
+
+/// Make the fake challenge `host` the way a page's own request does after the
+/// document has settled: no daemon command in between, so only a background
+/// responder can answer it. Returns the fake's report of how many live
+/// connections the challenge reached.
+fn challenge_now(server: &TestServer, host: &str, request: &str) -> String {
+    server::http_get(
+        &format!("127.0.0.1:{}", server.cdp_port),
+        &format!("/challenge?host={host}&request={request}"),
+    )
+    .expect("challenge pushed")
+}
+
+/// Store a basic-auth pair for `host` in the server's vault, as a user would
+/// through the vault UI.
+fn vault_basic_auth(server: &TestServer, host: &str, user: &str, password: &str) {
+    let response = server.post(
+        "/v1/vault/credentials",
+        &format!(
+            "{{\"domain\":{},\"label\":\"{} basic auth\",\"fields\":[{{\"name\":\"username\",\"value\":{},\"secret\":false}},{{\"name\":\"password\",\"value\":{},\"secret\":true}}]}}",
+            server::json_string(host),
+            host,
+            server::json_string(user),
+            server::json_string(password),
+        ),
+    );
+    assert_eq!(
+        status_code(&response),
+        "200",
+        "credential not stored: {}",
+        body_of(&response)
+    );
+}
+
+/// Polls `read` until `ready` says the thing being waited for has happened, or
+/// the budget runs out.
+///
+/// The responder answers in the background, and a challenge leaves more than
+/// one trace in the log: the intercepted request is continued first and the
+/// credentials go over in a second command a moment later. Waiting for the
+/// request to appear is therefore not waiting for the answer -- the test would
+/// read the log in between and call it unanswered.
+fn wait_until(
+    mut read: impl FnMut() -> String,
+    ready: impl Fn(&str) -> bool,
+    budget: Duration,
+) -> String {
+    let started = std::time::Instant::now();
+    loop {
+        let state = read();
+        if ready(&state) || started.elapsed() >= budget {
+            return state;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Waits until exactly `want` connections are intercepting, which is what
+/// "the responder owns this host" looks like from outside.
+fn wait_for_interceptors(server: &TestServer, want: usize, budget: Duration) -> String {
+    wait_until(
+        || fetch_armed(server),
+        |armed| armed.matches("\"session\":").count() == want,
+        budget,
+    )
+}
+
+/// Every `Fetch` log entry about `request`, as the fake saw it. A log is
+/// every answer in one string, so "did this challenge get answered, and with
+/// what" has to be asked of the entries for *that* request: the navigation's
+/// own answer to the same host sits right beside the responder's in the same
+/// log and would otherwise vouch for it. One request can have several entries
+/// (a paused request and an auth challenge share their id), so all of them are
+/// returned.
+fn fetch_answers_for(log: &str, request: &str) -> String {
+    let needle = format!("\"requestId\": \"{request}\"");
+    log.split("}, {")
+        .filter(|entry| entry.contains(&needle))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+#[test]
+fn a_vault_pair_answers_the_challenge_a_navigation_meets() {
+    // The whole point of the responder: navigating to a host behind basic
+    // auth comes back as a loaded page instead of a dialog a headless browser
+    // cannot see. The pair comes from the vault, over `Fetch.continueWithAuth`.
+    let server = TestServer::start("auth-challenge", true);
+    // A password with a quote in it: the pair has to survive JSON escaping on
+    // its way through the vault and back out in `Fetch.continueWithAuth`.
+    vault_basic_auth(&server, "protected.test", "alice", "p@ss\"w0rd");
+
+    let response = server.post("/v1/navigate", r#"{"url":"https://protected.test/app"}"#);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&response);
+    assert!(
+        body.contains("\"basic_auth\":\"responded\""),
+        "the challenge was not answered: {body}"
+    );
+    // And the report is the post-auth one, not the 401 that came first.
+    assert!(body.contains("\"status\":200"), "bare 401 reported: {body}");
+    assert!(
+        body.contains("\"vault\":{\"session\":\"none\",\"credentials\":1}"),
+        "the vault was not consulted: {body}"
+    );
+
+    // The fake saw the credential handed over, spelled the way current Chrome
+    // insists on (`authChallengeResponse`, not the flat form).
+    let log = fetch_log(&server);
+    assert!(
+        log.contains("\"method\": \"Fetch.enable\"")
+            && log.contains("\"handleAuthRequests\": true"),
+        "interception was not armed: {log}"
+    );
+    assert!(
+        log.contains("\"hosts\": [\"protected.test\"]"),
+        "not scoped to the host: {log}"
+    );
+    let answer = log
+        .split("}, {")
+        .find(|entry| entry.contains("Fetch.continueWithAuth"))
+        .unwrap_or("");
+    assert!(
+        answer.contains("\"response\": \"ProvideCredentials\""),
+        "no credentials provided: {log}"
+    );
+    assert!(
+        answer.contains("\"username\": \"alice\"")
+            && answer.contains("\"password\": \"p@ss\\\"w0rd\""),
+        "the wrong pair, or one that lost its escaping: {answer}"
+    );
+}
+
+#[test]
+fn the_responder_keeps_answering_after_the_document_has_settled() {
+    // The gap this responder exists to close: a page whose next request lands
+    // after the navigation is over, with no command in between. Chromium does
+    // not reliably cache what `Fetch.continueWithAuth` handed it, so the
+    // challenge comes again -- and nobody would be reading the tab's stream
+    // except the responder.
+    let server = TestServer::start("auth-after-settle", true);
+    vault_basic_auth(&server, "protected.test", "alice", "s3cr3t");
+    let response = server.post("/v1/navigate", r#"{"url":"https://protected.test/app"}"#);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    assert!(
+        body_of(&response).contains("\"basic_auth\":\"responded\""),
+        "the first challenge went unanswered: {}",
+        body_of(&response)
+    );
+
+    // The navigation gave the host to a responder of its own: exactly one live
+    // connection is intercepting, and it is not the one that navigated.
+    let armed = wait_for_interceptors(&server, 1, Duration::from_secs(5));
+    assert!(
+        armed.contains("protected.test"),
+        "one interceptor for the host expected, got {armed}"
+    );
+
+    // Now the page asks for something else on that host, with nothing running.
+    let pushed = challenge_now(&server, "protected.test", "after-settle");
+    assert!(
+        pushed.contains("\"challenged\": 1"),
+        "no live connection was intercepting to challenge: {pushed}"
+    );
+
+    // And it is answered, from the pair, on its own. The entries for *this*
+    // request are what say so: the navigation's own answer to the same host
+    // is in the same log and would otherwise vouch for the responder.
+    let log = wait_until(
+        || fetch_log(&server),
+        |log| fetch_answers_for(log, "after-settle").contains("Fetch.continueWithAuth"),
+        Duration::from_secs(5),
+    );
+    let answers = fetch_answers_for(&log, "after-settle");
+    assert!(
+        answers.contains("Fetch.continueWithAuth"),
+        "the late challenge went unanswered: {log}"
+    );
+    assert!(
+        answers.contains("\"response\": \"ProvideCredentials\""),
+        "answered without credentials: {answers}"
+    );
+    assert!(
+        answers.contains("\"username\": \"alice\"") && answers.contains("\"password\": \"s3cr3t\""),
+        "the wrong pair: {answers}"
+    );
+    // The paused request is continued too, or the page would sit waiting.
+    assert!(
+        answers.contains("Fetch.continueRequest"),
+        "an intercepted request stayed paused: {answers}"
+    );
+}
+
+#[test]
+fn two_browsers_keep_their_own_responders() {
+    // The map of live responders is per *process*, but a target id is per
+    // *browser* -- both fakes here call their first tab `PAGE1`. Keyed by the
+    // target alone, the two servers file their responders under one key and
+    // whichever navigates second stops the other's, a responder nobody asked
+    // to stop: the first browser's later challenges go unanswered.
+    let first = TestServer::start("auth-two-browsers-a", true);
+    let second = TestServer::start("auth-two-browsers-b", true);
+    vault_basic_auth(&first, "alpha.test", "alice", "alpha-pw");
+    vault_basic_auth(&second, "beta.test", "bob", "beta-pw");
+
+    for server in [&first, &second] {
+        let host = if server.addr == first.addr {
+            "alpha.test"
+        } else {
+            "beta.test"
+        };
+        let response = server.post(
+            &format!("/v1/navigate?tab=PAGE1"),
+            &format!(r#"{{"url":"https://{host}/app"}}"#),
+        );
+        assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+        assert!(
+            body_of(&response).contains("\"basic_auth\":\"responded\""),
+            "{host} went unanswered: {}",
+            body_of(&response)
+        );
+    }
+
+    // Each responder must still be armed for its own host. With a shared key
+    // the second navigation stopped the first, so one browser is left with
+    // nothing watching it and challenges there are never answered.
+    for (server, host) in [(&first, "alpha.test"), (&second, "beta.test")] {
+        let armed = wait_until(
+            || fetch_armed(server),
+            |armed| armed.contains(host),
+            Duration::from_secs(5),
+        );
+        assert!(
+            armed.contains(host),
+            "{host} has no live responder: {armed}"
+        );
+        let pushed = challenge_now(server, host, &format!("late-{host}"));
+        assert!(
+            pushed.contains("\"challenged\": 1"),
+            "nothing was intercepting {host}: {pushed}"
+        );
+        let log = wait_until(
+            || fetch_log(server),
+            |log| {
+                fetch_answers_for(log, &format!("late-{host}")).contains("Fetch.continueWithAuth")
+            },
+            Duration::from_secs(5),
+        );
+        let answers = fetch_answers_for(&log, &format!("late-{host}"));
+        let pair = if host == "alpha.test" {
+            ("alice", "alpha-pw")
+        } else {
+            ("bob", "beta-pw")
+        };
+        assert!(
+            answers.contains(&format!("\"username\": \"{}\"", pair.0))
+                && answers.contains(&format!("\"password\": \"{}\"", pair.1)),
+            "{host} was answered with the wrong pair, or by the other browser: {answers}"
+        );
+    }
+}
+
+#[test]
+fn a_host_without_a_credential_is_never_intercepted() {
+    // Nothing to answer with: arming `Fetch` would only pause requests with
+    // no way to release them, which is the hang the responder was meant to
+    // stop. A host the vault knows nothing about is left alone.
+    let server = TestServer::start("auth-no-credential", true);
+    vault_basic_auth(&server, "protected.test", "alice", "s3cr3t");
+
+    let response = server.post("/v1/navigate", r#"{"url":"https://open.test/app"}"#);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&response);
+    assert!(
+        !body.contains("basic_auth"),
+        "a challenge was reported for a host with no credential: {body}"
+    );
+    assert!(
+        body.contains("\"vault\":{\"session\":\"none\",\"credentials\":0}"),
+        "the vault was not consulted: {body}"
+    );
+    // No interception was armed at all -- not for this host, not for any.
+    assert_eq!(fetch_log(&server), "[]", "interception armed for nothing");
+    assert_eq!(fetch_armed(&server), "[]", "something stayed armed");
+    // And with nothing armed, a challenge has nowhere to go.
+    let pushed = challenge_now(&server, "open.test", "nobody-home");
+    assert!(
+        pushed.contains("\"challenged\": 0"),
+        "a connection was intercepting a host with no credential: {pushed}"
+    );
+}
+
+#[test]
+fn closing_a_tab_stops_its_responder() {
+    // The responder holds a DevTools connection of its own for as long as the
+    // tab lives. Closing the tab must take it with it: an interception left
+    // armed over a target that no longer exists is a thread reading a stream
+    // nobody will ever answer.
+    let server = TestServer::start("auth-tab-closed", true);
+    vault_basic_auth(&server, "protected.test", "alice", "s3cr3t");
+    // Navigate a tab named by id, so the close can name it back.
+    let response = server.post(
+        "/v1/navigate?tab=PAGE1",
+        r#"{"url":"https://protected.test/app"}"#,
+    );
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let armed = wait_for_interceptors(&server, 1, Duration::from_secs(5));
+    assert!(
+        armed.contains("protected.test"),
+        "the responder never armed: {armed}"
+    );
+
+    // The last tab may not be closed, so open a second one first.
+    server.post(
+        "/v1/navigate?context=alice",
+        r#"{"url":"https://example.test"}"#,
+    );
+    let request = format!(
+        "DELETE /v1/tabs/PAGE1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\n...gth: 0\r\n\r\n",
+        server.token
+    );
+    let closed = server.fragmented(&request);
+    assert_eq!(status_code(&closed), "200", "got {}", body_of(&closed));
+
+    // The interception was given back rather than orphaned: every arming has a
+    // matching release in the log. A responder that never released it would
+    // still be "gone" after the close -- Chromium drops the socket -- so the
+    // count is what says it let go on its own.
+    let log = wait_until(
+        || fetch_log(&server),
+        |log| {
+            log.contains("Fetch.enable")
+                && log.matches("Fetch.enable").count() == log.matches("Fetch.disable").count()
+        },
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        log.matches("Fetch.enable").count(),
+        log.matches("Fetch.disable").count(),
+        "an interception was armed and never released: {log}"
+    );
+    assert_eq!(
+        fetch_armed(&server),
+        "[]",
+        "the responder is still intercepting a closed tab"
+    );
+}
+
+#[test]
+fn re_navigating_a_host_does_not_leave_two_interceptors_on_it() {
+    // A navigation to a credentialled host arms `Fetch` itself, so the tab's
+    // background responder has to let go first: two interceptors over one host
+    // would both have to answer every request on it.
+    let server = TestServer::start("auth-rearm", true);
+    vault_basic_auth(&server, "protected.test", "alice", "s3cr3t");
+
+    let response = server.post("/v1/navigate", r#"{"url":"https://protected.test/app"}"#);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    assert!(
+        body_of(&response).contains("\"basic_auth\":\"responded\""),
+        "the first challenge went unanswered: {}",
+        body_of(&response)
+    );
+    wait_for_interceptors(&server, 1, Duration::from_secs(5));
+
+    // Same host again: the responder is stopped and the navigation's own
+    // interception takes its place.
+    let response = server.post("/v1/navigate", r#"{"url":"https://protected.test/other"}"#);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    assert!(
+        body_of(&response).contains("\"basic_auth\":\"responded\""),
+        "the second challenge went unanswered: {}",
+        body_of(&response)
+    );
+
+    // The fake records any moment two live connections held the same host,
+    // which happens inside the navigation rather than after it -- so by the
+    // time it has answered, an overlap would already be on the list.
+    let overlaps = fetch_overlaps(&server);
+    assert_eq!(overlaps, "[]", "two interceptors over one host: {overlaps}");
+    // Whatever is intercepting now is exactly one connection: the navigation
+    // gave its interception back and the responder took the host again.
+    let armed = wait_for_interceptors(&server, 1, Duration::from_secs(5));
+    assert!(
+        armed.contains("protected.test"),
+        "the responder did not take the host back: {armed}"
+    );
+}
+
+#[test]
+fn turning_the_responder_off_arms_nothing() {
+    // `"auth":false` is a caller that wants the raw challenge (to see the
+    // 401, or to answer it in the page). Nothing may be armed for it, or the
+    // requests it would have inspected stay paused.
+    let server = TestServer::start("auth-disabled", true);
+    vault_basic_auth(&server, "protected.test", "alice", "s3cr3t");
+
+    let response = server.post(
+        "/v1/navigate",
+        r#"{"url":"https://protected.test/app","auth":false}"#,
+    );
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&response);
+    assert!(
+        !body.contains("basic_auth"),
+        "the responder answered a challenge it was told to leave: {body}"
+    );
+    assert_eq!(fetch_log(&server), "[]", "interception armed anyway");
+    assert_eq!(fetch_armed(&server), "[]", "something stayed armed");
+}
+
+#[test]
+fn each_tab_gets_its_own_responder() {
+    // Two tabs, two credentialled hosts, two responders: the responder is
+    // keyed by tab, so neither stops the other and neither answers for a host
+    // it has no pair for.
+    let server = TestServer::start("auth-two-tabs", true);
+    vault_basic_auth(&server, "protected.test", "alice", "s3cr3t");
+    vault_basic_auth(&server, "other.test", "bob", "hunter2");
+    let response = server.post(
+        "/v1/navigate?tab=PAGE1",
+        r#"{"url":"https://protected.test/app"}"#,
+    );
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    wait_for_interceptors(&server, 1, Duration::from_secs(5));
+    let response = server.post(
+        "/v1/navigate?context=alice",
+        r#"{"url":"https://other.test/app"}"#,
+    );
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+
+    // The context tab's responder is armed for its own host, and the first
+    // tab's is untouched: one interceptor per host, on two connections.
+    let armed = wait_until(
+        || fetch_armed(&server),
+        |armed| armed.contains("other.test"),
+        Duration::from_secs(5),
+    );
+    assert!(
+        armed.contains("protected.test") && armed.contains("other.test"),
+        "both hosts should be answered: {armed}"
+    );
+    assert_eq!(
+        fetch_overlaps(&server),
+        "[]",
+        "two tabs' responders collide: {}",
+        fetch_overlaps(&server)
+    );
+    // A challenge to the context tab's host is answered with that tab's pair,
+    // not the other tab's: the responder is keyed by tab.
+    challenge_now(&server, "other.test", "ctx-challenge");
+    let log = wait_until(
+        || fetch_log(&server),
+        |log| fetch_answers_for(log, "ctx-challenge").contains("Fetch.continueWithAuth"),
+        Duration::from_secs(5),
+    );
+    let answer = fetch_answers_for(&log, "ctx-challenge");
+    assert!(
+        answer.contains("\"username\": \"bob\"") && answer.contains("\"password\": \"hunter2\""),
+        "the wrong tab's pair answered: {answer}"
+    );
+    assert!(
+        !answer.contains("alice"),
+        "the first tab's pair answered for the second: {answer}"
+    );
+}
+
 #[test]
 fn a_click_by_ref_is_a_real_mouse_click() {
     let server = TestServer::start("click-ref", true);
