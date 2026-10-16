@@ -1608,18 +1608,6 @@ fn navigate_observed(
         }
     };
     let (reply, auth_handled) = if !auth_on {
-        // Disarm a responder a previous navigation on this tab left armed:
-        // its host patterns do not cover the page we are going to, and an
-        // interception nobody answers is a page that cannot load.
-        if let Some(key) = connection.target_key.clone()
-            && armed_auth()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&key)
-                .is_some()
-        {
-            let _ = connection.call("Fetch.disable", "{}");
-        }
         (
             connection.call_observed(
                 "Page.navigate",
@@ -1702,18 +1690,41 @@ fn navigate_observed(
             }
             answer(&text, &mut connection, &mut auth_handled);
         }
-        connection.set_read_timeout(CDP_HTTP_TIMEOUT);
-        // Interception stays armed for this tab: the page's own requests
-        // (its `fetch()` calls) get challenged too, and with the pair
-        // registered, every later command's read loop answers them. A bare
-        // `Fetch.disable` here would leave those later challenges on a
-        // headless dialog that never opens — the request hangs.
-        if let (Some(key), Some(pair)) = (connection.target_key.clone(), auth.as_ref()) {
-            armed_auth()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key, pair.clone());
+        // Interception is torn down once the document has settled: Chrome
+        // caches the credential it was handed for the realm, and answers the
+        // page's own `fetch()` calls with it from then on.
+        //
+        // Leaving it armed is what the first cut did, and it wedges pages: an
+        // intercepted request stays paused until a CDP client reads the event
+        // and answers it, and between commands nobody is reading the tab's
+        // connection. A page whose first request comes after the navigation
+        // (every SPA boot) then hangs until some later command happens to
+        // drain the stream. Verified against the live daemon: with the
+        // responder left armed, `fetch()` to a protected path never resolved
+        // while the daemon sat idle, and the pending request stayed paused
+        // across commands.
+        //
+        // A short late window still answers a challenge that lands just after
+        // the document — a redirect chain finishing, or a page whose very
+        // first request beats the credential cache — so the handshake that
+        // populates that cache is not lost by a hair.
+        let late = std::time::Instant::now() + AUTH_LATE_WINDOW;
+        loop {
+            let left = late.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            connection.set_read_timeout(left);
+            let Ok(text) = connection.next_message(MAX_CDP_MESSAGE) else {
+                break;
+            };
+            if message_id(&text).is_some() {
+                continue;
+            }
+            answer(&text, &mut connection, &mut auth_handled);
         }
+        let _ = connection.call("Fetch.disable", "{}");
+        connection.set_read_timeout(CDP_HTTP_TIMEOUT);
         (
             nav_reply.ok_or_else(|| "navigation did not answer within the auth window".to_string()),
             auth_handled,
@@ -1762,6 +1773,13 @@ fn navigate_observed(
 /// intercepted requests before the page is handed back to the normal settle
 /// wait (which then reports `settled:false` if it is still coming).
 const AUTH_WINDOW: Duration = Duration::from_secs(20);
+
+/// How long after the document settles a challenge may still arrive and be
+/// answered before interception is torn down: a redirect chain finishing, or
+/// a page whose first request beats the credential cache. Keeping
+/// interception on past this point is what wedges an idle page (see the
+/// comment in `navigate_observed`).
+const AUTH_LATE_WINDOW: Duration = Duration::from_millis(250);
 
 /// `Fetch.authRequired`: the request id of an HTTP auth challenge.
 fn auth_required_id(event: &str) -> Option<String> {
@@ -1893,10 +1911,6 @@ pub fn tabs_json(cdp_port: u16) -> Result<String, String> {
 
 /// Close a tab by id. The last page is refused: Chromium exits with it.
 pub fn close_tab(cdp_port: u16, id: &str) -> Result<(), String> {
-    armed_auth()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(id);
     let discovery = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")?;
     // Every page target counts here, context tabs included: any of them keeps
     // Chromium alive, and a context's tab may be closed directly (the context
@@ -3588,10 +3602,6 @@ fn context_targets(cdp_port: u16) -> Vec<String> {
 pub struct CdpConnection {
     stream: TcpStream,
     next_id: u64,
-    /// The tab this connection drives, when it has one: the key under which
-    /// an armed basic-auth responder is registered for the tab (see
-    /// `armed_auth`).
-    target_key: Option<String>,
 }
 
 impl CdpConnection {
@@ -3606,9 +3616,7 @@ impl CdpConnection {
             .find(|o| json_string_value(o, "id").as_deref() == Some(target))
             .and_then(|o| json_string_value(&o, "webSocketDebuggerUrl"))
             .ok_or_else(|| format!("no DevTools target {target} any more"))?;
-        let mut connection = Self::connect(&ws)?;
-        connection.target_key = Some(target.to_string());
-        Ok(connection)
+        Self::connect(&ws)
     }
 
     /// Discover the tab's target and complete the websocket handshake.
@@ -3636,11 +3644,7 @@ impl CdpConnection {
                 chosen.1.clone()
             }
         };
-        let mut connection = Self::connect(&ws)?;
-        connection.target_key = Some(tab.target.clone().unwrap_or_else(|| {
-            pinned_target(tab.cdp_port).unwrap_or_else(|| format!("default:{}", tab.cdp_port))
-        }));
-        Ok(connection)
+        Self::connect(&ws)
     }
 
     /// Complete the websocket handshake with one DevTools endpoint.
@@ -3680,11 +3684,7 @@ impl CdpConnection {
         if !handshake.starts_with(b"HTTP/1.1 101") {
             return Err("Chromium rejected CDP websocket handshake".into());
         }
-        Ok(Self {
-            stream,
-            next_id: 1,
-            target_key: None,
-        })
+        Ok(Self { stream, next_id: 1 })
     }
 
     /// Send one command and read its reply, skipping events meant for nobody.
@@ -3734,7 +3734,6 @@ impl CdpConnection {
                 Some(_) => continue,
                 None => {
                     crate::diagnostics::record_event();
-                    self.answer_armed_auth(&text);
                     observe(&text)
                 }
             }
@@ -3758,11 +3757,8 @@ impl CdpConnection {
             let _ = self.stream.set_read_timeout(Some(left));
             match self.next_message(MAX_CDP_MESSAGE) {
                 Ok(text) => {
-                    if message_id(&text).is_none() {
-                        self.answer_armed_auth(&text);
-                        if observe(&text) {
-                            break true;
-                        }
+                    if message_id(&text).is_none() && observe(&text) {
+                        break true;
                     }
                 }
                 Err(_) => break false,
@@ -3770,37 +3766,6 @@ impl CdpConnection {
         };
         let _ = self.stream.set_read_timeout(Some(CDP_HTTP_TIMEOUT));
         Ok(clean)
-    }
-
-    /// Answer an interception event for a tab whose basic-auth responder is
-    /// still armed (see [`armed_auth`]): the challenge with the vault's pair,
-    /// every paused request with a plain continue. This is what keeps a page
-    /// behind basic auth working after the navigation — its own `fetch()`s
-    /// get challenged too, and an unanswered challenge in a headless browser
-    /// is a request that hangs for ever on a dialog that will never open.
-    fn answer_armed_auth(&mut self, event: &str) {
-        let Some(key) = self.target_key.clone() else {
-            return;
-        };
-        let auth = armed_auth()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .cloned();
-        let Some(auth) = auth else {
-            return;
-        };
-        if let Some(rid) = auth_required_id(event) {
-            self.send(
-                "Fetch.continueWithAuth",
-                &continue_with_auth_params(&rid, &Some(auth)),
-            );
-        } else if let Some(rid) = paused_request_id(event) {
-            self.send(
-                "Fetch.continueRequest",
-                &format!("{{\"requestId\":{}}}", json_string(&rid)),
-            );
-        }
     }
 
     /// Fire one command without reading for its reply: the reply comes back
@@ -3879,17 +3844,6 @@ pub fn checkin(tab: &Tab, connection: CdpConnection) {
     let pool = cdp_pool(tab);
     let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
     guard.put(connection);
-}
-
-/// Tabs whose basic-auth responder is still armed: the navigation answered a
-/// challenge and left `Fetch` interception on, so later requests the PAGE
-/// makes (its own `fetch()` calls included) get their challenges answered
-/// with the same vault pair. Keyed by tab; the armed connection must be the
-/// one in the pool for that tab (a fresh connection has interception off and
-/// simply never sees the events).
-fn armed_auth() -> &'static Mutex<HashMap<String, (String, String)>> {
-    static MAP: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
-    MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// The string a `Runtime.evaluate` with `returnByValue` produced.
