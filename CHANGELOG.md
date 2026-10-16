@@ -1,5 +1,66 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **The vault UI session now says what it means, and lasts as long as you
+  work.** Three fixes to the cookie that guards `cu-vault.menustudioai.com`
+  (`src/vault.rs`, `src/server.rs`):
+
+  - `Secure` is now set. The vault is served over HTTPS and only over HTTPS,
+    but the cookie was travelling without the flag, so any accidental
+    plain-HTTP request handed the session token to anything on the path.
+  - `SameSite` moves from `Strict` to `Lax`. `Strict` withholds the cookie
+    from *top-level cross-site navigations* too, so arriving at the vault from
+    a link in a mail client or a chat, or through a redirect, dropped the
+    session with no explanation and asked for the master password again.
+    `Lax` sends the cookie on those top-level GETs and withholds it on every
+    cross-site POST/form — and since every state-changing vault route is a
+    POST or a DELETE, forgery protection is unchanged.
+  - The session slides. It used to die exactly twelve hours after login no
+    matter what you did in between, which logged people out mid-afternoon.
+    Now every authenticated request moves the deadline, so a session expires
+    after a *period of inactivity* and never mid-work.
+
+  The login page grows a **"Remember this session"** checkbox: unticked, the
+  twelve hours above; ticked, thirty days, sliding the same way. The flag is
+  a server-side property of the session (`ui_sessions` in `vault.db`), never
+  a client-side one — the cookie is `HttpOnly`, so nothing in the page (and
+  nothing in `localStorage`) can extend a session's life. `GET
+  /v1/vault/ui/session` reports whether the current cookie is live so the
+  login page can skip the form when it already is.
+
+  UI sessions moved from a daemon-lifetime `HashSet` to a table in the vault
+  database, so a daemon restart no longer logs everyone out. Only a SHA-256
+  of each token is stored: the token itself is a bearer credential, and a
+  copy of `vault.db` must not be a set of live sessions. Changing the master
+  password now ends every existing session.
+
+- **The login page is a real page now** (`src/vault_login.html`): labelled
+  fields instead of bare placeholders, a light and a dark scheme, a visible
+  focus ring, an announced and legible error state, a busy state on submit,
+  and 44px touch targets. The inputs are `font-size: max(16px, 1em)` — the
+  rule the rest of the project's UI already follows (mini-tui
+  `web/src/app.css`) — because below 16px iOS Safari zooms the viewport the
+  moment a field takes focus and never zooms back. The app page's inputs get
+  the same floor and a focus ring; they had the same zoom trap.
+
+### Security
+
+- With nginx's `auth_basic` removed from the vault vhost (its native browser
+  dialog was the thing being replaced), the vault's own session check is the
+  only thing between the public internet and every stored cookie,
+  credential and pending secret request. That branch in `vault_route` is
+  deny-by-default and covered by a test that walks all fourteen data routes
+  with no cookie, a junk cookie and an unrelated cookie, asserting `401` on
+  each: `/v1/vault/{status,sessions,credentials,requests,passwd}` and every
+  approve/deny. Only the three deliberately-open routes answer without a
+  session — the two HTML pages (no data in them) and `/v1/vault/ui/{state,
+  session}`, which say only whether a master password is set and whether
+  *this* cookie is live. Login is still rate-limited to five attempts every
+  five minutes.
+
 ## [1.1.2] - 2026-10-15
 
 ### Fixed

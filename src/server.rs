@@ -4279,6 +4279,22 @@ pub fn json_value(input: &str, key: &str) -> Option<String> {
         Some(rest.split(|c: char| !c.is_ascii_digit()).next()?.into())
     }
 }
+/// Whether the JSON object `input` carries `key: true`. `json_value` reads
+/// strings and numbers only — on a bare boolean it hands back the empty
+/// string, which is indistinguishable from `false`, so a flag like the login
+/// page's "remember this session" needs its own reader.
+pub fn json_bool(input: &str, key: &str) -> bool {
+    let needle = format!("\"{key}\"");
+    let Some(start) = input.find(&needle) else {
+        return false;
+    };
+    let rest = input[start + needle.len()..].trim_start();
+    let Some(rest) = rest.strip_prefix(':') else {
+        return false;
+    };
+    rest.trim_start().starts_with("true")
+}
+
 pub fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -4473,24 +4489,84 @@ fn vault_route(
                     None,
                 );
             }
-            let token = crate::vault::ui_session_create();
+            // "Remember this session" is a server-side property of the
+            // session, never a client-side one: the cookie is HttpOnly, so
+            // nothing in the page (and nothing in localStorage) can extend a
+            // session's life. It arrives here in the login body and lives in
+            // `ui_sessions` until the session ends.
+            let remember = json_bool(body, "remember");
+            vault.ui_sessions_reap();
+            let token = match vault.ui_session_create(remember) {
+                Ok(token) => token,
+                Err(e) => {
+                    return (
+                        "500 Internal Server Error",
+                        "application/json",
+                        format!("{{\"error\":{}}}", json_string(&e)),
+                        None,
+                    );
+                }
+            };
             (
                 "200 OK",
                 "application/json",
                 "{\"ok\":true}".into(),
-                Some(format!(
-                    "cu_vault_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200"
+                Some(session_cookie(
+                    &token,
+                    crate::vault::ui_session_ttl(remember),
                 )),
             )
         }
         ("POST", "/v1/vault/ui/logout") => {
-            crate::vault::ui_session_drop(cookie.and_then(crate::vault::cookie_token).as_deref());
+            if let Ok(vault) = crate::vault::Vault::open(&state.data_dir) {
+                vault.ui_session_drop(cookie.and_then(crate::vault::cookie_token).as_deref());
+            }
             (
                 "200 OK",
                 "application/json",
                 "{\"ok\":true}".into(),
-                Some("cu_vault_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0".into()),
+                Some(CLEARED_COOKIE.into()),
             )
+        }
+        ("GET", "/v1/vault/ui/session") => {
+            // What the login page asks before showing a form: is there already
+            // a live session, and how long has it left? The renewal is
+            // deliberate here — the person is demonstrably at the vault — and
+            // the answer carries no secret, only its own expiry.
+            let vault = match crate::vault::Vault::open(&state.data_dir) {
+                Ok(v) => v,
+                Err(e) => {
+                    return (
+                        "500 Internal Server Error",
+                        "application/json",
+                        format!("{{\"error\":{}}}", json_string(&e)),
+                        None,
+                    );
+                }
+            };
+            match vault.ui_session_check(cookie.and_then(crate::vault::cookie_token).as_deref()) {
+                Some(session) => (
+                    "200 OK",
+                    "application/json",
+                    format!(
+                        "{{\"authenticated\":true,\"remember\":{},\"expires_in\":{}}}",
+                        session.remember,
+                        session.max_age()
+                    ),
+                    Some(session_cookie(
+                        &cookie
+                            .and_then(crate::vault::cookie_token)
+                            .unwrap_or_default(),
+                        session.max_age(),
+                    )),
+                ),
+                None => (
+                    "200 OK",
+                    "application/json",
+                    "{\"authenticated\":false}".into(),
+                    None,
+                ),
+            }
         }
         ("GET", "/v1/vault/ui/state") => {
             // The login page reads this before any session exists: whether a
@@ -4512,25 +4588,80 @@ fn vault_route(
             }
         }
         _ => {
-            let live = crate::vault::ui_session_valid(
-                cookie.and_then(crate::vault::cookie_token).as_deref(),
-            );
-            if !live {
+            // Everything below this line is the vault's data API and needs a
+            // live UI session. With nginx's `auth_basic` gone (the browser's
+            // native dialog was the thing being removed), this branch is the
+            // *only* thing standing between the public internet and every
+            // stored cookie, credential and secret request. It is therefore
+            // deliberately deny-by-default: a path that is not matched above
+            // gets a session check, and a request without one never reaches
+            // `vault_api`, whatever the path, method or query say.
+            let vault = match crate::vault::Vault::open(&state.data_dir) {
+                Ok(v) => v,
+                Err(e) => {
+                    return (
+                        "500 Internal Server Error",
+                        "application/json",
+                        format!("{{\"error\":{}}}", json_string(&e)),
+                        None,
+                    );
+                }
+            };
+            let token = cookie.and_then(crate::vault::cookie_token);
+            let Some(session) = vault.ui_session_check(token.as_deref()) else {
                 return (
                     "401 Unauthorized",
                     "application/json",
                     "{\"error\":\"vault: log in first\"}".into(),
                     None,
                 );
-            }
+            };
+            // Sliding renewal: the browser's copy of `Max-Age` is re-issued on
+            // every authenticated request, so an active session never expires
+            // under the person working, and an abandoned one still dies after
+            // its whole lifetime of silence.
             let (status, kind, response) = vault_api(method, path, body, state);
-            (status, kind, response, None)
+            (
+                status,
+                kind,
+                response,
+                Some(session_cookie(
+                    token.as_deref().unwrap_or_default(),
+                    session.max_age(),
+                )),
+            )
         }
     }
 }
 
 const LOGIN_PAGE: &str = include_str!("vault_login.html");
 const APP_PAGE: &str = include_str!("vault_app.html");
+
+/// The `Set-Cookie` value for a vault UI session.
+///
+/// Three attributes carry the security here, and the third one is a
+/// deliberate loosening:
+///
+/// - `HttpOnly` — no script can read the session token, so an XSS on this
+///   page cannot exfiltrate it.
+/// - `Secure` — the vault is served over HTTPS and only over HTTPS. Without
+///   the flag the cookie travelled in the clear on any accidental plain-HTTP
+///   request (the port-80 vhost answered the vault too), where anything on
+///   the path could read it and replay it.
+/// - `SameSite=Lax` instead of `Strict` — `Strict` withholds the cookie from
+///   every cross-site request, *including a top-level navigation*: arriving at
+///   the vault from a link in a mail client or a chat, or through a redirect,
+///   dropped the session with no explanation and the person was asked for the
+///   master password again. `Lax` sends the cookie on those top-level GETs
+///   and withholds it on every cross-site POST/form, which is the case that
+///   actually matters for forgery. Since every state-changing vault route is
+///   a POST or a DELETE, `Lax` keeps that protection intact.
+fn session_cookie(token: &str, max_age: i64) -> String {
+    format!("cu_vault_session={token}; Max-Age={max_age}; Path=/; HttpOnly; Secure; SameSite=Lax")
+}
+
+/// The same cookie, expired: what logging out sets.
+const CLEARED_COOKIE: &str = "cu_vault_session=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax";
 
 /// The vault data API. Reached either with the bearer token (the local CLI,
 /// an agent) or with a live UI session cookie (the vault UI through nginx).
@@ -5696,5 +5827,274 @@ mod frame_tests {
             "{text}"
         );
         assert!(pairs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod vault_session_tests {
+    use super::*;
+
+    /// A throwaway data directory per test, so the real `~/.cu/daemon` vault
+    /// is never the thing a test writes to.
+    fn tmp_state(tag: &str) -> AppState {
+        let dir = std::env::temp_dir().join(format!(
+            "cu-vault-route-{tag}-{}-{}",
+            std::process::id(),
+            crate::vault::ui_session_token()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        AppState {
+            vault_host: None,
+            daemon: false,
+            data_dir: dir,
+            token: "t".into(),
+            cdp_port: 1,
+            browser: BrowserState::new(),
+            public_host: None,
+        }
+    }
+
+    fn cookie_header(token: &str) -> String {
+        format!("cu_vault_session={token}")
+    }
+
+    #[test]
+    fn the_session_cookie_is_httponly_secure_and_lax() {
+        let cookie = session_cookie("TOKEN", 43200);
+        assert!(cookie.contains("HttpOnly"), "{cookie}");
+        assert!(cookie.contains("Secure"), "{cookie}");
+        assert!(cookie.contains("SameSite=Lax"), "{cookie}");
+        assert!(!cookie.contains("SameSite=Strict"), "{cookie}");
+        assert!(cookie.contains("Max-Age=43200"), "{cookie}");
+        assert!(cookie.contains("Path=/"), "{cookie}");
+        // Clearing must carry the same attributes, or the browser keeps a
+        // cookie that no longer matches and the logout does nothing.
+        assert!(CLEARED_COOKIE.contains("Max-Age=0"));
+        assert!(CLEARED_COOKIE.contains("Secure"));
+        assert!(CLEARED_COOKIE.contains("HttpOnly"));
+    }
+
+    /// The deny-by-default guarantee that replaces nginx's `auth_basic`: with
+    /// that gone, every route below the page/login/session ones must answer
+    /// 401 to a browser with no cookie, whatever the method or query.
+    #[test]
+    fn no_cookie_means_no_vault_data() {
+        let state = tmp_state("nocookie");
+        let routes = [
+            ("GET", "/v1/vault/status"),
+            ("GET", "/v1/vault/sessions"),
+            ("POST", "/v1/vault/sessions/save"),
+            ("DELETE", "/v1/vault/sessions/example.com"),
+            ("GET", "/v1/vault/credentials"),
+            ("POST", "/v1/vault/credentials"),
+            ("GET", "/v1/vault/credentials/1"),
+            ("DELETE", "/v1/vault/credentials/1"),
+            ("POST", "/v1/vault/passwd"),
+            ("GET", "/v1/vault/requests"),
+            ("POST", "/v1/vault/requests"),
+            ("GET", "/v1/vault/requests/1"),
+            ("POST", "/v1/vault/requests/1/approve"),
+            ("POST", "/v1/vault/requests/1/deny"),
+        ];
+        for (method, path) in routes {
+            let (status, _, body, _) = vault_route(method, path, "{}", &state, None);
+            assert_eq!(
+                status, "401 Unauthorized",
+                "{method} {path} answered {body}"
+            );
+            assert!(body.contains("log in first"), "{method} {path}: {body}");
+        }
+        // A junk cookie is no better than none.
+        for cookie in ["cu_vault_session=", "cu_vault_session=bogus", "other=1"] {
+            let (status, _, _, _) =
+                vault_route("GET", "/v1/vault/credentials", "{}", &state, Some(cookie));
+            assert_eq!(status, "401 Unauthorized", "cookie {cookie:?}");
+        }
+    }
+
+    #[test]
+    fn the_pages_and_the_session_probe_stay_open_but_leak_nothing() {
+        let state = tmp_state("open");
+        // The login page and the app shell are HTML with no data in them; the
+        // login page needs them to render at all.
+        for (method, path) in [("GET", "/vault"), ("GET", "/vault/app")] {
+            let (status, _, body, _) = vault_route(method, path, "", &state, None);
+            assert_eq!(status, "200 OK", "{path}");
+            assert!(!body.contains("hunter2"), "{path} must carry no data");
+        }
+        // `/v1/vault/ui/state` is read before any session exists (it decides
+        // first-run vs login) and says only whether a password is set.
+        let (status, _, body, _) = vault_route("GET", "/v1/vault/ui/state", "", &state, None);
+        assert_eq!(status, "200 OK");
+        assert!(body.contains("has_password"), "{body}");
+        // `/v1/vault/ui/session` says whether *this* cookie is live, and
+        // nothing about anyone else's.
+        let (status, _, body, _) = vault_route("GET", "/v1/vault/ui/session", "", &state, None);
+        assert_eq!(status, "200 OK");
+        assert!(body.contains("\"authenticated\":false"), "{body}");
+        assert!(!body.contains("remember"), "{body}");
+    }
+
+    #[test]
+    fn logging_in_sets_a_cookie_and_logging_out_clears_it() {
+        let state = tmp_state("login");
+        let vault = crate::vault::Vault::open(&state.data_dir).expect("vault");
+        vault.set_password(None, "correct horse").unwrap();
+        let (status, _, body, _) = vault_route(
+            "POST",
+            "/v1/vault/ui/login",
+            r#"{"password":"correct horse","remember":true}"#,
+            &state,
+            None,
+        );
+        assert_eq!(status, "200 OK", "{body}");
+        let cookie = vault_route(
+            "POST",
+            "/v1/vault/ui/login",
+            r#"{"password":"correct horse","remember":true}"#,
+            &state,
+            None,
+        )
+        .3
+        .expect("cookie");
+        assert!(cookie.contains("Secure"), "{cookie}");
+        assert!(cookie.contains("SameSite=Lax"), "{cookie}");
+        let token = cookie
+            .split(';')
+            .next()
+            .and_then(|c| c.split_once('='))
+            .map(|(_, t)| t.to_string())
+            .expect("token");
+        // A remembered login gets the long Max-Age, and reads data back.
+        let max_age: i64 = cookie
+            .split("Max-Age=")
+            .nth(1)
+            .and_then(|v| v.split(';').next())
+            .and_then(|v| v.trim().parse().ok())
+            .expect("max-age");
+        assert!(
+            max_age > crate::vault::UI_SESSION_TTL,
+            "remember got {max_age}s"
+        );
+        let (status, _, _, _) = vault_route(
+            "GET",
+            "/v1/vault/credentials",
+            "{}",
+            &state,
+            Some(&cookie_header(&token)),
+        );
+        assert_eq!(status, "200 OK");
+        // Logout ends it.
+        let (_, _, _, cleared) = vault_route(
+            "POST",
+            "/v1/vault/ui/logout",
+            "{}",
+            &state,
+            Some(&cookie_header(&token)),
+        );
+        assert_eq!(cleared.as_deref(), Some(CLEARED_COOKIE));
+        let (status, _, _, _) = vault_route(
+            "GET",
+            "/v1/vault/credentials",
+            "{}",
+            &state,
+            Some(&cookie_header(&token)),
+        );
+        assert_eq!(status, "401 Unauthorized", "a logged-out cookie is dead");
+    }
+
+    #[test]
+    fn an_authenticated_request_renews_the_cookie_and_an_unanswered_one_does_not() {
+        let state = tmp_state("renew");
+        let vault = crate::vault::Vault::open(&state.data_dir).expect("vault");
+        vault.set_password(None, "pw").unwrap();
+        let token = vault.ui_session_create(true).expect("session");
+        let head = cookie_header(&token);
+        let (status, _, _, cookie) =
+            vault_route("GET", "/v1/vault/credentials", "{}", &state, Some(&head));
+        assert_eq!(status, "200 OK");
+        let cookie = cookie.expect("an authenticated request re-issues the cookie");
+        assert!(cookie.contains(&token), "the same token, not a new one");
+        assert!(cookie.contains("Secure") && cookie.contains("SameSite=Lax"));
+        let max_age: i64 = cookie
+            .split("Max-Age=")
+            .nth(1)
+            .and_then(|v| v.split(';').next())
+            .and_then(|v| v.trim().parse().ok())
+            .expect("max-age");
+        // Sliding: the reply hands back a full lifetime, not the remainder.
+        assert!(
+            max_age > crate::vault::UI_SESSION_TTL_REMEMBER - 120,
+            "renewed cookie had {max_age}s left, expected about a month"
+        );
+    }
+}
+
+#[cfg(test)]
+mod login_page_tests {
+    use super::*;
+
+    /// The iOS-Safari zoom trap is silent and invisible in a screenshot: the
+    /// zoom only shows on a real device. Asserting the rule in the served
+    /// bytes is the only check that catches a regression here.
+    #[test]
+    fn every_login_input_is_sixteen_pixels() {
+        for (page, name) in [(LOGIN_PAGE, "login"), (APP_PAGE, "app")] {
+            assert!(
+                page.contains("font-size: max(16px, 1em)"),
+                "{name} page lost the 16px input floor: a zoomed iOS viewport \
+                 that never zooms back"
+            );
+            // The old offenders, spelled out so a reintroduction is obvious.
+            assert!(
+                !page.contains("font-size: 0.95rem"),
+                "{name} page went back to 15.2px inputs"
+            );
+            assert!(
+                !page.contains("font-size: 1.2rem"),
+                "{name} page went back to a rem-sized input"
+            );
+        }
+    }
+
+    #[test]
+    fn the_login_form_meets_the_touch_target_floor() {
+        // 44px is the smallest reliably tappable target on a phone; the card's
+        // fields, its button and the remember row all carry it.
+        for needle in ["min-height: 44px"] {
+            assert!(
+                LOGIN_PAGE.contains(needle),
+                "login page lost its touch target floor ({needle})"
+            );
+        }
+        assert!(LOGIN_PAGE.contains(".remember {"), "remember row styled");
+        assert!(
+            LOGIN_PAGE.contains("id=\"remember\""),
+            "no remember checkbox in the form"
+        );
+        assert!(
+            LOGIN_PAGE.contains("remember: $('remember').checked"),
+            "the checkbox never reaches the server, so it would do nothing"
+        );
+    }
+
+    #[test]
+    fn the_login_page_respects_the_colour_scheme_and_focus() {
+        assert!(
+            LOGIN_PAGE.contains("prefers-color-scheme: dark"),
+            "login page is dark-only"
+        );
+        assert!(
+            LOGIN_PAGE.contains(":focus-visible"),
+            "no visible focus ring: keyboard users cannot see where they are"
+        );
+        assert!(
+            LOGIN_PAGE.contains("aria-live"),
+            "the error state is not announced"
+        );
+        assert!(
+            LOGIN_PAGE.contains("<label for=\"password\">"),
+            "the field has a placeholder but no label"
+        );
     }
 }

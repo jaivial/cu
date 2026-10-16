@@ -17,9 +17,9 @@
 //! salted PBKDF2-HMAC-SHA256 hash in `vault_meta`, and only unlocks the UI
 //! — the daemon itself reads the key file, as any process running as the
 //! user could anyway.
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
@@ -687,6 +687,10 @@ impl Vault {
             )
             .map_err(|e| e.to_string())?;
         }
+        // Sessions opened with the old password do not outlive it: whoever
+        // knows the new one must be the one holding a cookie, not everyone
+        // who was ever logged in before the change.
+        self.ui_sessions_drop_all();
         Ok(())
     }
 
@@ -864,6 +868,13 @@ CREATE TABLE IF NOT EXISTS vault_meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ui_sessions (
+  token_hash TEXT PRIMARY KEY,
+  remember   INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  last_seen  INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS sessions (
   domain        TEXT NOT NULL,
   profile       TEXT NOT NULL DEFAULT 'default',
@@ -886,48 +897,173 @@ CREATE TABLE IF NOT EXISTS credentials (
 );
 ";
 
-// ---- UI session cookies and login rate limiting (in-memory, daemon-lifetime) ----
-
-fn ui_sessions() -> &'static Mutex<HashSet<(String, Instant)>> {
-    static SET: OnceLock<Mutex<HashSet<(String, Instant)>>> = OnceLock::new();
-    SET.get_or_init(|| Mutex::new(HashSet::new()))
-}
+// ---- UI session cookies and login rate limiting ----
 
 fn login_attempts() -> &'static Mutex<VecDeque<Instant>> {
     static Q: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::new());
     &Q
 }
 
-const UI_SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
+/// A UI session that was not asked to be remembered: it lives this long from
+/// the last request that used it. Twelve hours is enough to close the laptop
+/// overnight without losing the vault, and short enough that a session left
+/// open on a shared machine is gone by the next working day.
+pub const UI_SESSION_TTL: i64 = 12 * 3600;
+/// With "remember this session" ticked: a month. Sliding like the short one,
+/// so an active month-long session is never cut off mid-work.
+pub const UI_SESSION_TTL_REMEMBER: i64 = 30 * 24 * 3600;
+
 const MAX_LOGIN_ATTEMPTS: usize = 5;
 const LOGIN_WINDOW: Duration = Duration::from_secs(300);
 
-/// A fresh UI session token (call only after the password checked out).
-pub fn ui_session_create() -> String {
-    let token = format!("{}-{}", random_token(), hex_encode(&rand_bytes::<16>()));
-    ui_sessions()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert((token.clone(), Instant::now()));
-    token
+/// A live UI session, as [`Vault::ui_session_check`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiSession {
+    /// Whether the person ticked "remember this session" at login.
+    pub remember: bool,
+    /// When this session stops being valid (unix seconds).
+    pub expires_at: i64,
 }
 
-pub fn ui_session_valid(token: Option<&str>) -> bool {
-    let Some(token) = token.filter(|t| !t.is_empty()) else {
-        return false;
-    };
-    let mut sessions = ui_sessions().lock().unwrap_or_else(|e| e.into_inner());
-    sessions.retain(|(_t, at)| at.elapsed() < UI_SESSION_TTL);
-    sessions.iter().any(|(t, _)| t == token)
-}
-
-pub fn ui_session_drop(token: Option<&str>) {
-    if let Some(token) = token {
-        ui_sessions()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|(t, _)| t != token);
+impl UiSession {
+    /// Seconds left, floored at zero — what the cookie's `Max-Age` should be.
+    pub fn max_age(&self) -> i64 {
+        (self.expires_at - now()).max(0)
     }
+}
+
+/// The lifetime a session gets from its `remember` flag.
+pub fn ui_session_ttl(remember: bool) -> i64 {
+    if remember {
+        UI_SESSION_TTL_REMEMBER
+    } else {
+        UI_SESSION_TTL
+    }
+}
+
+/// A fresh UI session token (call only after the password checked out). Only
+/// its hash is stored, so a database that leaks hands over no live session.
+pub fn ui_session_token() -> String {
+    format!("{}-{}", random_token(), hex_encode(&rand_bytes::<16>()))
+}
+
+impl Vault {
+    /// Open a UI session for `remember` and return its token.
+    pub fn ui_session_create(&self, remember: bool) -> Result<String, String> {
+        let token = ui_session_token();
+        let at = now();
+        let ttl = ui_session_ttl(remember);
+        self.connect()?
+            .execute(
+                "INSERT INTO ui_sessions(token_hash, remember, created_at, last_seen, expires_at)
+                 VALUES (?1, ?2, ?3, ?3, ?4)",
+                rusqlite::params![token_hash(&token), i64::from(remember), at, at + ttl],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(token)
+    }
+
+    /// Whether `token` names a live session, sliding its expiry forward.
+    ///
+    /// The renewal is the point: someone working in the vault all afternoon
+    /// was being logged out at the twelve-hour mark with no warning, because
+    /// the lifetime was measured from login rather than from last use. Every
+    /// authenticated request moves the deadline instead, so a session dies
+    /// after a *period of inactivity* — the behaviour every other session
+    /// cookie in the world has — and not after a fixed span of wall clock.
+    pub fn ui_session_check(&self, token: Option<&str>) -> Option<UiSession> {
+        let token = token.filter(|t| !t.is_empty())?;
+        let hash = token_hash(token);
+        let at = now();
+        let conn = self.connect().ok()?;
+        let row: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT remember, expires_at FROM ui_sessions WHERE token_hash = ?1",
+                [&hash],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        let (remember, expires_at) = row?;
+        if expires_at <= at {
+            // Expired: drop it here rather than waiting for a sweep, so a dead
+            // token cannot be told apart from one that never existed.
+            let _ = conn.execute("DELETE FROM ui_sessions WHERE token_hash = ?1", [&hash]);
+            return None;
+        }
+        let ttl = ui_session_ttl(remember != 0);
+        let _ = conn.execute(
+            "UPDATE ui_sessions SET last_seen = ?2, expires_at = ?3 WHERE token_hash = ?1",
+            rusqlite::params![hash, at, at + ttl],
+        );
+        Some(UiSession {
+            remember: remember != 0,
+            expires_at: at + ttl,
+        })
+    }
+
+    /// Whether `token` names a live session, without renewing it: the check
+    /// for surfaces that ask "am I logged in?" and must not quietly extend
+    /// the life of a session nobody is using.
+    pub fn ui_session_valid(&self, token: Option<&str>) -> bool {
+        self.ui_session_peek(token).is_some()
+    }
+
+    /// The stored session without touching its expiry.
+    fn ui_session_peek(&self, token: Option<&str>) -> Option<UiSession> {
+        let hash = token_hash(token?);
+        let at = now();
+        self.connect()
+            .ok()?
+            .query_row(
+                "SELECT remember, expires_at FROM ui_sessions WHERE token_hash = ?1",
+                [&hash],
+                |r| {
+                    Ok(UiSession {
+                        remember: r.get::<_, i64>(0)? != 0,
+                        expires_at: r.get::<_, i64>(1)?,
+                    })
+                },
+            )
+            .ok()
+            .filter(|s| s.expires_at > at)
+    }
+
+    /// End the session `token` names (logging out).
+    pub fn ui_session_drop(&self, token: Option<&str>) {
+        let Some(hash) = token.filter(|t| !t.is_empty()).map(token_hash) else {
+            return;
+        };
+        if let Ok(conn) = self.connect() {
+            let _ = conn.execute("DELETE FROM ui_sessions WHERE token_hash = ?1", [&hash]);
+        }
+    }
+
+    /// Forget every session — for when the master password changes.
+    pub fn ui_sessions_drop_all(&self) {
+        if let Ok(conn) = self.connect() {
+            let _ = conn.execute("DELETE FROM ui_sessions", []);
+        }
+    }
+
+    /// Delete sessions that expired more than a day ago, so a long-lived
+    /// vault does not accumulate rows nobody will ever look up again.
+    pub fn ui_sessions_reap(&self) {
+        if let Ok(conn) = self.connect() {
+            let _ = conn.execute(
+                "DELETE FROM ui_sessions WHERE expires_at < ?1",
+                [now() - 24 * 3600],
+            );
+        }
+    }
+}
+
+/// What a UI session token is stored as. The token itself is a bearer
+/// credential: a copy of `vault.db` must not be a set of live sessions.
+fn token_hash(token: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(token.as_bytes());
+    hex_encode(&hasher.finalize())
 }
 
 /// Whether another login attempt is allowed right now, and if it is, record
@@ -1041,12 +1177,161 @@ mod tests {
 
     #[test]
     fn ui_sessions_expire_and_drop() {
-        let token = ui_session_create();
-        assert!(ui_session_valid(Some(&token)));
-        ui_session_drop(Some(&token));
-        assert!(!ui_session_valid(Some(&token)));
-        assert!(!ui_session_valid(Some("bogus")));
-        assert!(!ui_session_valid(None));
+        let vault = tmp_vault("sess");
+        let token = vault.ui_session_create(false).expect("session opens");
+        assert!(vault.ui_session_valid(Some(&token)));
+        vault.ui_session_drop(Some(&token));
+        assert!(!vault.ui_session_valid(Some(&token)));
+        assert!(!vault.ui_session_valid(Some("bogus")));
+        assert!(!vault.ui_session_valid(None));
+    }
+
+    #[test]
+    fn remember_buys_a_month_and_the_default_buys_twelve_hours() {
+        let vault = tmp_vault("remember");
+        let short = vault.ui_session_create(false).expect("session");
+        let long = vault.ui_session_create(true).expect("session");
+        let short = vault.ui_session_check(Some(&short)).expect("live");
+        let long = vault.ui_session_check(Some(&long)).expect("live");
+        assert!(!short.remember);
+        assert!(long.remember);
+        // Roughly the two lifetimes, not exactly: the check slid each one.
+        assert!(
+            (ui_session_ttl(false) - 60..=ui_session_ttl(false)).contains(&short.max_age()),
+            "short session had {}s left",
+            short.max_age()
+        );
+        assert!(
+            (ui_session_ttl(true) - 60..=ui_session_ttl(true)).contains(&long.max_age()),
+            "remembered session had {}s left",
+            long.max_age()
+        );
+    }
+
+    #[test]
+    fn a_session_slides_forward_so_working_in_the_vault_never_expires() {
+        let vault = tmp_vault("slide");
+        let token = vault.ui_session_create(false).expect("session");
+        // Wind the stored expiry back to almost nothing: a session created a
+        // whole lifetime ago, used a moment ago.
+        vault
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE ui_sessions SET expires_at = ?1 WHERE token_hash = ?2",
+                rusqlite::params![now() + 5, token_hash(&token)],
+            )
+            .unwrap();
+        let session = vault.ui_session_check(Some(&token)).expect("still live");
+        assert!(
+            session.max_age() > ui_session_ttl(false) / 2,
+            "the deadline moved forward instead of running out: {}s left",
+            session.max_age()
+        );
+        // A peeking check, by contrast, leaves the deadline alone.
+        vault
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE ui_sessions SET expires_at = ?1 WHERE token_hash = ?2",
+                rusqlite::params![now() + 5, token_hash(&token)],
+            )
+            .unwrap();
+        assert!(vault.ui_session_valid(Some(&token)));
+        let after = vault.ui_session_peek(Some(&token)).expect("live").max_age();
+        assert!(after < 60, "peek must not extend: {after}s left");
+    }
+
+    #[test]
+    fn an_expired_session_is_refused_and_erased() {
+        let vault = tmp_vault("expired");
+        let token = vault.ui_session_create(false).expect("session");
+        vault
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE ui_sessions SET expires_at = ?1 WHERE token_hash = ?2",
+                rusqlite::params![now() - 1, token_hash(&token)],
+            )
+            .unwrap();
+        assert!(vault.ui_session_check(Some(&token)).is_none());
+        let left: i64 = vault
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM ui_sessions WHERE token_hash = ?1",
+                [&token_hash(&token)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "an expired session is not left lying in the table");
+    }
+
+    #[test]
+    fn sessions_survive_a_restart_and_the_raw_token_is_never_stored() {
+        let dir = std::env::temp_dir().join(format!(
+            "cu-vault-persist-{}-{}",
+            std::process::id(),
+            ui_session_token()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let token = Vault::open(&dir)
+            .expect("opens")
+            .ui_session_create(true)
+            .expect("session");
+        // A brand-new `Vault` over the same directory is what a daemon restart
+        // looks like: the session has to still be there.
+        let reopened = Vault::open(&dir).expect("reopens");
+        let session = reopened
+            .ui_session_check(Some(&token))
+            .expect("live after restart");
+        assert!(session.remember);
+        // And the database holds the hash, never the bearer token itself.
+        let stored: String = reopened
+            .connect()
+            .unwrap()
+            .query_row("SELECT token_hash FROM ui_sessions LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_ne!(stored, token);
+        assert_eq!(stored, token_hash(&token));
+        assert!(!stored.contains(&token));
+    }
+
+    #[test]
+    fn changing_the_master_password_ends_every_session() {
+        let vault = tmp_vault("pwrot");
+        vault.set_password(None, "first").unwrap();
+        let a = vault.ui_session_create(false).expect("session");
+        let b = vault.ui_session_create(true).expect("session");
+        vault.set_password(Some("first"), "second").unwrap();
+        assert!(
+            !vault.ui_session_valid(Some(&a)),
+            "old cookie must not survive"
+        );
+        assert!(
+            !vault.ui_session_valid(Some(&b)),
+            "old cookie must not survive"
+        );
+    }
+
+    #[test]
+    fn reaping_only_removes_rows_that_died_over_a_day_ago() {
+        let vault = tmp_vault("reap");
+        let fresh = vault.ui_session_create(false).expect("session");
+        let ancient = vault.ui_session_create(false).expect("session");
+        vault
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE ui_sessions SET expires_at = ?1 WHERE token_hash = ?2",
+                rusqlite::params![now() - 48 * 3600, token_hash(&ancient)],
+            )
+            .unwrap();
+        vault.ui_sessions_reap();
+        assert!(vault.ui_session_valid(Some(&fresh)));
+        assert!(!vault.ui_session_valid(Some(&ancient)));
     }
 
     #[test]
