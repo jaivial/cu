@@ -22,6 +22,9 @@ fn main() {
     // `--tab ID` runs any page command in another tab (a popup a click
     // opened, found with `cu tabs`); it is lifted out before dispatch.
     let mut tab: Option<String> = None;
+    // `--new-tab` asks for a page of this invocation's own, instead of the
+    // tab this session is already working in.
+    let mut new_tab = false;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--tab" {
@@ -31,13 +34,16 @@ fn main() {
             }
             tab = Some(args.remove(i + 1));
             args.remove(i);
+        } else if args[i] == "--new-tab" {
+            new_tab = true;
+            args.remove(i);
         } else {
             i += 1;
         }
     }
     // Append `tab=` to a page command's path, keeping any query it has.
     let on_tab = |path: &str| match &tab {
-        None => invocation_tab(path),
+        None => invocation_tab(path, new_tab),
         Some(id) if path.contains('?') => format!("{path}&tab={id}"),
         Some(id) => format!("{path}?tab={id}"),
     };
@@ -217,7 +223,7 @@ fn main() {
 }
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n\nPage commands take --tab ID to run in another tab (see `cu tabs`). to run in another tab (see `cu tabs`)."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
     );
 }
 
@@ -443,33 +449,101 @@ fn daemon_config() -> Option<(u16, String)> {
     Some((port, token))
 }
 
-/// A page command without `--tab`, talking to the daemon: open a fresh tab
-/// for this invocation and run there. Two agents invoking `cu` at the same
-/// moment then work on different pages by construction, and neither can
-/// touch the other's tab (nor a legacy instance's: `CU_DATA_DIR` callers
-/// keep the shared-default behaviour they were built on).
-fn invocation_tab(path: &str) -> String {
+/// A page command without `--tab`, talking to the daemon: work in the tab
+/// this session already has, opening one only the first time (with
+/// `--new-tab`, or when the session has none). `cu navigate` and the
+/// `cu snapshot` an agent runs after it are two invocations of one session, so
+/// the second reads the page the first opened; two sessions are two processes
+/// and never share a page.
+fn invocation_tab(path: &str, new_tab: bool) -> String {
     let Some((port, token)) = daemon_config() else {
         return path.to_string();
     };
-    let body = format!("{{\"owner_pid\":{}}}", std::process::id());
+    let owner = session_pid();
+    let body = format!("{{\"owner_pid\":{owner},\"fresh\":{new_tab}}}");
     match request_daemon(port, &token, "POST", "/v1/tabs", Some(&body)) {
         Ok(reply) => {
             if let Some(id) = server::json_value(&reply, "id") {
-                eprintln!(
-                    "cu: working in a fresh tab ({id}); it is collected when this process exits"
-                );
+                // A bare boolean, which `json_value` (string-only) cannot read.
+                if reply.contains("\"reused\":true") {
+                    eprintln!(
+                        "cu: working in tab ({id}), the page this session already had; it is collected when the session exits"
+                    );
+                } else {
+                    eprintln!(
+                        "cu: working in a fresh tab ({id}); it is collected when this session exits"
+                    );
+                }
                 return if path.contains('?') {
                     format!("{path}&tab={id}")
                 } else {
                     format!("{path}?tab={id}")
                 };
             }
+            eprintln!("cu: the daemon answered without a tab id; working in its default page");
             path.to_string()
         }
-        Err(_) => path.to_string(),
+        Err(e) => {
+            // Never silent: a page command that could not get a tab of its own
+            // would run in whatever page the daemon shows, which is how an
+            // agent ends up reading another agent's tab.
+            eprintln!("cu: could not open this session's tab ({e}); working in the default page");
+            path.to_string()
+        }
     }
 }
+
+/// The process this CLI call belongs to: the nearest ancestor that is not a
+/// one-shot shell (`sh -c ...`, the wrapper an agent runs one command in) nor
+/// another `cu`. Consecutive commands of one agent share it, so they share a
+/// page; a different agent is a different process and gets its own.
+fn session_pid() -> u32 {
+    let mut pid = std::process::id();
+    for _ in 0..8 {
+        let Some(parent) = parent_of(pid) else { break };
+        if parent <= 1 {
+            break;
+        }
+        if !is_transient_shell(parent) {
+            return parent;
+        }
+        pid = parent;
+    }
+    std::os::unix::process::parent_id()
+}
+
+/// The parent pid in `/proc/<pid>/stat`, read the way the kernel writes it
+/// (`comm` may hold spaces and parentheses, so the fields start after the last
+/// `)`).
+fn parent_of(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat.rsplit_once(')')?.1;
+    fields.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// A shell running one command (`bash -c 'cu ...'`) or a wrapper around one:
+/// these are per-invocation processes, so the session is above them.
+fn is_transient_shell(pid: u32) -> bool {
+    let comm = fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+    let comm = comm.trim();
+    match SHELLS.contains(&comm) {
+        true => fs::read_to_string(format!("/proc/{pid}/cmdline"))
+            .map(|line| {
+                line.split('\0').any(|arg| {
+                    arg.starts_with('-')
+                        && !arg.starts_with("--")
+                        && arg[1..].chars().any(|c| c == 'c')
+                        && arg.len() <= 4
+                })
+            })
+            .unwrap_or(false),
+        false => WRAPPERS.contains(&comm),
+    }
+}
+
+/// Shells and one-shot wrappers an agent (or a person) runs a command through.
+const SHELLS: [&str; 8] = ["sh", "bash", "dash", "zsh", "ash", "ksh", "fish", "busybox"];
+const WRAPPERS: [&str; 6] = ["timeout", "env", "nohup", "setsid", "nice", "stdbuf"];
 
 fn request_daemon(
     port: u16,

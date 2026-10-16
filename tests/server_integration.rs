@@ -1132,3 +1132,251 @@ fn an_annotated_screenshot_needs_refs_to_label() {
     let response = server.get("/v1/screenshot?annotate=nope");
     assert_eq!(status_code(&response), "400", "{response}");
 }
+
+// ---- the page a session works in ------------------------------------------
+//
+// `cu navigate` and the `cu snapshot` an agent runs after it are two CLI
+// invocations of one session: the daemon used to open a fresh tab for every
+// command, so the second read `about:blank`. These tests drive the real
+// routes and the real binary, not a mock of them.
+
+/// A pid that is alive and is not this process: a `sleep` the test kills at
+/// the end, standing in for a second agent.
+fn live_pid() -> (Child, u32) {
+    let child = Command::new("sleep")
+        .arg("60")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id();
+    (child, pid)
+}
+
+#[test]
+fn a_second_command_works_in_the_tab_its_session_already_has() {
+    let server = TestServer::start("tabs-reuse", true);
+    let owner = std::process::id();
+    let first = server.post("/v1/tabs", &format!("{{\"owner_pid\":{owner}}}"));
+    assert_eq!(status_code(&first), "200", "got {}", body_of(&first));
+    assert!(
+        body_of(&first).contains("\"reused\":false"),
+        "a first request should open a tab: {}",
+        body_of(&first)
+    );
+    let id = server::json_value(body_of(&first), "id").expect("tab id");
+    let second = server.post("/v1/tabs", &format!("{{\"owner_pid\":{owner}}}"));
+    assert_eq!(status_code(&second), "200", "got {}", body_of(&second));
+    assert!(
+        body_of(&second).contains("\"reused\":true"),
+        "the second request should be handed the same page: {}",
+        body_of(&second)
+    );
+    assert_eq!(
+        server::json_value(body_of(&second), "id").as_deref(),
+        Some(id.as_str())
+    );
+    // And only one tab was opened: the page the session now works in.
+    let listed = body_of(&server.get("/v1/tabs")).to_string();
+    assert!(
+        !listed.contains("TAB2"),
+        "a second tab was opened: {listed}"
+    );
+    assert_eq!(
+        listed.matches(&format!("\"id\":\"{id}\"")).count(),
+        1,
+        "{listed}"
+    );
+}
+
+#[test]
+fn two_sessions_never_share_a_page() {
+    let server = TestServer::start("tabs-two-sessions", true);
+    let (mut other, other_pid) = live_pid();
+    let mine = server.post(
+        "/v1/tabs",
+        &format!("{{\"owner_pid\":{}}}", std::process::id()),
+    );
+    let theirs = server.post("/v1/tabs", &format!("{{\"owner_pid\":{other_pid}}}"));
+    assert_eq!(status_code(&mine), "200", "got {}", body_of(&mine));
+    assert_eq!(status_code(&theirs), "200", "got {}", body_of(&theirs));
+    assert!(
+        body_of(&theirs).contains("\"reused\":false"),
+        "the other session got my page: {}",
+        body_of(&theirs)
+    );
+    assert_ne!(
+        server::json_value(body_of(&mine), "id"),
+        server::json_value(body_of(&theirs), "id")
+    );
+    // The other session comes back and gets its own tab, not mine.
+    let again = server.post("/v1/tabs", &format!("{{\"owner_pid\":{other_pid}}}"));
+    assert_eq!(
+        server::json_value(body_of(&again), "id"),
+        server::json_value(body_of(&theirs), "id")
+    );
+    let _ = other.kill();
+    let _ = other.wait();
+}
+
+#[test]
+fn a_new_tab_is_asked_for_explicitly() {
+    let server = TestServer::start("tabs-new-tab", true);
+    let owner = std::process::id();
+    let first = server.post("/v1/tabs", &format!("{{\"owner_pid\":{owner}}}"));
+    let id = server::json_value(body_of(&first), "id").expect("tab id");
+    // `--new-tab` carries `"fresh":true`: a page of this call's own, even
+    // though the session already has one.
+    let fresh = server.post(
+        "/v1/tabs",
+        &format!("{{\"owner_pid\":{owner},\"fresh\":true}}"),
+    );
+    assert_eq!(status_code(&fresh), "200", "got {}", body_of(&fresh));
+    assert!(
+        body_of(&fresh).contains("\"reused\":false"),
+        "{}",
+        body_of(&fresh)
+    );
+    let new_id = server::json_value(body_of(&fresh), "id").expect("tab id");
+    assert_ne!(id, new_id);
+    // The session works in the newest one from then on.
+    let after = server.post("/v1/tabs", &format!("{{\"owner_pid\":{owner}}}"));
+    assert_eq!(
+        server::json_value(body_of(&after), "id").as_deref(),
+        Some(new_id.as_str())
+    );
+}
+
+#[test]
+fn a_closed_tab_is_never_handed_back() {
+    let server = TestServer::start("tabs-closed", true);
+    let owner = std::process::id();
+    let first = server.post("/v1/tabs", &format!("{{\"owner_pid\":{owner}}}"));
+    let id = server::json_value(body_of(&first), "id").expect("tab id");
+    let closed = server.fragmented(&format!(
+        "DELETE /v1/tabs/{id} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n",
+        server.token
+    ));
+    assert_eq!(body_of(&closed), r#"{"closed":true}"#, "{closed}");
+    // A tab the browser no longer lists must not come back as "yours".
+    // (The fake browser names a new target from its live count, so a fresh tab
+    // can carry the closed tab's name: `reused:false` is what says it is new.)
+    let after = server.post("/v1/tabs", &format!("{{\"owner_pid\":{owner}}}"));
+    assert_eq!(status_code(&after), "200", "got {}", body_of(&after));
+    assert!(
+        body_of(&after).contains("\"reused\":false"),
+        "a closed tab was handed back: {}",
+        body_of(&after)
+    );
+}
+
+#[test]
+fn a_dead_session_is_not_given_a_tab_again() {
+    let server = TestServer::start("tabs-dead-owner", true);
+    let (mut child, pid) = live_pid();
+    let first = server.post("/v1/tabs", &format!("{{\"owner_pid\":{pid}}}"));
+    let id = server::json_value(body_of(&first), "id").expect("tab id");
+    child.kill().expect("kill sleep");
+    child.wait().expect("reap sleep");
+    // Wait for /proc/<pid> to go: a reaped process has none.
+    for _ in 0..100 {
+        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let after = server.post("/v1/tabs", &format!("{{\"owner_pid\":{pid}}}"));
+    assert_eq!(status_code(&after), "200", "got {}", body_of(&after));
+    assert!(
+        body_of(&after).contains("\"reused\":false"),
+        "a dead session's tab was handed back: {}",
+        body_of(&after)
+    );
+    assert_ne!(server::json_value(body_of(&after), "id"), Some(id));
+}
+
+/// A real `cu daemon`, a real fake browser, and the real binary run twice:
+/// the documented `navigate` -> `snapshot` flow the CLI documents, end to end.
+#[test]
+fn the_real_cli_keeps_one_page_for_its_session() {
+    let dir = std::env::temp_dir().join(format!("cu-it-cli-session-{}", std::process::id()));
+    let _ = remove_dir(&dir);
+    std::fs::create_dir_all(&dir).expect("data dir");
+    let (port, cdp_port) = (free_port(), free_port());
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_cu"))
+        .args(["daemon", "--port", &port.to_string(), "--cdp-port"])
+        .arg(cdp_port.to_string())
+        .arg("--data")
+        .arg(&dir)
+        .env(
+            "CU_BROWSER",
+            env!("CARGO_MANIFEST_DIR").to_owned() + "/tests/fake_chromium.py",
+        )
+        .stdout(Stdio::null())
+        .stderr(
+            std::fs::File::create(std::env::temp_dir().join("cu-it-cli-daemon.log"))
+                .map(Stdio::from)
+                .unwrap_or(Stdio::null()),
+        )
+        .spawn()
+        .expect("spawn cu daemon");
+    // Ready once it answers.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if std::fs::read_to_string(dir.join("server.json")).is_ok()
+            && TcpStream::connect(("127.0.0.1", port)).is_ok()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_cu"))
+            .args(args)
+            .env("CU_DAEMON_DIR", &dir)
+            .env_remove("CU_DATA_DIR")
+            .output()
+            .expect("run cu")
+    };
+    let first = run(&["snapshot"]);
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        stderr.contains("working in a fresh tab ("),
+        "the first command should open a tab: {stderr} daemon-log: {}",
+        std::fs::read_to_string(std::env::temp_dir().join("cu-it-cli-daemon.log"))
+            .unwrap_or_default()
+    );
+    assert_eq!(first.status.code(), Some(0), "snapshot failed: {stderr}");
+    let second = run(&["snapshot"]);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains("the page this session already had"),
+        "the second command should reuse the page: {stderr}"
+    );
+    assert_eq!(second.status.code(), Some(0), "snapshot failed: {stderr}");
+    // Same tab both times, and the page really came from it.
+    let id_of = |text: &str| {
+        let start = text.find("tab (").expect("tab marker") + "tab (".len();
+        text[start..]
+            .chars()
+            .take_while(|c| *c != ')')
+            .collect::<String>()
+    };
+    assert_eq!(
+        id_of(&String::from_utf8_lossy(&first.stderr)),
+        id_of(&String::from_utf8_lossy(&second.stderr))
+    );
+    assert!(String::from_utf8_lossy(&first.stdout).contains("snapshot") || first.stdout.len() > 2);
+    // `--new-tab` opens a second page and keeps working in it.
+    let third = run(&["snapshot", "--new-tab"]);
+    let stderr = String::from_utf8_lossy(&third.stderr);
+    assert!(stderr.contains("working in a fresh tab ("), "{stderr}");
+    assert_ne!(
+        id_of(&stderr),
+        id_of(&String::from_utf8_lossy(&second.stderr))
+    );
+    let _ = Command::new("kill").arg(daemon.id().to_string()).status();
+    let _ = daemon.wait();
+    let _ = remove_dir(&dir);
+}

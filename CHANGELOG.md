@@ -61,6 +61,30 @@
   *this* cookie is live. Login is still rate-limited to five attempts every
   five minutes.
 
+### Fixed
+
+
+- **A session keeps its page, so `cu navigate` and `cu snapshot` read the same
+  tab.** In daemon mode every page command without `--tab` opened a *fresh* tab,
+  so the flow the skill documents — `cu navigate URL`, then `cu snapshot` — read
+  `about:blank`: the second command landed in a new, empty page, and so did
+  `cu shot`, `cu text` and click-by-ref. Each command also left its tab behind
+  (five snapshots opened five tabs, reaped only ten minutes after the process
+  that asked for them died). A page command without `--tab` now works in the tab
+  its session already has, opening one only the first time: the second command
+  reads the page the first navigated to, and no tab is created per command. The
+  session is the nearest ancestor that is not a one-shot shell (`sh -c ...`), so
+  two agents are two sessions and still never share a page. `--new-tab` asks for
+  a page of this call's own, for a test that wants one.
+- **`POST /v1/tabs` waits for the browser like every other page route.** It was
+  the only page route outside the readiness gate, so a tab request racing
+  Chromium's start-up answered `502` and the CLI, which ignored the failure, ran
+  the command in whatever page the daemon was showing — one agent reading
+  another's tab without a word. The route now waits, and a CLI that still cannot
+  get a tab of its own says so on stderr instead of falling through silently.
+- **A closed tab is never handed back to its session**, and its lease goes with
+  it; a session whose process is gone does not get its old tab either.
+
 ## [1.1.2] - 2026-10-15
 
 ### Fixed
