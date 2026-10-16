@@ -42,15 +42,27 @@
 
 - HTTP basic auth, answered (`src/server.rs`): when the vault holds a
   user/password credential for a domain, `cu navigate` arms CDP
-  `Fetch.authRequired` interception scoped to that host for the length of the
-  navigation and answers a 401 + `WWW-Authenticate` challenge with the
-  vault's pair (`Fetch.continueWithAuth`) — a headless browser has no dialog
-  to offer, and Chrome strips URL-embedded credentials from subresource
-  fetches, so pages behind nginx-style basic auth used to be unreachable.
-  Every intercepted request is continued on the fly without ever stopping to
-  read a command's reply inline. The reply gains `"basic_auth":"responded"`
-  and the post-auth document status; `"auth":false` in the navigate body
-  turns the responder off.
+  `Fetch.authRequired` interception scoped to that host and answers a
+  401 + `WWW-Authenticate` challenge with the vault's pair
+  (`Fetch.continueWithAuth`) — a headless browser has no dialog to offer, and
+  Chrome strips URL-embedded credentials from subresource fetches, so pages
+  behind nginx-style basic auth used to be unreachable. Every intercepted
+  request is continued on the fly without ever stopping to read a command's
+  reply inline. The reply gains `"basic_auth":"responded"` and the post-auth
+  document status; `"auth":false` in the navigate body turns the responder
+  off.
+
+  The navigation's interception alone was not enough, and handing it back
+  once the document settled only moved the problem: a credential delivered
+  through `Fetch.continueWithAuth` is not reliably put in Chrome's HTTP auth
+  cache (measured against a real nginx-fronted origin over TLS: the realm was
+  challenged again for the page's very next request), and between an agent's
+  commands nobody is reading the tab to answer it. So a tab that navigated
+  with a vault pair keeps a responder of its own: a dedicated DevTools
+  connection, `Fetch` armed for that host, answering every challenge with the
+  pair and continuing every other intercepted request until the tab closes or
+  its connection dies. A navigation arms its own interception only after that
+  responder has let go.
 
 - Agent secret requests (`src/vault.rs`, `src/main.rs`, `src/vault_app.html`):
   `cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait]` asks for a
