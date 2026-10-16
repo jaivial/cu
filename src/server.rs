@@ -2268,6 +2268,80 @@ pub fn login_page() -> String {
 /// The viewport is overridden through `Emulation.setDeviceMetricsOverride`
 /// for this one capture and cleared afterwards, so later actions see the page
 /// as before.
+/// The metrics a tab is being shown at right now, as far as CDP will say.
+///
+/// CDP has **no getter** for `Emulation.setDeviceMetricsOverride` -- asking a
+/// browser what override is in force is not a command that exists -- so the
+/// only way to put a tab back the way it was is to measure what it is being
+/// *shown* at and re-apply that. Everything [`Viewport::read`] recovers comes
+/// from one `Runtime.evaluate`: the CSS viewport the page is laid out at and
+/// the device pixel ratio it is rendered at.
+///
+/// What is recovered is the size and the scale, which is what an override
+/// that another tool set (a QA harness emulating a phone, a second agent's
+/// `cu shot --width`) is for. What is not recovered is the `mobile` flag and
+/// an explicit `screenWidth`/`screenHeight`: neither is observable from the
+/// page, and guessing them would be worse than the browser's own values. For
+/// a `mobile:false` override -- the ordinary one, and the only one `cu`
+/// itself sets -- the restore is exact; for a mobile emulation it puts the
+/// tab back at the right CSS size and scale rather than at the window's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Viewport {
+    width: u32,
+    height: u32,
+    scale: f64,
+}
+
+impl Viewport {
+    /// The metrics this tab is currently shown at.
+    fn read(tab: &Tab) -> Option<Self> {
+        let reply = tab.command(
+            "Runtime.evaluate",
+            "{\"expression\":\"JSON.stringify({w:innerWidth,h:innerHeight,d:devicePixelRatio})\",\"returnByValue\":true}",
+        ).ok()?;
+        let value = evaluated_string(&reply)?;
+        let number = |key: &str| json_number(&value, key);
+        let (width, height) = (number("w")?, number("h")?);
+        // A page mid-navigation can report 0x0; there is nothing to restore
+        // from that, and re-applying it would pin the tab to nothing.
+        if !(width.is_finite() && height.is_finite()) || width < 1.0 || height < 1.0 {
+            return None;
+        }
+        let scale = number("d")
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .unwrap_or(1.0);
+        Some(Self {
+            width: width.round() as u32,
+            height: height.round() as u32,
+            scale,
+        })
+    }
+}
+
+/// Put the tab back the way it was before this capture.
+///
+/// Handing the tab to the browser is right when there was nothing to keep --
+/// but it is wrong when something else had emulated the tab, which is what
+/// clearing unconditionally used to do. With no getter for the override, the
+/// saved metrics are compared against what the browser falls back to: the same
+/// answer means nothing was emulated and the clear was the whole job, and a
+/// different answer means the saved metrics were an override the caller set,
+/// so they go back on.
+fn restore_viewport(was: Option<Viewport>, tab: &Tab) {
+    let _ = tab.command("Emulation.clearDeviceMetricsOverride", "{}");
+    let Some(was) = was else { return };
+    if Viewport::read(tab) == Some(was) {
+        return;
+    }
+    let _ = tab.command(
+        "Emulation.setDeviceMetricsOverride",
+        &format!(
+            "{{\"width\":{},\"height\":{},\"deviceScaleFactor\":{},\"mobile\":false}}",
+            was.width, was.height, was.scale
+        ),
+    );
+}
+
 fn screenshot(tab: &Tab, query: &str) -> (&'static str, &'static str, String) {
     let options = match ShotOptions::parse(query) {
         Ok(options) => options,
@@ -2281,10 +2355,13 @@ fn screenshot(tab: &Tab, query: &str) -> (&'static str, &'static str, String) {
     };
     let png = options.png;
     let format = if png { "png" } else { "jpeg" };
+    // Read BEFORE the capture overrides anything: what the tab is shown at
+    // now is the caller's, not the viewport this capture is about to set.
+    let was = Viewport::read(tab);
     let result = capture_annotated(tab, &options);
     if options.emulates() {
-        // Restore the browser's own viewport even if the capture failed.
-        let _ = tab.command("Emulation.clearDeviceMetricsOverride", "{}");
+        // Put the tab back the way this capture found it, even if it failed.
+        restore_viewport(was, tab);
     }
     match result {
         Ok((result, size)) => {

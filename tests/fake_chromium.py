@@ -25,6 +25,14 @@ PORT = next(
 CLOSED_MARKER = os.environ.get("FAKE_CHROMIUM_CLOSED")
 # Input commands received, in order; served at /input-log for the tests.
 INPUT_LOG = []
+# The viewport the page is emulated at, as `Emulation.setDeviceMetricsOverride`
+# last set it: (width, height, deviceScaleFactor), or None when the browser's
+# own window size applies. Like Chromium, `clearDeviceMetricsOverride` puts it
+# back to None and the metrics change back.
+EMULATED = [None]
+# The browser's own window size, in CSS pixels: what an un-emulated tab is
+# shown at, and what a cleared override falls back to.
+WINDOW = [1280, 720]
 # Tabs opened in browser contexts: target id -> context id.
 CONTEXT_TABS = {}
 # Targets closed with Target.closeTarget: gone from discovery, like Chromium.
@@ -92,6 +100,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(INPUT_LOG)
         elif self.path == "/download-behaviour":
             self.send_json(DOWNLOAD_BEHAVIOUR)
+        elif self.path == "/viewport":
+            self.send_raw(json.dumps(EMULATED[0], separators=(",", ":")))
+        elif self.path.startswith("/emulate"):
+            # Seed an override the way another tool would, before the daemon
+            # runs: GET /emulate?width=390&height=844&scale=2
+            q = dict(
+                kv.split("=", 1) for kv in self.path.split("?", 1)[-1].split("&") if "=" in kv
+            ) if "?" in self.path else {}
+            EMULATED[0] = [
+                float(q.get("width", 1280)),
+                float(q.get("height", 720)),
+                float(q.get("scale", 1)),
+            ]
+            self.send_raw(json.dumps(EMULATED[0], separators=(",", ":")))
         elif self.path == "/json/version":
             self.send_json(
                 {
@@ -146,6 +168,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_json(self, obj):
         body = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_raw(self, body: str):
+        """Send a body verbatim: for the endpoints whose exact spelling other
+        tests assert on."""
+        body = body.encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -312,6 +344,17 @@ class Handler(BaseHTTPRequestHandler):
             return {"result": {}}
         if method == "Page.captureScreenshot":
             return {"id": 1, "result": {"data": PNG}}
+        if method == "Emulation.setDeviceMetricsOverride":
+            p = params or {}
+            EMULATED[0] = [
+                p.get("width"),
+                p.get("height"),
+                p.get("deviceScaleFactor"),
+            ]
+            return {"result": {}}
+        if method == "Emulation.clearDeviceMetricsOverride":
+            EMULATED[0] = None
+            return {"result": {}}
         if method == "Runtime.evaluate":
             expr = (params or {}).get("expression", "")
             if "challenge" in expr and "location.href" in expr and DENY_ON["on"]:
@@ -384,6 +427,12 @@ class Handler(BaseHTTPRequestHandler):
                 return {"result": {"result": {"type": "string", "value": value}}}
             if "__cu.focus(" in expr or "__cu.select(" in expr:
                 return {"result": {"result": {"type": "string", "value": "{}"}}}
+            if "devicePixelRatio" in expr and "innerWidth" in expr:
+                # The viewport probe: an emulated tab reports the emulated
+                # metrics, an un-emulated one the window's.
+                w, h, d = EMULATED[0] or [WINDOW[0], WINDOW[1], 1]
+                value = json.dumps({"w": w, "h": h, "d": d})
+                return {"result": {"result": {"type": "string", "value": value}}}
             return {"id": 1, "result": {"result": {"type": "undefined"}}}
         return {"id": 1, "result": {}}
 

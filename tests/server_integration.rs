@@ -811,6 +811,79 @@ fn download_behaviour(server: &TestServer) -> String {
     .expect("download behaviour")
 }
 
+/// The viewport the fake browser is currently emulating, as
+/// `(width, height, scale)`, or `None` when its own window size applies.
+///
+/// Compared as numbers, not as the JSON text: `cu` sets whole CSS pixels and
+/// the fake keeps whatever type it was handed, so the two spell the same
+/// viewport differently ("390" and "390.0") and the pixels are what matter.
+fn emulated_viewport(server: &TestServer) -> Option<(f64, f64, f64)> {
+    let reply =
+        server::http_get(&format!("127.0.0.1:{}", server.cdp_port), "/viewport").expect("viewport");
+    // The fake answers `[width,height,scale]`, so these are array positions,
+    // not the object keys `json_number` looks for.
+    let values: Vec<f64> = reply
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+    match values[..] {
+        [w, h, d, ..] => Some((w, h, d)),
+        _ => None,
+    }
+}
+
+/// The same, as the text the fake serves, for a test that wants to assert the
+/// override is gone outright.
+fn raw_viewport(server: &TestServer) -> String {
+    server::http_get(&format!("127.0.0.1:{}", server.cdp_port), "/viewport").expect("viewport")
+}
+
+/// A capture that emulates a viewport must not take anyone else's with it.
+///
+/// Another tool (a QA harness emulating a phone, a second agent's
+/// `cu shot --width`) can have a device metrics override in force on the tab.
+/// `cu` used to clear that override unconditionally once its own capture was
+/// done, so the caller found its tab back at the browser's window size with
+/// nothing said -- every later action then measured the wrong layout.
+#[test]
+fn a_capture_restores_the_viewport_it_found() {
+    let server = TestServer::start("shot-keep-override", true);
+    // Another tool emulates a 390x844 phone on this tab before we get here.
+    server::http_get(
+        &format!("127.0.0.1:{}", server.cdp_port),
+        "/emulate?width=390&height=844&scale=2",
+    )
+    .expect("seed the override");
+    assert_eq!(emulated_viewport(&server), Some((390.0, 844.0, 2.0)));
+
+    let response = server.get("/v1/screenshot?width=800&height=600");
+    assert_eq!(status_code(&response), "200", "{}", body_of(&response));
+
+    assert_eq!(
+        emulated_viewport(&server),
+        Some((390.0, 844.0, 2.0)),
+        "cu cleared an override it did not set: the caller's viewport is gone"
+    );
+}
+
+/// The ordinary case, kept: a capture on a tab nobody emulated leaves the
+/// browser's own window in charge, instead of pinning the tab to the size
+/// that happened to be on screen during the capture.
+#[test]
+fn a_capture_leaves_an_unemulated_tab_to_the_browser() {
+    let server = TestServer::start("shot-clear-override", true);
+    let response = server.get("/v1/screenshot?width=800&height=600");
+    assert_eq!(status_code(&response), "200", "{}", body_of(&response));
+    assert_eq!(
+        raw_viewport(&server),
+        "null",
+        "the tab is pinned to the capture's viewport instead of following the window"
+    );
+}
+
 #[test]
 fn a_click_by_ref_is_a_real_mouse_click() {
     let server = TestServer::start("click-ref", true);
