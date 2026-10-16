@@ -63,6 +63,23 @@
 
 ### Fixed
 
+- **`cu shot` no longer takes another tool's viewport away with it.** A capture
+  asked for a size (`--width`/`--height`/`--scale`) or a clip emulates that
+  viewport for the shot and then cleared the override unconditionally. That is
+  right for the override it set itself and wrong for one that was already in
+  force: another tool (a QA harness emulating a phone, a second agent's
+  capture) had put the tab at its own size, and `cu` left it at the browser's
+  window size instead, silently. Measured on a live tab emulated at 390x844, a
+  plain `cu shot --width 800 --height 600` put the page back at 1366x629, so
+  every later action in that session measured a layout nobody asked for.
+
+  CDP has no "what override is set?" command, so `cu` now reads the metrics the
+  tab is being shown at before the capture and compares them with what the
+  browser falls back to after clearing: the same answer means nothing was
+  emulated and the clear was the whole job, and a different one means the saved
+  metrics were somebody else's and they go back on. The size and the device
+  scale factor are recovered exactly; the `mobile` flag and an explicit
+  screen size are not observable from the page and are left to the browser.
 
 - **A session keeps its page, so `cu navigate` and `cu snapshot` read the same
   tab.** In daemon mode every page command without `--tab` opened a *fresh* tab,
