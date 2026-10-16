@@ -1030,6 +1030,75 @@ fn the_responder_keeps_answering_after_the_document_has_settled() {
 }
 
 #[test]
+fn two_browsers_keep_their_own_responders() {
+    // The map of live responders is per *process*, but a target id is per
+    // *browser* -- both fakes here call their first tab `PAGE1`. Keyed by the
+    // target alone, the two servers file their responders under one key and
+    // whichever navigates second stops the other's, a responder nobody asked
+    // to stop: the first browser's later challenges go unanswered.
+    let first = TestServer::start("auth-two-browsers-a", true);
+    let second = TestServer::start("auth-two-browsers-b", true);
+    vault_basic_auth(&first, "alpha.test", "alice", "alpha-pw");
+    vault_basic_auth(&second, "beta.test", "bob", "beta-pw");
+
+    for server in [&first, &second] {
+        let host = if server.addr == first.addr {
+            "alpha.test"
+        } else {
+            "beta.test"
+        };
+        let response = server.post(
+            &format!("/v1/navigate?tab=PAGE1"),
+            &format!(r#"{{"url":"https://{host}/app"}}"#),
+        );
+        assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+        assert!(
+            body_of(&response).contains("\"basic_auth\":\"responded\""),
+            "{host} went unanswered: {}",
+            body_of(&response)
+        );
+    }
+
+    // Each responder must still be armed for its own host. With a shared key
+    // the second navigation stopped the first, so one browser is left with
+    // nothing watching it and challenges there are never answered.
+    for (server, host) in [(&first, "alpha.test"), (&second, "beta.test")] {
+        let armed = wait_until(
+            || fetch_armed(server),
+            |armed| armed.contains(host),
+            Duration::from_secs(5),
+        );
+        assert!(
+            armed.contains(host),
+            "{host} has no live responder: {armed}"
+        );
+        let pushed = challenge_now(server, host, &format!("late-{host}"));
+        assert!(
+            pushed.contains("\"challenged\": 1"),
+            "nothing was intercepting {host}: {pushed}"
+        );
+        let log = wait_until(
+            || fetch_log(server),
+            |log| {
+                fetch_answers_for(log, &format!("late-{host}")).contains("Fetch.continueWithAuth")
+            },
+            Duration::from_secs(5),
+        );
+        let answers = fetch_answers_for(&log, &format!("late-{host}"));
+        let pair = if host == "alpha.test" {
+            ("alice", "alpha-pw")
+        } else {
+            ("bob", "beta-pw")
+        };
+        assert!(
+            answers.contains(&format!("\"username\": \"{}\"", pair.0))
+                && answers.contains(&format!("\"password\": \"{}\"", pair.1)),
+            "{host} was answered with the wrong pair, or by the other browser: {answers}"
+        );
+    }
+}
+
+#[test]
 fn a_host_without_a_credential_is_never_intercepted() {
     // Nothing to answer with: arming `Fetch` would only pause requests with
     // no way to release them, which is the hang the responder was meant to
