@@ -26,8 +26,13 @@
            border-radius: 12px; width: min(34rem, 94vw); padding: 1.4rem; }
   dialog::backdrop { background: rgba(0,0,0,0.6); }
   label { display: block; font-size: 0.85rem; color: #8b93a7; margin: 0.7rem 0 0.2rem; }
+  /* 16px exactly, like the login page: below that iOS Safari zooms the
+     viewport on focus and never zooms back. */
   input, textarea, select { width: 100%; padding: 0.45rem 0.6rem; border-radius: 8px;
-           border: 1px solid #2a2f3a; background: #0f1115; color: inherit; font-size: 0.95rem; }
+           border: 1px solid #2a2f3a; background: #0f1115; color: inherit;
+           font-size: max(16px, 1em); }
+  input:focus-visible, button:focus-visible, select:focus-visible, textarea:focus-visible {
+    outline: 2px solid #3b82f6; outline-offset: 2px; }
   textarea { font-family: ui-monospace, monospace; min-height: 4rem; }
   .field-row { display: grid; grid-template-columns: 1fr 1.4fr 7rem auto auto; gap: 0.4rem;
                align-items: center; margin-bottom: 0.4rem; }
