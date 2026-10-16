@@ -844,7 +844,8 @@ pub fn route(
     // while the browser is down, so it is deliberately not gated.
     let needs_browser = matches!(
         (method, path),
-        ("POST", "/v1/navigate")
+        ("POST", "/v1/tabs")
+            | ("POST", "/v1/navigate")
             | ("GET", "/v1/screenshot")
             | ("GET", "/v1/snapshot")
             | ("POST", "/v1/navigate-and-snapshot")
@@ -961,8 +962,12 @@ pub fn route(
                 format!("{{\"error\":{}}}", json_string(&e)),
             ),
         },
-        // A fresh tab for this invocation to work in (`cu daemon` mode: the
-        // CLI opens one per command so two agents never share a page).
+        // The page this session works in: the tab it already holds when there
+        // is one (so `cu navigate` and the `cu snapshot` after it read the same
+        // page), and a fresh tab otherwise -- or always, with `"fresh":true`
+        // (`--new-tab`), which is what a test that wants a page of its own
+        // asks for. A different session is a different owner and never lands
+        // in another agent's tab.
         ("POST", "/v1/tabs") => {
             let url = {
                 let asked = json_value(body, "url").unwrap_or_default();
@@ -973,6 +978,24 @@ pub fn route(
                 }
             };
             let owner = json_value(body, "owner_pid").and_then(|p| p.parse::<u32>().ok());
+            // The string-only JSON reader cannot see a bare boolean, which is
+            // what `--new-tab` sends (`"fresh":true`).
+            let fresh = body.contains("\"fresh\":true") || body.contains("\"fresh\": true");
+            if !fresh
+                && let Some(pid) = owner
+                && let Some(id) = leased_tab_of(state.cdp_port, pid)
+            {
+                touch_tab_lease(&id);
+                return (
+                    "200 OK",
+                    "application/json",
+                    format!(
+                        "{{\"id\":{},\"tab\":{},\"reused\":true}}",
+                        json_string(&id),
+                        json_string(&id)
+                    ),
+                );
+            }
             match browser_command(
                 state.cdp_port,
                 "Target.createTarget",
@@ -988,7 +1011,7 @@ pub fn route(
                             "200 OK",
                             "application/json",
                             format!(
-                                "{{\"id\":{},\"tab\":{}}}",
+                                "{{\"id\":{},\"tab\":{},\"reused\":false}}",
                                 json_string(&id),
                                 json_string(&id)
                             ),
@@ -1966,6 +1989,11 @@ pub fn close_tab(cdp_port: u16, id: &str) -> Result<(), String> {
         }
         thread::sleep(Duration::from_millis(10));
     }
+    // The lease goes with the tab: a session must not be handed a closed id.
+    tab_leases()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(id);
     // The pool of a closed tab is dead weight, and if it was the default the
     // next action must pick a live page instead of a vanished id.
     forget_tab(&Tab {
@@ -4995,6 +5023,32 @@ fn register_tab_lease(id: &str, owner_pid: u32) {
                 used: Instant::now(),
             },
         );
+}
+
+/// The live tab a session already works in, if any: the most recently used
+/// one leased to `owner_pid`. A leased tab the browser no longer lists (a
+/// popup closed by hand, a crashed renderer) is dropped here instead of being
+/// handed back.
+fn leased_tab_of(cdp_port: u16, owner_pid: u32) -> Option<String> {
+    let live: Vec<String> = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")
+        .map(|discovery| {
+            json_objects(&discovery)
+                .into_iter()
+                .filter(|o| json_string_value(o, "type").as_deref() == Some("page"))
+                .filter_map(|o| json_string_value(&o, "id"))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !pid_alive(owner_pid) {
+        return None;
+    }
+    let mut leases = tab_leases().lock().unwrap_or_else(|e| e.into_inner());
+    leases.retain(|id, lease| lease.owner_pid != owner_pid || live.iter().any(|open| open == id));
+    leases
+        .iter()
+        .filter(|(_, lease)| lease.owner_pid == owner_pid)
+        .max_by_key(|(_, lease)| lease.used)
+        .map(|(id, _)| id.clone())
 }
 
 fn touch_tab_lease(id: &str) {

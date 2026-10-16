@@ -13,7 +13,11 @@ Use `cu` when an agent needs a persistent local browser session.
    `CU_HEADLESS=1` asks for `--headless=new` back (and those sites will
    challenge), `CU_DISPLAY=:N` picks the display.
 2. Check it: `cu status`.
-3. Navigate with `cu navigate https://example.com`. If the reply says
+3. Navigate with `cu navigate https://example.com`. A page command without
+   `--tab` works in the tab this session already has, opening one the first
+   time: the commands of one agent -- `navigate`, then `snapshot`, then a
+   `click` -- share one page. `--new-tab` opens a page of this call's own
+   instead (what a test that wants its own page asks for). If the reply says
    `"settled":false`, the page was still loading when the three-second wait
    ended: take a snapshot before acting. A navigation that cannot happen is a
    `navigation failed: ...` error, not silence.
@@ -39,7 +43,8 @@ Use `cu` when an agent needs a persistent local browser session.
 6. For credentials, run `cu login`, navigate to the site's sign-in page, then direct the user to the printed `/login` page. The daemon types what they enter into the browser. Never ask the user to paste a password into chat and never include passwords in tool arguments.
 7. Popups and extra tabs: `cu tabs` lists them (the default is flagged);
    any page command takes `--tab ID` to run there, and `cu tabs close ID`
-   dismisses one. Never act on a popup guessed from `cu tabs` output of an
+   dismisses one. A tab a session opened is its own: another agent never
+   lands in it. Never act on a popup guessed from `cu tabs` output of an
    older snapshot -- ids and urls come from the last `cu tabs`.
 8. QA references. When a check fails, pin it to the element instead of
    describing it in prose: `cu mark e7 "overlaps the footer at 375px"
