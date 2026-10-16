@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
@@ -1567,6 +1567,12 @@ fn navigate_observed(
             )
         });
     let auth_on = auth.is_some() && enabled.is_ok();
+    if auth_on {
+        // This navigation arms `Fetch` itself, so the tab's background
+        // responder has to let go first: two sessions intercepting the same
+        // host would both have to answer every request.
+        stop_auth_keeper(tab);
+    }
     if auth_on
         && connection
             .call("Fetch.enable", &fetch_enable_params(&url_host(url)))
@@ -1725,6 +1731,12 @@ fn navigate_observed(
         }
         let _ = connection.call("Fetch.disable", "{}");
         connection.set_read_timeout(CDP_HTTP_TIMEOUT);
+        // Hand the host to a responder of its own: from here the page's
+        // requests are answered even while no command is running (see
+        // [`AuthKeeper`]).
+        if let Some(pair) = auth.clone() {
+            start_auth_keeper(tab, &url_host(url), pair);
+        }
         (
             nav_reply.ok_or_else(|| "navigation did not answer within the auth window".to_string()),
             auth_handled,
@@ -1911,6 +1923,11 @@ pub fn tabs_json(cdp_port: u16) -> Result<String, String> {
 
 /// Close a tab by id. The last page is refused: Chromium exits with it.
 pub fn close_tab(cdp_port: u16, id: &str) -> Result<(), String> {
+    // The tab's background auth responder goes with it.
+    stop_auth_keeper(&Tab {
+        cdp_port,
+        target: Some(id.to_string()),
+    });
     let discovery = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")?;
     // Every page target counts here, context tabs included: any of them keeps
     // Chromium alive, and a context's tab may be closed directly (the context
@@ -3783,8 +3800,27 @@ impl CdpConnection {
     }
 
     fn next_message(&mut self, limit: usize) -> Result<String, String> {
-        let payload = read_frame(&mut self.stream, limit)?;
+        let payload = read_frame(&mut self.stream, limit).map_err(|e| e.to_string())?;
         String::from_utf8(payload).map_err(|e| e.to_string())
+    }
+
+    /// Like [`Self::next_message`], but a read that timed out is `Ok(None)`
+    /// instead of an error: the background auth responder polls the stream
+    /// between answers and must tell "nothing to answer yet" from "this
+    /// connection is gone, stop".
+    fn next_message_optional(&mut self, limit: usize) -> Result<Option<String>, String> {
+        match read_frame(&mut self.stream, limit) {
+            Ok(payload) => String::from_utf8(payload)
+                .map(Some)
+                .map_err(|e| e.to_string()),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     /// How long the next read may wait: the auth window pumps the stream
@@ -3844,6 +3880,132 @@ pub fn checkin(tab: &Tab, connection: CdpConnection) {
     let pool = cdp_pool(tab);
     let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
     guard.put(connection);
+}
+
+/// How long the auth responder's read waits before it looks at its stop flag
+/// again.
+const AUTH_KEEPER_POLL: Duration = Duration::from_millis(500);
+
+/// One tab's background basic-auth responder.
+///
+/// Why it exists: a credential handed to the browser through
+/// `Fetch.continueWithAuth` is **not** reliably put in Chrome's HTTP auth
+/// cache. Measured on this machine against a real nginx-fronted origin over
+/// TLS: the realm was challenged again for the page's very next request.
+/// With the cache empty and no dialog in headless, that request then waits
+/// for ever. Answering every challenge means somebody has to be reading the
+/// tab's event stream at all times, which a task-driven agent cannot promise:
+/// between its commands nobody is reading, and a paused request only arrives
+/// when somebody is.
+///
+/// So the tab gets a reader of its own — a dedicated DevTools connection with
+/// `Fetch` armed for the credentialled host, answering challenges with the
+/// vault pair and continuing every other intercepted request. Its own
+/// connection keeps the pool free for commands, and a connection that dies
+/// (tab closed, browser restarted) takes its interception with it.
+struct AuthKeeper {
+    host: String,
+    pair: (String, String),
+    stop: Arc<AtomicBool>,
+    /// Set once the thread has let the interception go: whoever arms `Fetch`
+    /// next must not race a responder still holding it.
+    done: Arc<AtomicBool>,
+}
+
+fn auth_keepers() -> &'static Mutex<HashMap<String, Arc<AuthKeeper>>> {
+    static KEEPERS: OnceLock<Mutex<HashMap<String, Arc<AuthKeeper>>>> = OnceLock::new();
+    KEEPERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The key a tab's keeper is filed under.
+fn keeper_key(tab: &Tab) -> String {
+    tab.target
+        .clone()
+        .unwrap_or_else(|| format!("default:{}", tab.cdp_port))
+}
+
+/// Stop a tab's keeper, waiting (bounded) for it to give the interception
+/// back, so a navigation's own `Fetch.enable` is never a second interceptor
+/// on the same host.
+fn stop_auth_keeper(tab: &Tab) {
+    let key = keeper_key(tab);
+    let Some(keeper) = auth_keepers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key)
+    else {
+        return;
+    };
+    keeper.stop.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !keeper.done.load(Ordering::SeqCst) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Arm (or re-arm) the tab's responder for `host` with `pair`. A keeper
+/// already running for the tab is stopped first, so re-navigating to the same
+/// host replaces its credentials instead of racing them.
+fn start_auth_keeper(tab: &Tab, host: &str, pair: (String, String)) {
+    if host.is_empty() {
+        return;
+    }
+    stop_auth_keeper(tab);
+    let keeper = Arc::new(AuthKeeper {
+        host: host.to_string(),
+        pair,
+        stop: Arc::new(AtomicBool::new(false)),
+        done: Arc::new(AtomicBool::new(false)),
+    });
+    auth_keepers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(keeper_key(tab), Arc::clone(&keeper));
+    let tab = tab.clone();
+    thread::spawn(move || {
+        let mut connection = match CdpConnection::open(&tab) {
+            Ok(connection) => connection,
+            Err(_) => {
+                keeper.done.store(true, Ordering::SeqCst);
+                return;
+            }
+        };
+        if connection
+            .call("Fetch.enable", &fetch_enable_params(&keeper.host))
+            .is_err()
+        {
+            // Something else already answers for this host; leave it be.
+            keeper.done.store(true, Ordering::SeqCst);
+            return;
+        }
+        while !keeper.stop.load(Ordering::SeqCst) {
+            connection.set_read_timeout(AUTH_KEEPER_POLL);
+            match connection.next_message_optional(MAX_CDP_MESSAGE) {
+                Ok(Some(text)) => {
+                    if message_id(&text).is_some() {
+                        continue;
+                    }
+                    if let Some(rid) = auth_required_id(&text) {
+                        connection.send(
+                            "Fetch.continueWithAuth",
+                            &continue_with_auth_params(&rid, &Some(keeper.pair.clone())),
+                        );
+                    } else if let Some(rid) = paused_request_id(&text) {
+                        connection.send(
+                            "Fetch.continueRequest",
+                            &format!("{{\"requestId\":{}}}", json_string(&rid)),
+                        );
+                    }
+                }
+                // Nothing to answer yet.
+                Ok(None) => continue,
+                // The stream is gone: the interception dies with it.
+                Err(_) => break,
+            }
+        }
+        let _ = connection.call("Fetch.disable", "{}");
+        keeper.done.store(true, Ordering::SeqCst);
+    });
 }
 
 /// The string a `Runtime.evaluate` with `returnByValue` produced.
@@ -4001,26 +4163,26 @@ pub const SETTLE_MAX: Duration = Duration::from_millis(3000);
 /// forms used to be handled, so `Page.captureScreenshot` failed with
 /// "CDP response is too large". Payloads are also read to their full announced
 /// length, which a single `read()` does not guarantee.
-fn read_frame(stream: &mut TcpStream, limit: usize) -> Result<Vec<u8>, String> {
+fn read_frame(stream: &mut TcpStream, limit: usize) -> std::io::Result<Vec<u8>> {
     let mut head = [0; 2];
-    stream.read_exact(&mut head).map_err(|e| e.to_string())?;
+    stream.read_exact(&mut head)?;
     let opcode = head[0] & 0x0f;
     let mut len = (head[1] & 0x7f) as usize;
     if len == 126 {
         let mut b = [0; 2];
-        stream.read_exact(&mut b).map_err(|e| e.to_string())?;
+        stream.read_exact(&mut b)?;
         len = u16::from_be_bytes(b) as usize;
     } else if len == 127 {
         let mut b = [0; 8];
-        stream.read_exact(&mut b).map_err(|e| e.to_string())?;
+        stream.read_exact(&mut b)?;
         len = usize::try_from(u64::from_be_bytes(b))
-            .map_err(|_| "CDP response is too large".to_string())?;
+            .map_err(|_| std::io::Error::other("CDP response is too large"))?;
     }
     if len > limit {
-        return Err("CDP response is too large".into());
+        return Err(std::io::Error::other("CDP response is too large"));
     }
     let mut payload = vec![0; len];
-    stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
+    stream.read_exact(&mut payload)?;
     // Text frames carry the JSON; anything else (ping/close/pong) is not an
     // answer, so read the next frame instead of parsing it as a response.
     match opcode {
