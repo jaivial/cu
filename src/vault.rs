@@ -150,13 +150,63 @@ impl Vault {
             key,
         };
         let conn = vault.connect()?;
-        conn.execute_batch(SCHEMA)
+        vault.migrate(&conn)?;
+        // The secret-requests DDL goes first so the migration (which may
+        // have just created the table in the current shape) and a fresh
+        // database end up with the same schema.
+        conn.execute_batch(&format!("{SECRET_REQUESTS_DDL}{SCHEMA}"))
             .map_err(|e| format!("vault schema: {e}"))?;
         let _ = conn.execute(
             "INSERT OR REPLACE INTO vault_meta(key, value) VALUES ('schema_version', '1')",
             [],
         );
         Ok(vault)
+    }
+
+    /// Bring a database written by an older build up to the current schema.
+    /// `CREATE TABLE IF NOT EXISTS` silently keeps an old shape, so a table
+    /// that predates the current `secret_requests` columns is renamed and
+    /// its rows copied across before the schema runs.
+    fn migrate(&self, conn: &Connection) -> Result<(), String> {
+        let columns: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(secret_requests)")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| e.to_string())?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        let current = !columns.is_empty()
+            && columns.iter().any(|c| c == "requested_by")
+            && columns.iter().any(|c| c == "status");
+        if columns.is_empty() || current {
+            return Ok(());
+        }
+        conn.execute(
+            "ALTER TABLE secret_requests RENAME TO secret_requests_old",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+        // The rename freed the name, so the current shape can be created
+        // here, before the copy — the full schema batch runs after us.
+        conn.execute_batch(SECRET_REQUESTS_DDL)
+            .map_err(|e| e.to_string())?;
+        // Rows are only worth copying when the old shape is the one this
+        // project once shipped; anything stranger is dropped with the table.
+        if columns.contains(&"requester".to_string()) && columns.contains(&"state".to_string()) {
+            conn.execute(
+                "INSERT INTO secret_requests
+                     (id, domain, reason, requested_by, status, created_at, decided_at)
+                 SELECT id, domain, reason, requester, state, created_at, decided_at
+                 FROM secret_requests_old",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        conn.execute("DROP TABLE secret_requests_old", [])
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     fn connect(&self) -> Result<Connection, String> {
@@ -794,6 +844,21 @@ fn unescape_json(value: &str) -> String {
     out
 }
 
+/// The current `secret_requests` shape, on its own so the migration can
+/// create it mid-flight (see [`Vault::migrate`]).
+const SECRET_REQUESTS_DDL: &str = "
+CREATE TABLE IF NOT EXISTS secret_requests (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  domain        TEXT NOT NULL,
+  reason        TEXT NOT NULL DEFAULT '',
+  requested_by  TEXT NOT NULL DEFAULT '',
+  status        TEXT NOT NULL DEFAULT 'pending',
+  credential_id INTEGER,
+  created_at    INTEGER NOT NULL,
+  decided_at    INTEGER
+);
+";
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS vault_meta (
   key   TEXT PRIMARY KEY,
@@ -818,16 +883,6 @@ CREATE TABLE IF NOT EXISTS credentials (
   notes      TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS secret_requests (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  domain        TEXT NOT NULL,
-  reason        TEXT NOT NULL DEFAULT '',
-  requested_by  TEXT NOT NULL DEFAULT '',
-  status        TEXT NOT NULL DEFAULT 'pending',
-  credential_id INTEGER,
-  created_at    INTEGER NOT NULL,
-  decided_at    INTEGER
 );
 ";
 
@@ -992,6 +1047,45 @@ mod tests {
         assert!(!ui_session_valid(Some(&token)));
         assert!(!ui_session_valid(Some("bogus")));
         assert!(!ui_session_valid(None));
+    }
+
+    #[test]
+    fn an_old_secret_requests_table_is_migrated() {
+        let dir = std::env::temp_dir().join(format!("cu-vault-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // What an unreleased build left behind: other column names.
+        {
+            let conn = Connection::open(dir.join("vault.db")).unwrap();
+            conn.execute(
+                "CREATE TABLE secret_requests (
+                   id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                   domain     TEXT NOT NULL,
+                   reason     TEXT NOT NULL DEFAULT '',
+                   requester  TEXT NOT NULL DEFAULT '',
+                   state      TEXT NOT NULL DEFAULT 'pending',
+                   created_at INTEGER NOT NULL,
+                   decided_at INTEGER
+                 )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO secret_requests(domain, reason, requester, state, created_at)
+                 VALUES ('old.example.com', 'left over', 'agent-x', 'pending', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let vault = Vault::open(&dir).expect("opens over the old shape");
+        let listed = vault.list_requests(None).unwrap();
+        assert!(listed.contains("old.example.com"), "{listed}");
+        assert!(listed.contains("agent-x"));
+        assert!(listed.contains("pending"));
+        // And the migrated table behaves like a fresh one.
+        let id = vault.create_request("example.com", "", "").unwrap();
+        assert!(id > 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     const QA_FIELDS: &str = r#"[{"name":"user","value":"jaime","secret":false,"type":"text"},

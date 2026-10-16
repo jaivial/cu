@@ -954,7 +954,7 @@ fn vault(args: &[String], tab: Option<String>) -> Result<(), String> {
                     server::json_string(&from)
                 )),
             )?;
-            let id = server::json_string_value(&created, "id")
+            let id = server::json_value(&created, "id")
                 .and_then(|v| v.parse::<i64>().ok())
                 .ok_or("daemon did not return a request id")?;
             println!("{created}");

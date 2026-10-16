@@ -1567,102 +1567,163 @@ fn navigate_observed(
             )
         });
     let auth_on = auth.is_some() && enabled.is_ok();
-    if auth_on {
-        if connection
+    if auth_on
+        && connection
             .call("Fetch.enable", &fetch_enable_params(&url_host(url)))
             .is_err()
-        {
-            // The Fetch domain refused (an interception is somehow already
-            // armed on this pooled connection): a fresh connection does not
-            // carry it.
-            connection = open_connection(tab)?;
-            let _ = connection.call(
-                "Network.enable",
-                "{\"maxTotalBufferSize\":0,\"maxResourceBufferSize\":0}",
-            );
-            let _ = connection.call("Fetch.enable", &fetch_enable_params(&url_host(url)));
-        }
+    {
+        // The Fetch domain refused (an interception is somehow already armed
+        // on this pooled connection): a fresh connection does not carry it.
+        connection = open_connection(tab)?;
+        let _ = connection.call(
+            "Network.enable",
+            "{\"maxTotalBufferSize\":0,\"maxResourceBufferSize\":0}",
+        );
+        let _ = connection.call("Fetch.enable", &fetch_enable_params(&url_host(url)));
     }
     // Every document response seen; the main document's is the one whose
     // request id is the navigation's loader id. Taking the first one was
     // wrong: a frame of the previous page still loading (DataDome's CAPTCHA
     // iframe answers 200) could arrive first and stand in for a 403.
-    // Shared between the two observers (the command stream's and the auth
-    // window's), which never run at once.
     let documents = std::cell::RefCell::new(Vec::new());
     let mut see = |event: &str| {
         if let Some(d) = crate::scheduler::document_response(event) {
             documents.borrow_mut().push(d);
         }
     };
-    let reply = connection.call_observed(
-        "Page.navigate",
-        &format!("{{\"url\":{}}}", json_string(url)),
-        &mut see,
-    );
-    let mut auth_handled = false;
-    if let Ok(reply_text) = &reply {
-        if auth_on {
-            let loader = json_string_value(reply_text, "loaderId");
-            let frame = json_string_value(reply_text, "frameId");
-            let deadline = std::time::Instant::now() + AUTH_WINDOW;
-            let outcome = connection.handle_events(deadline, &mut |event, conn| {
-                if let Some(d) = crate::scheduler::document_response(event) {
-                    documents.borrow_mut().push(d);
-                }
-                if let Some(rid) = auth_required_id(event) {
-                    conn.send(
-                        "Fetch.continueWithAuth",
-                        &continue_with_auth_params(&rid, &auth),
-                    );
-                    auth_handled = true;
-                } else if let Some(rid) = paused_request_id(event) {
-                    conn.send(
-                        "Fetch.continueRequest",
-                        &format!("{{\"requestId\":{}}}", json_string(&rid)),
-                    );
-                }
-                // Done when the document this navigation is for has landed:
-                // without a challenge, any response for it; with one, the
-                // response that followed the credentials (the pre-auth 401
-                // shares the request id, so the last one wins).
-                let guard = documents.borrow();
-                let main = guard.iter().rev().find(|d| {
-                    loader.as_deref() == Some(d.request_id.as_str())
-                        || frame.as_deref().is_some_and(|f| !f.is_empty())
-                            && frame.as_deref() == Some(d.frame_id.as_str())
-                });
-                match main {
-                    Some(d) => !auth_handled || d.status != 401,
-                    None => false,
-                }
-            });
-            if outcome != Ok(true) {
-                // The window closed on a still-unsettled page (or the stream
-                // went away). A short grace lets the requests already paused
-                // be continued before interception is torn down, so the
-                // settle wait that follows sees an unintercepted browser.
-                let _ = connection.handle_events(
-                    std::time::Instant::now() + Duration::from_millis(400),
-                    &mut |_event, conn| {
-                        if let Some(rid) = paused_request_id(_event) {
-                            conn.send(
-                                "Fetch.continueRequest",
-                                &format!("{{\"requestId\":{}}}", json_string(&rid)),
-                            );
-                        }
-                        false
-                    },
-                );
-            }
+    // One interception event, answered as it is read: `send` never stops to
+    // read a reply, so the stream keeps flowing and no event is lost.
+    let answer = |text: &str, connection: &mut CdpConnection, auth_handled: &mut bool| {
+        if let Some(rid) = auth_required_id(text) {
+            connection.send(
+                "Fetch.continueWithAuth",
+                &continue_with_auth_params(&rid, &auth),
+            );
+            *auth_handled = true;
+        } else if let Some(rid) = paused_request_id(text) {
+            connection.send(
+                "Fetch.continueRequest",
+                &format!("{{\"requestId\":{}}}", json_string(&rid)),
+            );
+        }
+    };
+    let (reply, auth_handled) = if !auth_on {
+        // Disarm a responder a previous navigation on this tab left armed:
+        // its host patterns do not cover the page we are going to, and an
+        // interception nobody answers is a page that cannot load.
+        if let Some(key) = connection.target_key.clone()
+            && armed_auth()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key)
+                .is_some()
+        {
             let _ = connection.call("Fetch.disable", "{}");
         }
-        if enabled.is_ok() {
-            // The response event can trail the reply by a hair; one round trip
-            // drains what is already queued.
-            let _ = connection.call_observed("Network.disable", "{}", &mut see);
-            checkin(tab, connection);
+        (
+            connection.call_observed(
+                "Page.navigate",
+                &format!("{{\"url\":{}}}", json_string(url)),
+                &mut see,
+            ),
+            false,
+        )
+    } else {
+        // With interception armed, the challenge must be answered while the
+        // navigation is in flight: Chrome does not deliver the
+        // `Page.navigate` reply while the document request sits paused, so
+        // reading the reply first would starve it (five seconds, then
+        // EAGAIN). The navigation is sent unread instead, and this loop
+        // takes everything the stream offers — its reply as well as the
+        // interception events, each answered as it is read.
+        connection.send(
+            "Page.navigate",
+            &format!("{{\"url\":{}}}", json_string(url)),
+        );
+        let deadline = std::time::Instant::now() + AUTH_WINDOW;
+        let mut auth_handled = false;
+        let mut nav_reply: Option<String> = None;
+        let mut frame: Option<String> = None;
+        loop {
+            // Done: the reply is in and the document this navigation is for
+            // has landed — without a challenge, any response for its frame;
+            // with one, the response that followed the credentials (the
+            // pre-auth 401 shares the request id, so the last one is the
+            // real one).
+            let settled = match (&nav_reply, frame.as_deref()) {
+                (Some(_), Some(f)) => {
+                    match documents.borrow().iter().rev().find(|d| d.frame_id == f) {
+                        Some(d) => !auth_handled || d.status != 401,
+                        None => false,
+                    }
+                }
+                _ => false,
+            };
+            if settled {
+                break;
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            connection.set_read_timeout(left);
+            let Ok(text) = connection.next_message(MAX_CDP_MESSAGE) else {
+                break;
+            };
+            if message_id(&text).is_some() {
+                // The navigation's reply (the only command outstanding).
+                frame = json_string_value(&text, "frameId");
+                nav_reply = Some(text);
+                continue;
+            }
+            if let Some(d) = crate::scheduler::document_response(&text) {
+                documents.borrow_mut().push(d);
+            }
+            answer(&text, &mut connection, &mut auth_handled);
         }
+        // A short grace: requests paused when the loop ended get continued
+        // before interception is torn down, so the settle wait that follows
+        // sees an unintercepted browser.
+        let grace = std::time::Instant::now() + Duration::from_millis(400);
+        loop {
+            let left = grace.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            connection.set_read_timeout(left);
+            let Ok(text) = connection.next_message(MAX_CDP_MESSAGE) else {
+                break;
+            };
+            if message_id(&text).is_some() {
+                if nav_reply.is_none() {
+                    nav_reply = Some(text);
+                }
+                continue;
+            }
+            answer(&text, &mut connection, &mut auth_handled);
+        }
+        connection.set_read_timeout(CDP_HTTP_TIMEOUT);
+        // Interception stays armed for this tab: the page's own requests
+        // (its `fetch()` calls) get challenged too, and with the pair
+        // registered, every later command's read loop answers them. A bare
+        // `Fetch.disable` here would leave those later challenges on a
+        // headless dialog that never opens — the request hangs.
+        if let (Some(key), Some(pair)) = (connection.target_key.clone(), auth.as_ref()) {
+            armed_auth()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, pair.clone());
+        }
+        (
+            nav_reply.ok_or_else(|| "navigation did not answer within the auth window".to_string()),
+            auth_handled,
+        )
+    };
+    if reply.is_ok() && enabled.is_ok() {
+        // The response event can trail the reply by a hair; one round trip
+        // drains what is already queued.
+        let _ = connection.call_observed("Network.disable", "{}", &mut see);
+        checkin(tab, connection);
     }
     let reply = reply?;
     let documents = documents.into_inner();
@@ -1724,11 +1785,16 @@ fn paused_request_id(event: &str) -> Option<String> {
 fn fetch_enable_params(host: &str) -> String {
     let mut patterns = Vec::new();
     for scheme in ["http", "https"] {
-        for pattern in [
-            format!("{scheme}://{host}/*"),
-            format!("{scheme}://*.{host}/*"),
-        ] {
-            patterns.push(format!("{{\"urlPattern\":{}}}", json_string(&pattern)));
+        // A pattern without an explicit port only matches the scheme's
+        // default port (URLPattern semantics — `http://host/*` never sees
+        // `host:8893/`), so each host gets a bare and a `:*` pattern.
+        for host_part in [host.to_string(), format!("*.{host}")] {
+            for port in ["", ":*"] {
+                patterns.push(format!(
+                    "{{\"urlPattern\":{}}}",
+                    json_string(&format!("{scheme}://{host_part}{port}/*"))
+                ));
+            }
         }
     }
     format!(
@@ -1739,20 +1805,25 @@ fn fetch_enable_params(host: &str) -> String {
 
 /// The `Fetch.continueWithAuth` answer to a challenge: the vault's pair when
 /// there is one, a silent cancel otherwise (headless has no dialog to offer,
-/// and `Default` would leave the page waiting for exactly that).
+/// and `Default` would leave the page waiting for exactly that). The answer
+/// rides in `authChallengeResponse` — the flat spelling this protocol once
+/// used is refused by current Chrome with a deserialisation error.
 fn continue_with_auth_params(request_id: &str, auth: &Option<(String, String)>) -> String {
-    match auth {
-        Some((user, password)) => format!(
-            "{{\"requestId\":{},\"response\":\"ProvideCredentials\",\"username\":{},\"password\":{}}}",
-            json_string(request_id),
-            json_string(user),
-            json_string(password)
+    let (response, extra) = match auth {
+        Some((user, password)) => (
+            "ProvideCredentials",
+            format!(
+                ",\"username\":{},\"password\":{}",
+                json_string(user),
+                json_string(password)
+            ),
         ),
-        None => format!(
-            "{{\"requestId\":{},\"response\":\"CancelAuth\"}}",
-            json_string(request_id)
-        ),
-    }
+        None => ("CancelAuth", String::new()),
+    };
+    format!(
+        "{{\"requestId\":{},\"authChallengeResponse\":{{\"response\":\"{response}\"{extra}}}}}",
+        json_string(request_id)
+    )
 }
 
 /// A one-action batch from a `/v1/click` or `/v1/type` body.
@@ -1822,6 +1893,10 @@ pub fn tabs_json(cdp_port: u16) -> Result<String, String> {
 
 /// Close a tab by id. The last page is refused: Chromium exits with it.
 pub fn close_tab(cdp_port: u16, id: &str) -> Result<(), String> {
+    armed_auth()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(id);
     let discovery = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")?;
     // Every page target counts here, context tabs included: any of them keeps
     // Chromium alive, and a context's tab may be closed directly (the context
@@ -3513,6 +3588,10 @@ fn context_targets(cdp_port: u16) -> Vec<String> {
 pub struct CdpConnection {
     stream: TcpStream,
     next_id: u64,
+    /// The tab this connection drives, when it has one: the key under which
+    /// an armed basic-auth responder is registered for the tab (see
+    /// `armed_auth`).
+    target_key: Option<String>,
 }
 
 impl CdpConnection {
@@ -3527,7 +3606,9 @@ impl CdpConnection {
             .find(|o| json_string_value(o, "id").as_deref() == Some(target))
             .and_then(|o| json_string_value(&o, "webSocketDebuggerUrl"))
             .ok_or_else(|| format!("no DevTools target {target} any more"))?;
-        Self::connect(&ws)
+        let mut connection = Self::connect(&ws)?;
+        connection.target_key = Some(target.to_string());
+        Ok(connection)
     }
 
     /// Discover the tab's target and complete the websocket handshake.
@@ -3555,7 +3636,11 @@ impl CdpConnection {
                 chosen.1.clone()
             }
         };
-        Self::connect(&ws)
+        let mut connection = Self::connect(&ws)?;
+        connection.target_key = Some(tab.target.clone().unwrap_or_else(|| {
+            pinned_target(tab.cdp_port).unwrap_or_else(|| format!("default:{}", tab.cdp_port))
+        }));
+        Ok(connection)
     }
 
     /// Complete the websocket handshake with one DevTools endpoint.
@@ -3595,7 +3680,11 @@ impl CdpConnection {
         if !handshake.starts_with(b"HTTP/1.1 101") {
             return Err("Chromium rejected CDP websocket handshake".into());
         }
-        Ok(Self { stream, next_id: 1 })
+        Ok(Self {
+            stream,
+            next_id: 1,
+            target_key: None,
+        })
     }
 
     /// Send one command and read its reply, skipping events meant for nobody.
@@ -3645,6 +3734,7 @@ impl CdpConnection {
                 Some(_) => continue,
                 None => {
                     crate::diagnostics::record_event();
+                    self.answer_armed_auth(&text);
                     observe(&text)
                 }
             }
@@ -3668,8 +3758,11 @@ impl CdpConnection {
             let _ = self.stream.set_read_timeout(Some(left));
             match self.next_message(MAX_CDP_MESSAGE) {
                 Ok(text) => {
-                    if message_id(&text).is_none() && observe(&text) {
-                        break true;
+                    if message_id(&text).is_none() {
+                        self.answer_armed_auth(&text);
+                        if observe(&text) {
+                            break true;
+                        }
                     }
                 }
                 Err(_) => break false,
@@ -3679,34 +3772,35 @@ impl CdpConnection {
         Ok(clean)
     }
 
-    /// Read events until `done` says stop or `deadline` passes, with the
-    /// connection itself handed to `handle` so an event can be answered
-    /// before the next one is read (`Fetch.authRequired` must be, or the
-    /// page waits for ever). Returns `false` if the deadline cut a read
-    /// short: the stream may then hold half a frame, so the caller must not
-    /// pool the connection again.
-    pub(crate) fn handle_events(
-        &mut self,
-        deadline: std::time::Instant,
-        handle: &mut dyn FnMut(&str, &mut CdpConnection) -> bool,
-    ) -> Result<bool, String> {
-        let clean = loop {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero() {
-                break false;
-            }
-            let _ = self.stream.set_read_timeout(Some(left));
-            match self.next_message(MAX_CDP_MESSAGE) {
-                Ok(text) => {
-                    if message_id(&text).is_none() && handle(&text, self) {
-                        break true;
-                    }
-                }
-                Err(_) => break false,
-            }
+    /// Answer an interception event for a tab whose basic-auth responder is
+    /// still armed (see [`armed_auth`]): the challenge with the vault's pair,
+    /// every paused request with a plain continue. This is what keeps a page
+    /// behind basic auth working after the navigation — its own `fetch()`s
+    /// get challenged too, and an unanswered challenge in a headless browser
+    /// is a request that hangs for ever on a dialog that will never open.
+    fn answer_armed_auth(&mut self, event: &str) {
+        let Some(key) = self.target_key.clone() else {
+            return;
         };
-        let _ = self.stream.set_read_timeout(Some(CDP_HTTP_TIMEOUT));
-        Ok(clean)
+        let auth = armed_auth()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned();
+        let Some(auth) = auth else {
+            return;
+        };
+        if let Some(rid) = auth_required_id(event) {
+            self.send(
+                "Fetch.continueWithAuth",
+                &continue_with_auth_params(&rid, &Some(auth)),
+            );
+        } else if let Some(rid) = paused_request_id(event) {
+            self.send(
+                "Fetch.continueRequest",
+                &format!("{{\"requestId\":{}}}", json_string(&rid)),
+            );
+        }
     }
 
     /// Fire one command without reading for its reply: the reply comes back
@@ -3726,6 +3820,12 @@ impl CdpConnection {
     fn next_message(&mut self, limit: usize) -> Result<String, String> {
         let payload = read_frame(&mut self.stream, limit)?;
         String::from_utf8(payload).map_err(|e| e.to_string())
+    }
+
+    /// How long the next read may wait: the auth window pumps the stream
+    /// directly and bounds each read by the time it has left.
+    pub(crate) fn set_read_timeout(&self, timeout: Duration) {
+        let _ = self.stream.set_read_timeout(Some(timeout));
     }
 }
 
@@ -3779,6 +3879,17 @@ pub fn checkin(tab: &Tab, connection: CdpConnection) {
     let pool = cdp_pool(tab);
     let mut guard = pool.lock().unwrap_or_else(|e| e.into_inner());
     guard.put(connection);
+}
+
+/// Tabs whose basic-auth responder is still armed: the navigation answered a
+/// challenge and left `Fetch` interception on, so later requests the PAGE
+/// makes (its own `fetch()` calls included) get their challenges answered
+/// with the same vault pair. Keyed by tab; the armed connection must be the
+/// one in the pool for that tab (a fresh connection has interception off and
+/// simply never sees the events).
+fn armed_auth() -> &'static Mutex<HashMap<String, (String, String)>> {
+    static MAP: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// The string a `Runtime.evaluate` with `returnByValue` produced.
@@ -4265,6 +4376,25 @@ fn vault_route(
                 Some("cu_vault_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0".into()),
             )
         }
+        ("GET", "/v1/vault/ui/state") => {
+            // The login page reads this before any session exists: whether a
+            // master password is set decides first-run (repeat field) vs
+            // plain login. Nothing secret in the answer.
+            match crate::vault::Vault::open(&state.data_dir) {
+                Ok(v) => (
+                    "200 OK",
+                    "application/json",
+                    format!("{{\"has_password\":{}}}", v.has_password()),
+                    None,
+                ),
+                Err(e) => (
+                    "500 Internal Server Error",
+                    "application/json",
+                    format!("{{\"error\":{}}}", json_string(&e)),
+                    None,
+                ),
+            }
+        }
         _ => {
             let live = crate::vault::ui_session_valid(
                 cookie.and_then(crate::vault::cookie_token).as_deref(),
@@ -4306,11 +4436,8 @@ fn vault_api(
     };
     let path_only = path.split('?').next().unwrap_or(path);
     match (method, path_only) {
-        ("GET", "/v1/vault/ui/state") => (
-            "200 OK",
-            "application/json",
-            format!("{{\"has_password\":{}}}", vault.has_password()),
-        ),
+        // `/v1/vault/ui/state` is answered in `vault_route`: the login page
+        // reads it before any session exists.
         ("GET", "/v1/vault/status") => {
             let sessions = vault.list_sessions().unwrap_or_default();
             let credentials = vault.list_credentials("").unwrap_or_default();
@@ -4874,9 +5001,12 @@ mod tests {
     fn fetch_enable_is_scoped_to_the_host() {
         let params = fetch_enable_params("example.com");
         assert!(params.contains("\"handleAuthRequests\":true"));
+        // Bare patterns hit default-port URLs; `:*` wildcards the rest.
         assert!(params.contains("\"https://example.com/*\""));
+        assert!(params.contains("\"https://example.com:*/*\""));
         assert!(params.contains("\"https://*.example.com/*\""));
-        assert!(params.contains("\"http://example.com/*\""));
+        assert!(params.contains("\"https://*.example.com:*/*\""));
+        assert!(params.contains("\"http://example.com:*/*\""));
         assert!(!params.contains("other.com"));
     }
 
@@ -4884,13 +5014,14 @@ mod tests {
     fn auth_challenge_answers_carry_the_pair_or_cancel() {
         let auth = Some(("jaime".into(), "p@ss\"word".into()));
         let params = continue_with_auth_params("42", &auth);
-        assert!(params.contains("\"response\":\"ProvideCredentials\""));
+        // Current Chrome wants the answer nested in `authChallengeResponse`.
+        assert!(params.contains("\"authChallengeResponse\":{\"response\":\"ProvideCredentials\""));
         assert!(params.contains("\"requestId\":\"42\""));
         // The pair is JSON-escaped: a quote in a password must survive.
         assert!(params.contains("\"p@ss\\\"word\""));
         assert_eq!(
             continue_with_auth_params("42", &None),
-            "{\"requestId\":\"42\",\"response\":\"CancelAuth\"}"
+            "{\"requestId\":\"42\",\"authChallengeResponse\":{\"response\":\"CancelAuth\"}}"
         );
     }
 
