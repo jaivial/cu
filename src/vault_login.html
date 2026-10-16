@@ -75,12 +75,15 @@
   .field { margin-bottom: 1rem; }
 
   .remember {
-    display: flex; align-items: center; gap: .6rem;
+    display: flex; align-items: flex-start; gap: .6rem;
     min-height: 44px; margin: -.2rem 0 1.1rem;
     color: var(--text); font-size: .92rem; cursor: pointer;
     user-select: none;
   }
-  .remember input { width: 20px; height: 20px; accent-color: var(--accent); margin: 0; flex: 0 0 auto; }
+  /* The label wraps to two lines on a phone, so the box sits on the first
+     one rather than floating down the middle of the pair. */
+  .remember input { width: 20px; height: 20px; accent-color: var(--accent); margin: .1rem 0 0; flex: 0 0 auto; }
+  .remember span { line-height: 1.35; }
   .remember .note { color: var(--muted); }
 
   button {
