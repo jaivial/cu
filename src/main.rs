@@ -54,8 +54,20 @@ fn main() {
             None => request("GET", &on_tab("/v1/challenge"), None).map(|s| println!("{s}")),
             Some("release") => request("POST", &on_tab("/v1/challenge/release"), Some("{}"))
                 .map(|s| println!("{s}")),
+            // `cu challenge wait --timeout S`: park until the person has
+            // finished, instead of polling `cu challenge` in a loop.
+            Some("wait") => wait_for_handoff(&args[2..], &on_tab),
             Some(other) => Err(format!(
-                "unknown challenge command {other}; usage: cu challenge [release]"
+                "unknown challenge command {other}; usage: cu challenge [release|wait]"
+            )),
+        },
+        // `cu handoff`: the hand-off state -- is a person needed, on which
+        // tab, for how long -- and the passes already recorded.
+        Some("handoff") => match args.get(1).map(String::as_str) {
+            None => request("GET", &on_tab("/v1/handoff"), None).map(|s| println!("{s}")),
+            Some("wait") => wait_for_handoff(&args[2..], &on_tab),
+            Some(other) => Err(format!(
+                "unknown handoff command {other}; usage: cu handoff [wait]"
             )),
         },
         Some("diagnostics") => request("GET", "/v1/diagnostics", None).map(|s| println!("{s}")),
@@ -221,9 +233,49 @@ fn main() {
         std::process::exit(1);
     }
 }
+/// `cu handoff wait [--timeout S]`: ask the daemon to watch the tab until the
+/// hand-off resolves, and print one clear answer.
+///
+/// The daemon does the waiting (bounded, with its own backoff and a ceiling),
+/// so this is a single request rather than a client-side poll loop: the
+/// command cannot spin, and one wait costs one daemon thread instead of one
+/// request per second. A wait that ends with the person still needed exits
+/// non-zero, so a script or an agent can tell "still waiting" from "carry
+/// on" without parsing the JSON.
+fn wait_for_handoff(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), String> {
+    let mut timeout = 120.0f64;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--timeout" => {
+                i += 1;
+                timeout = args
+                    .get(i)
+                    .ok_or("--timeout needs seconds")?
+                    .parse()
+                    .map_err(|_| "--timeout takes seconds")?;
+            }
+            flag => return Err(format!("unknown option {flag}")),
+        }
+        i += 1;
+    }
+    let body = request(
+        "GET",
+        &on_tab(&format!("/v1/challenge?wait={timeout}")),
+        None,
+    )?;
+    println!("{body}");
+    match server::json_string_value(&body, "timed_out").as_deref() {
+        Some("true") => Err(format!(
+            "still waiting for a person after {timeout:.0}s; the tab is not usable yet"
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release|wait [--timeout S]]\n  cu handoff [wait [--timeout S]]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
     );
 }
 

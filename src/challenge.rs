@@ -1188,6 +1188,10 @@ pub fn enabled() -> bool {
 ///   how long it took, how many re-checks, how it ended, and which cookies
 ///   appeared for the page's URL meanwhile -- names, domain and expiry
 ///   only, never values.
+/// - An agent does not have to guess: `GET /v1/handoff` reports the open
+///   hand-offs and the last passes, and `GET /v1/challenge?wait=S` (or
+///   `cu handoff wait`) parks until the tab is released, the wait budget
+///   runs out, or the verdict turns into something no person can fix.
 pub mod handoff {
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Mutex, OnceLock};
@@ -1206,6 +1210,18 @@ pub mod handoff {
         cookies: Vec<String>,
         rechecks: u64,
         foreground: Option<String>,
+    }
+
+    /// What a [`wait`] returned: the assessment the wait ended on and what it
+    /// cost.
+    pub struct Outcome {
+        pub assessment: Assessment,
+        pub waited: Duration,
+        /// Probes spent on this wait, so a long wait is visible in the reply.
+        pub polls: u64,
+        /// The person has not finished (or the budget ran out): the agent
+        /// must not treat the tab as usable.
+        pub timed_out: bool,
     }
 
     struct Pass {
@@ -1243,6 +1259,39 @@ pub mod handoff {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(900),
         )
+    }
+
+    /// Longest a caller may be parked in [`wait`], whatever it asked for:
+    /// an agent waiting for a person must not hold a request thread (or a
+    /// daemon route) for ever. `CU_HANDOFF_WAIT_MAX_S`, default 900 s.
+    pub fn wait_ceiling() -> Duration {
+        Duration::from_secs(
+            std::env::var("CU_HANDOFF_WAIT_MAX_S")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(900),
+        )
+    }
+
+    /// The pause sequence a wait uses between re-checks: quick at first (a
+    /// person solving a Turnstile is usually faster than that), then slower
+    /// so a long wait costs the daemon little. Fixed, bounded and
+    /// deterministic -- no jitter to test around.
+    pub const BACKOFF_MS: [u64; 5] = [250, 500, 1000, 2000, 4000];
+    /// A wait never probes more often than this, whatever the budget.
+    pub const MIN_POLL_MS: u64 = 250;
+
+    /// How long to sleep before re-check number `attempt` (0 is the first).
+    pub fn backoff(attempt: u32) -> Duration {
+        let ms = BACKOFF_MS[(attempt as usize).min(BACKOFF_MS.len() - 1)];
+        Duration::from_millis(ms.max(MIN_POLL_MS))
+    }
+
+    /// Probes one wait may spend before its budget: a 60 s wait is not
+    /// allowed to hold the daemon at one probe a second for an hour.
+    pub fn max_checks(timeout: Duration) -> u64 {
+        let checks = timeout.as_millis() / (BACKOFF_MS[BACKOFF_MS.len() - 1] as u128);
+        checks.max(1).min(240) as u64
     }
 
     /// `name@domain exp=...` for every cookie the browser would send to
@@ -1434,6 +1483,137 @@ pub mod handoff {
         b.done.truncate(KEEP);
     }
 
+    /// The open hand-off on this tab, as the agent sees it: whether one is
+    /// waiting, for how long, and what the person has to solve.
+    pub fn open_for(tab: &Tab) -> Option<String> {
+        let b = book().lock().unwrap_or_else(|e| e.into_inner());
+        let open = b.open.get(tab)?;
+        Some(format!(
+            "{{\"tab\":{},\"url\":{},\"vendor\":{},\"open_ms\":{},\"rechecks\":{},\"foreground\":{},\"signals\":[{}]}}",
+            json_string(tab.target.as_deref().unwrap_or("default")),
+            json_string(&open.url),
+            open.vendor
+                .map(json_string)
+                .unwrap_or_else(|| "null".into()),
+            open.started.elapsed().as_millis(),
+            open.rechecks,
+            open.foreground
+                .as_deref()
+                .map(json_string)
+                .unwrap_or_else(|| "null".into()),
+            open.signals
+                .iter()
+                .map(|s| json_string(s))
+                .collect::<Vec<_>>()
+                .join(","),
+        ))
+    }
+
+    /// Park until the hand-off on this tab ends, or `timeout` is spent.
+    ///
+    /// This is what lets an agent *resume* instead of retrying blind: it
+    /// asks the daemon to watch the tab it was paused on, and the answer
+    /// says what the tab is now -- ready to continue, still waiting, or
+    /// something no person could fix from here. Re-checks use the same gate
+    /// the watcher uses (bounded, backoff-ed, no interaction), so the wait
+    /// never solves or touches anything, and the budget is a hard ceiling
+    /// (see [`wait_ceiling`]) on both the wait and the number of probes.
+    ///
+    /// Returns the assessment that ended the wait (`ready` when the person
+    /// finished), or the last one seen with `timed_out` set when the budget
+    /// ran out. A tab that never had a hand-off answers at once with a
+    /// fresh assessment, so the same call is safe to make either way.
+    pub fn wait(tab: &Tab, timeout: Duration) -> Outcome {
+        let budget = timeout.min(wait_ceiling());
+        let started = Instant::now();
+        // A wait nobody asked to wait: one assessment, no polling.
+        if budget.is_zero() {
+            return Outcome {
+                assessment: probe_once(tab),
+                waited: Duration::ZERO,
+                polls: 1,
+                timed_out: false,
+            };
+        }
+        let mut polls = 0u64;
+        let mut attempt = 0u32;
+        let mut last = probe_once(tab);
+        polls += 1;
+        // No open hand-off and the page is not a challenge: there is nothing
+        // to wait for, and polling a ready page forever would only burn
+        // budget. `challenge_pending` (an interstitial that may clear by
+        // itself) is exactly what this call is for, so it keeps waiting.
+        let mut was_open = open_for(tab).is_some();
+        while started.elapsed() + backoff(attempt) <= budget
+            && polls < max_checks(budget)
+            && (was_open
+                || last.state == super::ChallengeState::ChallengePending
+                || last.state == super::ChallengeState::HumanRequired)
+        {
+            std::thread::sleep(backoff(attempt).min(budget - started.elapsed()));
+            attempt += 1;
+            polls += 1;
+            last = probe_once(tab);
+            if open_for(tab).is_some() {
+                was_open = true;
+                continue;
+            }
+            match last.state {
+                // Cleared: the person is done, the tab goes back to
+                // automation. This is the answer the agent was waiting for.
+                super::ChallengeState::Ready
+                // Turned into something no person can fix from here: waiting
+                // longer would only waste the budget.
+                | super::ChallengeState::Blocked
+                | super::ChallengeState::RateLimited => break,
+                _ => {}
+            }
+        }
+        let timed_out =
+            matches!(last.state, super::ChallengeState::HumanRequired) || open_for(tab).is_some();
+        Outcome {
+            assessment: last,
+            waited: started.elapsed(),
+            polls,
+            timed_out,
+        }
+    }
+
+    /// One gate-style re-check: it stores what it sees (so the watcher, the
+    /// gate and this wait all agree on the state) and returns it.
+    fn probe_once(tab: &Tab) -> super::Assessment {
+        super::gate(tab).unwrap_or_else(|| {
+            let fresh = super::assess(|m, p| tab.command(m, p), Duration::ZERO);
+            super::record(tab, &fresh);
+            fresh
+        })
+    }
+
+    /// The wait budget the daemon will clamp to, in seconds, and the pause
+    /// sequence it uses: enough for an agent to know what to ask for and how
+    /// often it will be probed.
+    pub fn outcome_hint() -> String {
+        format!(
+            "wait up to {} s (CU_HANDOFF_WAIT_MAX_S), re-checked every {} ms at most",
+            wait_ceiling().as_secs(),
+            BACKOFF_MS[BACKOFF_MS.len() - 1]
+        )
+    }
+
+    /// What [`wait`] came back with, as JSON: the assessment (so the agent
+    /// sees the state and the signals), how long it waited, how many probes
+    /// it cost, and whether the person is still needed.
+    pub fn outcome_json(outcome: &Outcome) -> String {
+        format!(
+            "{{\"resolved\":{},\"timed_out\":{},\"waited_ms\":{},\"polls\":{},\"assessment\":{}}}",
+            !outcome.timed_out,
+            outcome.timed_out,
+            outcome.waited.as_millis(),
+            outcome.polls,
+            outcome.assessment.json(),
+        )
+    }
+
     /// `challenge.handoffs` in diagnostics: open hand-offs and the last
     /// passes, newest first.
     pub fn json() -> String {
@@ -1488,7 +1668,7 @@ pub mod handoff {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChallengeState, Probe, classify};
+    use super::{Assessment, ChallengeState, Probe, Verdict, classify};
 
     fn probe(url: &str, title: &str, status: u16, text: &str, markers: &[&str]) -> Probe {
         Probe {
@@ -1589,6 +1769,100 @@ mod tests {
         );
         let verdict = classify(&p);
         assert_eq!(verdict.state, ChallengeState::Unknown, "{verdict:?}");
+    }
+
+    #[test]
+    fn a_wait_rechecks_quickly_first_and_then_leaves_the_person_alone() {
+        use super::handoff;
+        // A Turnstile is usually solved faster than a second, so the first
+        // re-checks are close together; after that the daemon stops asking
+        // every 250 ms and settles at the slowest step. Bounded and
+        // monotonic: a wait never gets *more* eager as it runs.
+        let pauses: Vec<u64> = (0..8)
+            .map(handoff::backoff)
+            .map(|d| d.as_millis() as u64)
+            .collect();
+        assert_eq!(pauses[0], 250, "{pauses:?}");
+        for pair in pauses.windows(2) {
+            assert!(pair[1] >= pair[0], "not monotonic: {pauses:?}");
+        }
+        assert!(pauses[0] < pauses[4], "no easing at all: {pauses:?}");
+        // And the slowest step is a ceiling for every later one.
+        let last = handoff::BACKOFF_MS[handoff::BACKOFF_MS.len() - 1];
+        assert_eq!(handoff::backoff(99).as_millis() as u64, last);
+        assert!(handoff::backoff(0).as_millis() >= handoff::MIN_POLL_MS as u128);
+    }
+
+    #[test]
+    fn a_wait_costs_a_bounded_number_of_probes() {
+        use super::handoff;
+        use std::time::Duration;
+        // A long wait is not a tight loop against the browser: the slowest
+        // step sets the rate, and the probe count is clamped on both sides
+        // so a tiny budget still gets one look and a huge one stays finite.
+        assert_eq!(handoff::max_checks(Duration::from_secs(60)), 15);
+        assert_eq!(handoff::max_checks(Duration::ZERO), 1);
+        assert!(handoff::max_checks(Duration::from_secs(86_400)) <= 240);
+        // 15 probes at no less than the slowest step fits inside 60 s.
+        assert!(handoff::max_checks(Duration::from_secs(60)) * 4000 <= 60_000);
+    }
+
+    #[test]
+    fn a_wait_reports_what_it_cost_and_whether_a_person_is_still_needed() {
+        use super::handoff;
+        use std::time::Duration;
+        let assessment = Assessment::new(
+            &Probe {
+                url: "https://example.test/cf-chl/verify?__cf_chl_tk=secret".into(),
+                title: "Just a moment...".into(),
+                ready_state: "complete".into(),
+                status: 403,
+                text: "checking your browser".into(),
+                markers: vec!["cf-chl-opt".into()],
+                frames: Vec::new(),
+                hints: Vec::new(),
+            },
+            Verdict::new(ChallengeState::HumanRequired, Some("cloudflare"), vec![]),
+            Duration::from_millis(10_000),
+        );
+        let held = handoff::Outcome {
+            assessment: assessment.clone(),
+            waited: Duration::from_secs(30),
+            polls: 9,
+            timed_out: true,
+        };
+        let json = handoff::outcome_json(&held);
+        assert!(json.contains("\"timed_out\":true"), "{json}");
+        assert!(json.contains("\"polls\":9"), "{json}");
+        assert!(json.contains("\"resolved\":false"), "{json}");
+        // The challenge URL's token never leaves: the assessment cuts the
+        // query, so a wait cannot leak what the challenge page carries.
+        assert!(
+            json.contains("https://example.test/cf-chl/verify"),
+            "{json}"
+        );
+        assert!(!json.contains("__cf_chl_tk"), "token leaked: {json}");
+
+        let done = handoff::Outcome {
+            assessment,
+            waited: Duration::from_millis(700),
+            polls: 3,
+            timed_out: false,
+        };
+        let json = handoff::outcome_json(&done);
+        assert!(json.contains("\"resolved\":true"), "{json}");
+        assert!(json.contains("\"timed_out\":false"), "{json}");
+    }
+
+    #[test]
+    fn the_wait_budget_hint_names_the_ceiling_and_the_pace() {
+        use super::handoff;
+        let hint = handoff::outcome_hint();
+        assert!(hint.contains("CU_HANDOFF_WAIT_MAX_S"), "{hint}");
+        assert!(
+            hint.contains(&handoff::BACKOFF_MS[handoff::BACKOFF_MS.len() - 1].to_string()),
+            "{hint}"
+        );
     }
 
     #[test]

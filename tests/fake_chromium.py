@@ -50,7 +50,18 @@ GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 # When the page under test has an iframe, the frame tree gains a child and
 # walks run in its isolated world (context id 7), like a real Chromium.
 FRAMES_ON = {"on": False}
-# Whether the page is Chromium's own renderer refuse page (see DENY_URL).
+# Interstitial scenarios, driven by the URL the test navigates to:
+#   cf://            a Cloudflare "Just a moment..." interstitial that clears
+#                    itself after CLEAR_AFTER probes (an automatic pass);
+#   cfhold://        the same interstitial that never clears: it stays an
+#                    interstitial for ever, so a wait must end on a budget,
+#                    not on a page that quietly turned ready.
+# PROBES counts every challenge probe seen on the tab, so a test can assert
+# both that the fake cleared (and when) and that a hold really did not.
+INTERSTITIAL = {"kind": None, "probes": 0}
+# Probes the self-clearing interstitial is shown before it becomes the real
+# page. Small, so a test with the default 10 s budget sees it resolve.
+CLEAR_AFTER = 2
 CHILD_SNAPSHOT = json.dumps(
     {
         "url": "https://example.test/child",
@@ -87,6 +98,45 @@ FAKE_SNAPSHOT = json.dumps(
 )
 
 
+def interstitial_url():
+    """The address the challenge page rewrites itself to.
+
+    Cloudflare puts its tokens in the query, and cu cuts URLs to origin and
+    path before reporting them, so the query is what proves the redaction
+    too -- but the frame tree still serves the full address, like a browser.
+    """
+    return "https://example.test/cf-chl/verify?__cf_chl_tk=secret-token"
+
+
+def interstitial_probe(holding):
+    """What `PROBE_JS` sees on the interstitial page.
+
+    Held: the language-independent markers of a Cloudflare managed challenge
+    -- `_cf_chl_opt` and the error-text element -- under a 403 and the
+    `cf-mitigated: challenge` hint. Cleared: the real page, 200, no marker,
+    which is the only shape classified `ready`.
+    """
+    if holding:
+        return {
+            "url": interstitial_url(),
+            "title": "Just a moment...",
+            "ready": "complete",
+            "status": 403,
+            "text": "checking your browser before accessing example.test",
+            "markers": ["cf-chl-opt", "cf-challenge", "cf-error-text"],
+            "frames": [],
+        }
+    return {
+        "url": "https://example.test/account",
+        "title": "Example",
+        "ready": "complete",
+        "status": 200,
+        "text": "your account page, loaded",
+        "markers": [],
+        "frames": [],
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -114,6 +164,8 @@ class Handler(BaseHTTPRequestHandler):
                 float(q.get("scale", 1)),
             ]
             self.send_raw(json.dumps(EMULATED[0], separators=(",", ":")))
+        elif self.path == "/interstitial":
+            self.send_json(dict(INTERSTITIAL, clear_after=CLEAR_AFTER))
         elif self.path == "/json/version":
             self.send_json(
                 {
@@ -285,9 +337,21 @@ class Handler(BaseHTTPRequestHandler):
             # has to work with.
             DENY_ON["on"] = url.startswith("deny://")
             FRAMES_ON["on"] = "frames" in url
+            # cf:// is an interstitial that clears by itself after a few
+            # probes; cfhold:// is the same page that never clears.
+            INTERSTITIAL["kind"] = (
+                "clear" if url.startswith("cf://") else "hold"
+            ) if url.startswith(("cf://", "cfhold://")) else None
+            INTERSTITIAL["probes"] = 0
             return {"id": 1, "result": {"frameId": "f", "url": "https://example.test"}}
         if method == "Browser.setDownloadBehavior":
             DOWNLOAD_BEHAVIOUR.append(params or {})
+            return {"result": {}}
+        if method in ("Page.bringToFront", "Target.activateTarget"):
+            # How the hand-off proves it delivered the window to the person:
+            # both the page-level call and the browser-level activation must
+            # arrive, in that order.
+            INPUT_LOG.append(method)
             return {"result": {}}
         if method == "Target.createBrowserContext":
             return {"result": {"browserContextId": "CTX%d" % (len(CONTEXT_TABS) + 1)}}
@@ -310,6 +374,17 @@ class Handler(BaseHTTPRequestHandler):
         if method == "Page.getFrameTree":
             if DENY_ON["on"]:
                 return {"result": {"frameTree": {"frame": {"id": "MAINFRAME", "url": DENY_URL}}}}
+            if INTERSTITIAL["kind"]:
+                return {
+                    "result": {
+                        "frameTree": {
+                            "frame": {
+                                "id": "MAINFRAME",
+                                "url": interstitial_url(),
+                            }
+                        }
+                    }
+                }
             if FRAMES_ON["on"]:
                 return {
                     "result": {
@@ -357,6 +432,16 @@ class Handler(BaseHTTPRequestHandler):
             return {"result": {}}
         if method == "Runtime.evaluate":
             expr = (params or {}).get("expression", "")
+            if "challenge" in expr and "location.href" in expr and INTERSTITIAL["kind"]:
+                INTERSTITIAL["probes"] += 1
+                holding = INTERSTITIAL["kind"] == "hold" or INTERSTITIAL[
+                    "probes"
+                ] <= CLEAR_AFTER
+                value = json.dumps(
+                    interstitial_probe(holding),
+                    separators=(",", ":"),
+                )
+                return {"id": 1, "result": {"result": {"type": "string", "value": value}}}
             if "challenge" in expr and "location.href" in expr and DENY_ON["on"]:
                 # The challenge probe (PROBE_JS) on Chromium's error page: the
                 # URL is the renderer's, the title the site's name and the

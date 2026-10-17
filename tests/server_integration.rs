@@ -1205,7 +1205,6 @@ fn an_annotated_screenshot_needs_refs_to_label() {
     let response = server.get("/v1/screenshot?annotate=nope");
     assert_eq!(status_code(&response), "400", "{response}");
 }
-
 // ---- the page a session works in ------------------------------------------
 //
 // `cu navigate` and the `cu snapshot` an agent runs after it are two CLI
@@ -1452,4 +1451,216 @@ fn the_real_cli_keeps_one_page_for_its_session() {
     let _ = Command::new("kill").arg(daemon.id().to_string()).status();
     let _ = daemon.wait();
     let _ = remove_dir(&dir);
+}
+
+/// The hand-off wait ceiling is read from the environment, which is process
+/// wide: these tests are the ones that change it, so they take this lock and
+/// run one at a time rather than shortening each other's budget.
+fn wait_ceiling_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Set (or clear, with `None`) the wait ceiling for the length of a test.
+fn set_wait_ceiling(seconds: Option<&str>) {
+    // SAFETY: the lock above makes this the only thread touching the
+    // environment while it is set, and no other thread is reading it.
+    unsafe {
+        match seconds {
+            Some(value) => std::env::set_var("CU_HANDOFF_WAIT_MAX_S", value),
+            None => std::env::remove_var("CU_HANDOFF_WAIT_MAX_S"),
+        }
+    }
+}
+
+/// The fake browser's interstitial counter: how many challenge probes it has
+/// served, and which scenario (`clear` / `hold`) is on the tab.
+fn interstitial(server: &TestServer) -> String {
+    server::http_get(&format!("127.0.0.1:{}", server.cdp_port), "/interstitial")
+        .expect("interstitial state")
+}
+
+#[test]
+fn an_interstitial_that_clears_itself_is_resumed_without_the_agent_retrying() {
+    // The case the wait exists for: a navigation lands on a Cloudflare
+    // interstitial, the check clears by itself a moment later, and the agent
+    // must be able to pick the navigation back up from the hand-off instead
+    // of looping on `navigate`.
+    let server = TestServer::start("handoff-clear", true);
+    // A short wait budget keeps the test quick; the default is 10 s and the
+    // interstitial clears after two probes either way.
+    let response = server.post("/v1/navigate", r#"{"url":"cf://example.test/account"}"#);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let navigated = body_of(&response);
+    assert!(
+        navigated.contains("\"state\":\"ready\"") || navigated.contains("challenge_pending"),
+        "no challenge object: {navigated}"
+    );
+
+    // Now the wait: it must come back resolved, and the page it reports must
+    // be the real one, not the challenge page.
+    let response = server.get("/v1/challenge?wait=6");
+    assert_eq!(status_code(&response), "200", "got {response}");
+    let body = body_of(&response);
+    assert!(body.contains("\"resolved\":true"), "not resolved: {body}");
+    assert!(body.contains("\"timed_out\":false"), "timed out: {body}");
+    assert!(
+        body.contains("\"state\":\"ready\""),
+        "the interstitial never cleared: {body}"
+    );
+    // The fake really did serve the held page first and the real one after,
+    // so the test is measuring the resume, not a page that was never a
+    // challenge.
+    let seen = interstitial(&server);
+    assert_eq!(
+        server::json_string_value(&seen, "kind").as_deref(),
+        Some("clear"),
+        "{seen}"
+    );
+    assert!(
+        server::json_number(&seen, "probes").unwrap_or(0.0) >= 2.0,
+        "the interstitial was never shown: {seen}"
+    );
+}
+
+#[test]
+fn a_wait_on_an_interstitial_that_never_clears_ends_on_the_budget_not_on_a_lie() {
+    // A challenge the person has not solved yet. The wait must end on its
+    // own budget, say plainly that a person is still needed, and never
+    // report the tab as usable -- this is what stops an agent retrying blind.
+    let server = TestServer::start("handoff-hold", true);
+    // The budget is small: the wait is bounded by seconds, not by how long
+    // the person takes.
+    let _ceiling = wait_ceiling_lock();
+    set_wait_ceiling(Some("4"));
+    let response = server.post("/v1/navigate", r#"{"url":"cfhold://example.test/account"}"#);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+
+    let response = server.get("/v1/challenge?wait=2");
+    assert_eq!(status_code(&response), "200", "got {response}");
+    let body = body_of(&response);
+    assert!(
+        body.contains("\"timed_out\":true"),
+        "should not resolve: {body}"
+    );
+    assert!(
+        body.contains("\"resolved\":false"),
+        "resolved leaked: {body}"
+    );
+    assert!(
+        !body.contains("\"state\":\"ready\""),
+        "a held challenge read as ready: {body}"
+    );
+    // The tab is paused: an automatic action on it is still refused.
+    let response = server.post("/v1/click", r#"{"ref":"e1"}"#);
+    assert_eq!(status_code(&response), "409", "got {response}");
+    // And the fake really was held the whole time.
+    let seen = interstitial(&server);
+    assert_eq!(
+        server::json_string_value(&seen, "kind").as_deref(),
+        Some("hold"),
+        "{seen}"
+    );
+    set_wait_ceiling(None);
+}
+
+#[test]
+fn the_handoff_route_says_whether_a_person_is_needed_and_how_long() {
+    // The state the agent asks before deciding what to do: is anyone needed
+    // on this tab, and for how long. Without a hand-off it says so plainly
+    // rather than reporting an empty object the agent has to interpret.
+    let server = TestServer::start("handoff-state", true);
+    let response = server.get("/v1/handoff");
+    assert_eq!(status_code(&response), "200", "got {response}");
+    let body = body_of(&response);
+    assert!(body.contains("\"waiting\":false"), "{body}");
+    assert!(body.contains("\"open\":null"), "{body}");
+    // The budget it will clamp a wait to is published, so a caller knows what
+    // asking for is even possible.
+    assert!(body.contains("CU_HANDOFF_WAIT_MAX_S"), "{body}");
+
+    // A held challenge opens a hand-off the route can see.
+    let _ceiling = wait_ceiling_lock();
+    set_wait_ceiling(Some("4"));
+    server.post("/v1/navigate", r#"{"url":"cfhold://example.test/account"}"#);
+    let response = server.get("/v1/handoff");
+    assert_eq!(status_code(&response), "200", "got {response}");
+    let body = body_of(&response);
+    assert!(body.contains("\"waiting\":true"), "{body}");
+    assert!(body.contains("\"vendor\":\"cloudflare\""), "{body}");
+    // The challenge URL is cut: no `__cf_chl_tk` ever reaches the agent.
+    assert!(!body.contains("__cf_chl_tk"), "token leaked: {body}");
+    set_wait_ceiling(None);
+}
+
+#[test]
+fn a_human_required_tab_is_brought_to_the_front_of_the_browser() {
+    // Half of the hand-off is a *window*: a person can only solve what they
+    // can see, so a headful daemon must put the tab in front with both calls
+    // -- `Page.bringToFront` on the page session and `Target.activateTarget`
+    // on the browser session -- in that order. The test harness launches no
+    // browser, so the launch record is written here: without it `headful()`
+    // is false and the daemon honestly reports there is no window to raise.
+    let _ceiling = wait_ceiling_lock();
+    let mut policy = cu::policy::BrowserPolicy::resolve(cu::policy::BrowserMode::FastTest)
+        .expect("a policy for the test");
+    policy.headless = false;
+    policy.headless_shell = false;
+    policy.display = Some(":99".into());
+    cu::diagnostics::record_launch(&policy, &[]);
+
+    let server = TestServer::start("handoff-front", true);
+    set_wait_ceiling(Some("4"));
+    server.post("/v1/navigate", r#"{"url":"cfhold://example.test/account"}"#);
+    // The fronting runs off the request thread, so give it the same second a
+    // real person would have before looking at the tab.
+    std::thread::sleep(Duration::from_millis(700));
+
+    let log = input_log(&server);
+    let front = log
+        .find("Page.bringToFront")
+        .unwrap_or_else(|| panic!("the tab was never brought forward: {log}"));
+    let activated = log
+        .find("Target.activateTarget")
+        .unwrap_or_else(|| panic!("the target was never activated: {log}"));
+    assert!(
+        front < activated,
+        "activation must follow bringToFront: {log}"
+    );
+
+    // And the hand-off record says it was raised, not merely attempted.
+    let response = server.get("/v1/handoff");
+    assert_eq!(status_code(&response), "200", "got {response}");
+    let body = body_of(&response);
+    assert!(
+        body.contains("\"foreground\":\"brought to front"),
+        "the hand-off did not report the window: {body}"
+    );
+    set_wait_ceiling(None);
+    cu::diagnostics::clear_launch();
+}
+
+#[test]
+fn a_wait_clamps_a_long_request_to_the_ceiling() {
+    // An agent asking for a very long wait must not be able to hold the
+    // daemon open for it: the ceiling applies whatever the request says. The
+    // hold never clears, so a clamped wait returns on the ceiling -- fast.
+    let server = TestServer::start("handoff-ceiling", true);
+    let _ceiling = wait_ceiling_lock();
+    set_wait_ceiling(Some("2"));
+    server.post("/v1/navigate", r#"{"url":"cfhold://example.test/account"}"#);
+    // Asks for an hour; the daemon's ceiling is 2 s, so this returns quickly
+    // and says the person is still needed.
+    let response = server.get("/v1/challenge?wait=3600");
+    assert_eq!(status_code(&response), "200", "got {response}");
+    let body = body_of(&response);
+    assert!(body.contains("\"timed_out\":true"), "{body}");
+    // The reply costs a bounded number of probes: not one per second of the
+    // hour that was asked for.
+    let polls = server::json_number(&body, "polls").unwrap_or(0.0);
+    assert!(
+        polls > 0.0 && polls <= 240.0,
+        "poll count not bounded: {body}"
+    );
+    set_wait_ceiling(None);
 }

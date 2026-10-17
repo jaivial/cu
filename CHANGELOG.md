@@ -1,6 +1,57 @@
 # Changelog
 
-## [Unreleased]
+## [1.1.3] - 2026-10-17
+
+### Added
+
+- **`cu handoff wait`: the navigation resumes itself, so the agent does not
+  have to guess.** A navigation that lands on an interactive challenge
+  (Cloudflare managed challenge / Turnstile) is paused and handed to a person.
+  Until now the agent's only move was to retry `navigate` and read the same
+  `human_required` -- blind retries that burn the session's reputation, which
+  is the one thing the anti-bot line exists to prevent. Now the hand-off is
+  *observable and awaitable*, and `cu` picks the navigation back up the moment
+  the verification resolves.
+
+  - **`GET /v1/handoff`** (`cu handoff`) reports the hand-off state of a tab:
+    `waiting` (bool), the `open` hand-off when there is one (tab, redacted
+    URL, vendor, `open_ms`, re-checks, whether the tab was brought forward,
+    signals), the last `assessment`, the wait `budget` and the pass `history`.
+    The agent can tell "still waiting" from "gave up" without probing the
+    page at all.
+
+  - **`GET /v1/challenge?wait=S`** (`cu challenge wait --timeout S`, or
+    `cu handoff wait`) **parks until the hand-off resolves** instead of
+    answering at once. It re-checks with the same gate the watcher uses --
+    never interacting with the tab -- and returns the assessment it ended on,
+    plus `resolved`, `timed_out`, `waited_ms` and `polls`. It returns as soon
+    as the page reads `ready` (the person finished), or when the verdict turns
+    into something no person can fix from here (`blocked` / `rate_limited`), so
+    the wait never burns its whole budget on a hopeless page. A wait that ends
+    with `timed_out` exits non-zero from the CLI, so a script can tell "still
+    waiting" from "carry on" without parsing JSON.
+
+  - **Bounded by construction.** The budget a caller asks for is clamped to
+    `CU_HANDOFF_WAIT_MAX_S` (default 900 s) whatever the request says; the
+    re-checks use a fixed backoff (250 ms, 500 ms, 1 s, 2 s, 4 s and then
+    every 4 s) so a wait costs the daemon little; and the number of probes is
+    capped (`timeout / 4 s`, at most 240). A long wait is therefore one
+    parked daemon thread, not one request per second, and it cannot spin.
+
+  - The challenge URL's tokens are cut to origin and path exactly as before,
+    so a wait (or the hand-off route) can never leak the `__cf_chl_tk` the
+    challenge page carries.
+
+  Tests: 4 unit tests over the backoff sequence, the probe budget, the wait
+  reply (including that no token leaks) and the published ceiling; 4
+  integration tests over the fake browser, which gained two interstitial
+  scenarios -- `cf://`, which shows a Cloudflare managed challenge and clears
+  itself after two probes (the wait must return `resolved` with `ready`), and
+  `cfhold://`, the same page that never clears (the wait must end on its
+  budget, say `timed_out`, keep the tab paused, and a one-hour request must
+  still come back at the ceiling with a bounded probe count). A test also
+  asserts the window hand-off really happened: `Page.bringToFront` followed by
+  `Target.activateTarget`, both reaching the browser.
 
 ### Changed
 

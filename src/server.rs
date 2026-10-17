@@ -857,6 +857,7 @@ pub fn route(
             | ("GET", "/v1/text")
             | ("GET", "/v1/challenge")
             | ("POST", "/v1/challenge/release")
+            | ("GET", "/v1/handoff")
             | ("GET", "/v1/inspect")
             | ("GET", "/v1/marks")
             | ("POST", "/v1/marks")
@@ -936,6 +937,20 @@ pub fn route(
     }
     match (method, path) {
         ("GET", "/v1/challenge") => {
+            // `?wait=S` parks here instead of answering at once: this is
+            // the call an agent makes instead of retrying its navigation in
+            // a loop while a person is away. The budget is clamped inside
+            // the wait, so a large `S` cannot hold the daemon open.
+            let wait_for = seconds_param(query(full_path), "wait", 0.0);
+            if wait_for > 0.0 {
+                let timeout = Duration::from_secs_f64(wait_for.min(wait_ceiling_s()));
+                let outcome = crate::challenge::handoff::wait(&tab, timeout);
+                return (
+                    "200 OK",
+                    "application/json",
+                    crate::challenge::handoff::outcome_json(&outcome),
+                );
+            }
             // A paused tab is re-checked the way the gate does it, so an
             // interstitial read without a wait cannot quietly end the
             // hand-off; any other tab gets a fresh, counted check.
@@ -954,6 +969,32 @@ pub fn route(
             "application/json",
             format!("{{\"released\":{}}}", crate::challenge::release(&tab)),
         ),
+        // The hand-off state itself: is a person needed on this tab, for how
+        // long, and what the last passes looked like. A single `?tab=`-
+        // scoped object when the tab is held, plus the history, so an agent
+        // can tell "still waiting" from "gave up" without a probe.
+        ("GET", "/v1/handoff") => {
+            let held = crate::challenge::handoff::open_for(&tab);
+            let assessment = crate::challenge::last(&tab);
+            let mut body = format!(
+                "{{\"tab\":{}",
+                json_string(tab.target.as_deref().unwrap_or("default"))
+            );
+            body.push_str(&format!(
+                ",\"waiting\":{},\"open\":{}",
+                held.is_some(),
+                held.unwrap_or_else(|| "null".into())
+            ));
+            if let Some(a) = assessment {
+                body.push_str(&format!(",\"assessment\":{}", a.json()));
+            }
+            body.push_str(&format!(
+                ",\"budget\":{},\"history\":{}}}",
+                json_string(&crate::challenge::handoff::outcome_hint()),
+                crate::challenge::handoff::json()
+            ));
+            ("200 OK", "application/json", body)
+        }
         ("GET", "/v1/tabs") => match tabs_json(state.cdp_port) {
             Ok(body) => ("200 OK", "application/json", body),
             Err(e) => (
@@ -2711,6 +2752,19 @@ pub fn json_number(input: &str, key: &str) -> Option<f64> {
 /// The query string of a request path, without the `?`.
 fn query(path: &str) -> &str {
     path.split_once('?').map(|(_, q)| q).unwrap_or("")
+}
+
+/// A numeric query parameter, or `fallback` when it is absent, empty or not
+/// a number. A negative or absurd value is the caller's problem to clamp, not
+/// a reason to answer `400`: these are durations, and the ceiling that
+/// applies to them lives with the feature.
+fn seconds_param(query: &str, key: &str, fallback: f64) -> f64 {
+    form_value(query, key).parse().unwrap_or(fallback)
+}
+
+/// The longest a hand-off wait may be parked, whatever the request asks for.
+fn wait_ceiling_s() -> f64 {
+    crate::challenge::handoff::wait_ceiling().as_secs_f64()
 }
 
 /// One frame of the page as `Page.getFrameTree` describes it.

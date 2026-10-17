@@ -66,6 +66,12 @@ pub fn record_launch(policy: &BrowserPolicy, args: &[String]) {
     *launch().lock().unwrap_or_else(|e| e.into_inner()) = Some(record);
 }
 
+/// Forget the recorded launch, so a test (or an in-process restart) can put
+/// the next launch record on top without restarting the process.
+pub fn clear_launch() {
+    *launch().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// Fill in what the running browser says about itself, log one line and
 /// write `browser.json` next to `server.json`.
 pub fn record_ready(
