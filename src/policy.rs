@@ -297,10 +297,45 @@ impl BrowserPolicy {
         // headed Chrome without a window.
         if self.headless && !self.headless_shell {
             args.push("--headless=new".into());
+            // The User-Agent override `crate::stealth` installs lives only as
+            // long as the DevTools connection that made it, so a headless
+            // daemon's later requests went out as `HeadlessChrome` and
+            // sites such as x.com answered 403. The launch flag is what
+            // every request and every new tab carries.
+            if self.stealth {
+                if let Some(agent) = windowed_agent_for(&self.executable) {
+                    args.push(format!("--user-agent={agent}"));
+                }
+            }
         }
         args.push("about:blank".into());
         args
     }
+}
+
+/// The User-Agent a windowed build of `executable` sends, from its own
+/// `--version` (`Google Chrome 145.0.7632.67` -> `Chrome/145.0.0.0`): the
+/// reduced form current Chrome sends. `None` off Linux or when the version
+/// cannot be read, in which case the browser keeps its own.
+fn windowed_agent_for(executable: &Path) -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let out = std::process::Command::new(executable)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    parse_windowed_agent(&text)
+}
+
+fn parse_windowed_agent(version_output: &str) -> Option<String> {
+    let major: u32 = version_output
+        .split_whitespace()
+        .find_map(|word| word.split('.').next().and_then(|m| m.parse().ok()).filter(|_| word.contains('.')))?;
+    Some(format!(
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    ))
 }
 
 fn is_headless_shell(path: &Path) -> bool {
