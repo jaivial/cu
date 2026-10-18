@@ -43,6 +43,44 @@
   .toast { position: fixed; bottom: 1rem; right: 1rem; background: #166534; color: #dcfce7;
            padding: 0.5rem 0.9rem; border-radius: 8px; display: none; }
   .muted { color: #8b93a7; }
+  .mode { display: flex; gap: 0.4rem; margin: 0.7rem 0 0.2rem; }
+  .mode button.on { background: #3b82f6; border-color: #3b82f6; color: #fff; }
+  .hint { font-size: 0.8rem; color: #8b93a7; margin: 0.3rem 0 0; }
+  #f-lines { min-height: 7rem; }
+  #f-fields { min-height: 8rem; }
+  .preview { font-size: 0.85rem; color: #8b93a7; margin: 0.3rem 0 0; word-break: break-word; }
+  @media (max-width: 640px) {
+    body { font-size: 16px; }
+    header { flex-wrap: wrap; gap: 0.5rem; padding: 0.6rem 0.8rem; }
+    header h1 { flex: 1 1 auto; }
+    #search { order: 5; flex: 1 1 100%; max-width: none; min-height: 48px; font-size: 16px; }
+    header button { min-height: 44px; padding: 0.5rem 0.8rem; font-size: 0.95rem; }
+    #new { order: 1; }
+    main { margin: 0.8rem auto; padding: 0 0.7rem; }
+    table, thead, tbody, tr, td { display: block; width: 100%; }
+    thead { display: none; }
+    tr.cred { background: #171a21; border: 1px solid #2a2f3a; border-radius: 12px;
+              padding: 0.7rem 0.8rem; margin-bottom: 0.7rem; }
+    tr.cred td { border: 0; padding: 0.15rem 0; }
+    tr.cred td.dom { font-weight: 600; font-size: 1.05rem; }
+    td.actions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem;
+                 margin-top: 0.5rem; text-align: center; }
+    td.actions button { min-height: 48px; width: 100%; }
+    input, textarea, select { min-height: 48px; padding: 0.65rem 0.75rem; }
+    textarea { min-height: 7rem; }
+    dialog { width: 100vw; max-width: 100vw; height: 100dvh; max-height: 100dvh; margin: 0;
+             border-radius: 0; border: 0; padding: 1rem; overflow-y: auto; }
+    dialog .row { flex-direction: column; gap: 0.6rem; }
+    dialog .row.btns { flex-direction: column-reverse; }
+    dialog .row > div { width: 100%; }
+    dialog button { min-height: 48px; width: 100%; font-size: 1rem; }
+    #editor .row.btns { position: sticky; bottom: 0; background: #171a21;
+                                padding: 0.6rem 0 env(safe-area-inset-bottom); }
+    .field-row { grid-template-columns: 1fr 1fr; }
+    .field-row .muted:nth-child(3) { display: none; }
+    .field-row .mini { min-height: 44px; }
+    .toast { left: 0.7rem; right: 0.7rem; bottom: 1rem; text-align: center; }
+  }
 </style>
 </head>
 <body>
@@ -68,12 +106,21 @@
     <div><label>Domain</label><input id="f-domain" placeholder="example.com"></div>
     <div><label>Label</label><input id="f-label" placeholder="main login"></div>
   </div>
-  <label>Fields (one JSON array of {name, value, secret, type} — the UI form is generated from it)</label>
-  <textarea id="f-fields" placeholder='[{"name":"user","value":"you","secret":false,"type":"text"},{"name":"pass","value":"…","secret":true,"type":"password"}]'></textarea>
+  <div class="mode"><button type="button" id="mode-lines" class="on">Lines</button><button type="button" id="mode-json">JSON</button></div>
+  <div id="box-lines">
+    <label>Fields, one per line as name: value</label>
+    <textarea id="f-lines" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" placeholder="user: you@example.com&#10;password: ••••••••"></textarea>
+    <p class="hint">password, pass, clave, contraseña, token, key, secret, code, pin and cookie lines are stored as secret.</p>
+    <p class="preview" id="preview"></p>
+  </div>
+  <div id="box-json" hidden>
+    <label>Fields as a JSON array of {name, value, secret, type}</label>
+    <textarea id="f-fields" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" placeholder='[{"name":"user","value":"you","secret":false,"type":"text"},{"name":"password","value":"…","secret":true,"type":"password"}]'></textarea>
+  </div>
   <label>Notes</label>
   <textarea id="f-notes" style="min-height:2.5rem"></textarea>
   <p class="error" id="editor-error" style="color:#f87171"></p>
-  <div class="row" style="margin-top:0.8rem">
+  <div class="row btns" style="margin-top:0.8rem">
     <button id="cancel">Cancel</button>
     <button class="primary" id="save">Save</button>
   </div>
@@ -83,7 +130,7 @@
   <h2 id="reveal-title" style="margin-top:0"></h2>
   <div id="reveal-fields"></div>
   <p class="muted">Copied values clear from the clipboard after 30 s (best effort).</p>
-  <div class="row" style="margin-top:0.8rem">
+  <div class="row btns" style="margin-top:0.8rem">
     <button id="reveal-close">Close</button>
   </div>
 </dialog>
@@ -91,7 +138,7 @@
 <dialog id="sessions-dialog">
   <h2 style="margin-top:0">Saved sessions</h2>
   <table><thead><tr><th>Domain</th><th>Updated</th><th></th></tr></thead><tbody id="session-rows"></tbody></table>
-  <div class="row" style="margin-top:0.8rem"><button id="sessions-close">Close</button></div>
+  <div class="row btns" style="margin-top:0.8rem"><button id="sessions-close">Close</button></div>
 </dialog>
 
 <dialog id="requests-dialog">
@@ -102,7 +149,7 @@
   <table><thead><tr><th>#</th><th>Domain</th><th>Reason</th><th>Asked by</th><th>Credential</th><th></th></tr></thead>
   <tbody id="request-rows"></tbody></table>
   <p class="muted" id="requests-empty" hidden>No pending requests.</p>
-  <div class="row" style="margin-top:0.8rem"><button id="requests-close">Close</button></div>
+  <div class="row btns" style="margin-top:0.8rem"><button id="requests-close">Close</button></div>
 </dialog>
 
 <div class="toast" id="toast"></div>
@@ -130,8 +177,8 @@ function render() {
     !needle || [c.domain, c.label, c.notes].some(v => (v || '').toLowerCase().includes(needle)));
   $('empty').hidden = rows.length > 0;
   $('rows').innerHTML = rows.map(c => `
-    <tr>
-      <td>${esc(c.domain)}</td>
+    <tr class="cred">
+      <td class="dom">${esc(c.domain)}</td>
       <td>${esc(c.label)}</td>
       <td class="muted">${esc(c.fields || '')}</td>
       <td class="muted">${esc((c.notes || '').slice(0, 60))}</td>
@@ -149,6 +196,63 @@ function esc(value) {
   return d.innerHTML;
 }
 
+const SECRET_RE = /(pass|pwd|clave|contrase|secret|token|key|code|pin|cookie|otp|2fa)/i;
+const ALIAS = { usuario: 'user', username: 'user', login: 'user', correo: 'user', pass: 'password',
+                pwd: 'password', clave: 'password', 'contraseña': 'password', contrasena: 'password' };
+let mode = 'lines';
+function setMode(next) {
+  if (next === mode) return;
+  $('editor-error').textContent = '';
+  if (next === 'json') {
+    const r = linesToFields($('f-lines').value);
+    if (r.error) { $('editor-error').textContent = r.error; return; }
+    $('f-fields').value = JSON.stringify(r.fields, null, 1);
+  } else {
+    let f;
+    try { f = JSON.parse($('f-fields').value || '[]'); }
+    catch (e) { $('editor-error').textContent = `Fields is not valid JSON: ${e}`; return; }
+    if (!simple(f)) { $('editor-error').textContent = 'These fields need JSON (multi-line values or custom types).'; return; }
+    $('f-lines').value = fieldsToLines(f);
+  }
+  mode = next;
+  $('box-lines').hidden = next !== 'lines'; $('box-json').hidden = next !== 'json';
+  $('mode-lines').classList.toggle('on', next === 'lines');
+  $('mode-json').classList.toggle('on', next === 'json');
+  updatePreview();
+}
+function simple(f) {
+  return Array.isArray(f) && f.every(x => x && typeof x.name === 'string' && x.name && !/[:\n]/.test(x.name)
+    && typeof x.value === 'string' && !/\n/.test(x.value)
+    && (x.type || (x.secret ? 'password' : 'text')) === (x.secret ? 'password' : 'text'));
+}
+function fieldsToLines(f) { return f.map(x => `${x.name}: ${x.value}`).join('\n'); }
+function linesToFields(text) {
+  const fields = [];
+  const lines = text.split('\n').map(l => l.replace(/\r$/, '')).filter(l => l.trim() !== '');
+  for (const [i, line] of lines.entries()) {
+    const m = line.match(/^\s*([^:=]+?)\s*[:=]\s?(.*)$/);
+    if (!m) return { error: `Line ${i + 1} needs "name: value".` };
+    let name = m[1].trim(); const value = m[2].replace(/\s+$/, '');
+    name = ALIAS[name.toLowerCase()] || name;
+    const secret = SECRET_RE.test(name);
+    fields.push({ name, value, secret, type: secret ? 'password' : 'text' });
+  }
+  return { fields };
+}
+function updatePreview() {
+  if (mode !== 'lines') { $('preview').textContent = ''; return; }
+  const r = linesToFields($('f-lines').value);
+  $('preview').textContent = r.error ? r.error
+    : r.fields.map(f => `${f.name}${f.secret ? ' (secret)' : ''}`).join(' · ');
+}
+$('f-lines').oninput = updatePreview;
+$('mode-lines').onclick = () => setMode('lines');
+$('mode-json').onclick = () => setMode('json');
+function forceMode(m) {
+  mode = m; $('box-lines').hidden = m !== 'lines'; $('box-json').hidden = m !== 'json';
+  $('mode-lines').classList.toggle('on', m === 'lines'); $('mode-json').classList.toggle('on', m === 'json');
+}
+
 let editing = null;
 function edit(id) {
   const c = creds.find(c => c.id === id);
@@ -158,11 +262,14 @@ function edit(id) {
   $('f-label').value = c ? c.label : '';
   $('f-notes').value = c ? (c.notes || '') : '';
   $('editor-error').textContent = '';
+  $('f-lines').value = ''; $('f-fields').value = ''; forceMode('lines'); updatePreview();
   if (id) {
     fetch(`/v1/vault/credentials/${id}`).then(r => r.json())
-      .then(full => $('f-fields').value = JSON.stringify(full.fields, null, 1));
-  } else {
-    $('f-fields').value = '';
+      .then(full => {
+        if (simple(full.fields)) { $('f-lines').value = fieldsToLines(full.fields); forceMode('lines'); }
+        else { $('f-fields').value = JSON.stringify(full.fields, null, 1); forceMode('json'); }
+        updatePreview();
+      });
   }
   $('editor').showModal();
 }
@@ -173,8 +280,14 @@ $('search').oninput = render;
 
 $('save').onclick = async () => {
   let fields;
-  try { fields = JSON.parse($('f-fields').value || '[]'); }
-  catch (e) { $('editor-error').textContent = `Fields is not valid JSON: ${e}`; return; }
+  if (mode === 'lines') {
+    const r = linesToFields($('f-lines').value);
+    if (r.error) { $('editor-error').textContent = r.error; return; }
+    fields = r.fields;
+  } else {
+    try { fields = JSON.parse($('f-fields').value || '[]'); }
+    catch (e) { $('editor-error').textContent = `Fields is not valid JSON: ${e}`; return; }
+  }
   if (!Array.isArray(fields)) { $('editor-error').textContent = 'Fields must be a JSON array.'; return; }
   const reply = await fetch('/v1/vault/credentials', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
