@@ -876,8 +876,13 @@ fn daemon(args: &[String]) -> Result<(), String> {
     // Headless is the point of the daemon: no display is looked for, no
     // window is opened, whatever the host has (`CU_HEADLESS` said it too).
     let mut policy = BrowserPolicy::resolve(mode)?;
-    policy.headless = true;
-    policy.display = None;
+    // `CU_HEADLESS=0` opts the daemon into a windowed browser on a virtual
+    // display (`CU_DISPLAY`): closer to a real browser, fewer bot checks.
+    let windowed = std::env::var("CU_HEADLESS").map(|v| v.trim() == "0").unwrap_or(false);
+    if !(windowed && policy.display.is_some() && !policy.headless) {
+        policy.headless = true;
+        policy.display = None;
+    }
     cu::scheduler::configure(cu::scheduler::Budget::for_mode(mode));
     fs::create_dir_all(data.join("profiles/default")).map_err(|e| e.to_string())?;
     fs::create_dir_all(data.join("sessions")).map_err(|e| e.to_string())?;
