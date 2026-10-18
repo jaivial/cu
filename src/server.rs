@@ -4605,6 +4605,12 @@ fn vault_route(
             None,
         ),
         ("GET", "/vault/app") => ("200 OK", "text/html; charset=utf-8", APP_PAGE.into(), None),
+        ("GET", "/vault/live") => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            crate::live::PAGE.into(),
+            None,
+        ),
         ("POST", "/v1/vault/ui/login") => {
             if !crate::vault::login_allowed() {
                 return (
@@ -4830,6 +4836,11 @@ fn vault_api(
     body: &str,
     state: &AppState,
 ) -> (&'static str, &'static str, String) {
+    // The live view of a tab (a person finishing a check an agent must not
+    // solve) is a vault route: same session, same gate.
+    if let Some(reply) = crate::live::api(method, path, body, state) {
+        return reply;
+    }
     let vault = match crate::vault::Vault::open(&state.data_dir) {
         Ok(v) => v,
         Err(e) => {
