@@ -5,6 +5,7 @@ pub mod diagnostics;
 pub mod execution;
 pub mod human;
 pub mod input;
+pub mod live;
 pub mod policy;
 pub mod scheduler;
 pub mod server;

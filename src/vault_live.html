@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>cu live</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.4 system-ui, sans-serif; background: #0f1115; color: #e6e6e6;
+         min-height: 100dvh; display: flex; flex-direction: column; }
+  header { display: flex; gap: .5rem; align-items: center; padding: .5rem .6rem; background: #171a21;
+           border-bottom: 1px solid #2a2f3a; position: sticky; top: 0; z-index: 2; }
+  header h1 { font-size: .9rem; margin: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  button, select, input { font-size: 16px; min-height: 46px; border-radius: 10px; border: 1px solid #2a2f3a;
+           background: #232936; color: inherit; padding: 0 .9rem; }
+  button.primary { background: #3b82f6; border-color: #3b82f6; color: #fff; }
+  button.done { background: #166534; border-color: #166534; color: #fff; }
+  #stage { flex: 1; display: flex; justify-content: flex-start; align-items: flex-start; padding: .5rem; overflow: auto; }
+  #wrap { position: relative; width: 100%; flex: none; touch-action: none; user-select: none; }
+  #wrap.zoomed { touch-action: pan-x pan-y; }
+  #shot { width: 100%; display: block; border-radius: 8px; border: 1px solid #2a2f3a; background: #000; }
+  #dot { position: absolute; width: 22px; height: 22px; margin: -11px 0 0 -11px; border-radius: 50%;
+         background: rgba(59,130,246,.55); pointer-events: none; display: none; }
+  #bar { position: sticky; bottom: 0; background: #171a21; border-top: 1px solid #2a2f3a;
+         padding: .5rem .6rem calc(.5rem + env(safe-area-inset-bottom)); display: grid; gap: .5rem; }
+  #bar .row { display: flex; gap: .5rem; }
+  #bar .row > * { flex: 1; }
+  #text { flex: 3; min-width: 0; }
+  #status { font-size: .8rem; color: #8b93a7; padding: 0 .2rem; word-break: break-all; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">cu live</h1>
+  <select id="tabs" aria-label="Tab" style="max-width:5.5rem;padding:0 .4rem"></select>
+  <button id="zout" aria-label="Zoom out">−</button><button id="zin" aria-label="Zoom in">+</button>
+  <a href="/vault/app" style="color:#8b93a7">Vault</a>
+</header>
+<div id="stage"><div id="wrap"><img id="shot" alt="browser view"><div id="dot"></div></div></div>
+<div id="bar">
+  <div id="status">Connecting…</div>
+  <div class="row">
+    <input id="text" placeholder="Type here, then Send" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false">
+    <button id="send" class="primary">Send</button>
+  </div>
+  <div class="row">
+    <button data-key="Enter">Enter</button>
+    <button data-key="Backspace">⌫</button>
+    <button data-key="Tab">Tab</button>
+    <button id="up">▲</button>
+    <button id="down">▼</button>
+  </div>
+  <button id="release" class="done">I'm done, hand back to the agent</button>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let tab = '', busy = false, paused = false, last = null, delay = 900;
+const q = () => tab ? `?tab=${encodeURIComponent(tab)}` : '';
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (r.status === 401) { location.href = '/vault'; throw new Error('login'); }
+  return r.json();
+}
+async function loadTabs() {
+  try {
+    const body = await api('/v1/vault/live/tabs');
+    const tabs = (body.tabs || []).filter(t => !t.url.startsWith('chrome'));
+    $('tabs').innerHTML = tabs.map(t => `<option value="${t.id}">${(t.title || t.url).slice(0, 28)}</option>`).join('');
+    if (!tab && tabs.length) tab = (tabs.find(t => t.default) || tabs[0]).id;
+    $('tabs').value = tab;
+  } catch (e) {}
+}
+$('tabs').onchange = () => { tab = $('tabs').value; frame(); };
+async function frame() {
+  if (busy || paused) return;
+  busy = true;
+  try {
+    const f = await api('/v1/vault/live/frame' + q());
+    if (f.jpeg_base64) {
+      $('shot').src = 'data:image/jpeg;base64,' + f.jpeg_base64;
+      last = f;
+      $('title').textContent = f.url.replace(/^https?:\/\//, '').slice(0, 40);
+      $('status').textContent = (f.held ? 'Waiting for you. ' : 'Not paused. ') + f.url.slice(0, 90);
+    } else { $('status').textContent = f.error || 'No frame'; }
+  } catch (e) { $('status').textContent = 'Connection lost, retrying…'; }
+  busy = false;
+}
+async function send(body) {
+  paused = true;
+  try { await api('/v1/vault/live/input' + q(), { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) }); }
+  catch (e) {}
+  paused = false;
+  setTimeout(frame, 350);
+}
+// One finger: a short press is a tap; a drag scrolls the page.
+let start = null;
+const wrap = $('wrap');
+function rel(ev) { const r = $('shot').getBoundingClientRect();
+  return { x: (ev.clientX - r.left) / r.width, y: (ev.clientY - r.top) / r.height, px: ev.clientX, py: ev.clientY }; }
+wrap.addEventListener('pointerdown', ev => { start = { ...rel(ev), t: Date.now() }; wrap.setPointerCapture(ev.pointerId); });
+wrap.addEventListener('pointerup', ev => {
+  if (!start) return;
+  const e = rel(ev), moved = Math.hypot(e.px - start.px, e.py - start.py);
+  if (moved < 10) {
+    const dot = $('dot'); dot.style.left = (e.x * 100) + '%'; dot.style.top = (e.y * 100) + '%'; dot.style.display = 'block';
+    setTimeout(() => dot.style.display = 'none', 500);
+    send({ do: 'tap', x: e.x, y: e.y });
+  } else {
+    const h = last ? last.height : 800;
+    send({ do: 'scroll', x: start.x, y: start.y, dy: (start.y - e.y) * h, dx: (start.x - e.x) * (last ? last.width : 400) });
+  }
+  start = null;
+});
+$('send').onclick = () => { const t = $('text').value; if (!t) return; $('text').value = ''; send({ do: 'type', text: t }); };
+$('text').addEventListener('keydown', ev => { if (ev.key === 'Enter') { ev.preventDefault(); $('send').click(); } });
+document.querySelectorAll('[data-key]').forEach(b => b.onclick = () => send({ do: 'press', name: b.dataset.key }));
+$('up').onclick = () => send({ do: 'scroll', x: .5, y: .5, dy: -400, dx: 0 });
+$('down').onclick = () => send({ do: 'scroll', x: .5, y: .5, dy: 400, dx: 0 });
+$('release').onclick = async () => {
+  const r = await api('/v1/vault/live/release' + q(), { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' });
+  $('status').textContent = r.released ? 'Handed back to the agent. You can close this page.' : 'Nothing was waiting on this tab.';
+};
+let zoom = 1;
+function setZoom(z) { zoom = Math.min(4, Math.max(1, z)); wrap.style.width = (zoom * 100) + '%'; wrap.classList.toggle('zoomed', zoom > 1); }
+$('zin').onclick = () => setZoom(zoom + 0.5);
+$('zout').onclick = () => setZoom(zoom - 0.5);
+loadTabs().then(frame);
+setInterval(frame, delay);
+setInterval(loadTabs, 15000);
+</script>
+</body>
+</html>
