@@ -30,7 +30,8 @@ Use `cu` when an agent needs a persistent local browser session.
    Lines under `- frame: <url>` are inside an iframe; their refs work like any
    other -- click and type reach into the frame. When the answer is words
    rather than something to act on (prose, an API response, a message), read
-   `cu text` -- the snapshot only lists what is clickable.
+   `cu text` -- the snapshot only lists what is clickable. `cu console --level warn+`
+   shows console warnings, errors, uncaught exceptions, CSP and network failures.
 5. Act on what the snapshot shows by ref: `cu click e3`, `cu type e2 "text"
    [--submit]`. For several steps, send them at once and get the resulting
    page back in the same call:

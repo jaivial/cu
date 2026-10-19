@@ -860,6 +860,7 @@ pub fn route(
             | ("GET", "/v1/handoff")
             | ("GET", "/v1/inspect")
             | ("GET", "/v1/marks")
+            | ("GET", "/v1/console")
             | ("POST", "/v1/marks")
             | ("DELETE", "/v1/marks")
             | ("POST", "/v1/vault/sessions/save")
@@ -1156,6 +1157,33 @@ pub fn route(
                 && !body.contains("\"auth\": \"off\"")
                 && !body.contains("\"auth\":\"off\"");
             navigate_with_vault(state, &tab, &url, inject, auth_enabled)
+        }
+        // Everything the page wrote to its console, by level (see
+        // `crate::console`): `?level=warn+`, `grep=`, `since=`, `limit=`,
+        // `clear=1`, `format=text`.
+        ("GET", "/v1/console") => {
+            let q = query(full_path);
+            let levels = match crate::console::expand_levels(&form_value(q, "level")) {
+                Ok(l) => l,
+                Err(e) => {
+                    return (
+                        "400 Bad Request",
+                        "application/json",
+                        format!("{{\"error\":{}}}", json_string(&e)),
+                    );
+                }
+            };
+            let limit = form_value(q, "limit").parse::<usize>().unwrap_or(200);
+            let since = form_value(q, "since").parse::<u64>().unwrap_or(0);
+            crate::console::read(
+                &tab,
+                &levels,
+                &form_value(q, "grep"),
+                since,
+                limit,
+                form_value(q, "clear") == "1",
+                form_value(q, "format") == "text",
+            )
         }
         ("GET", "/v1/screenshot") => screenshot(&tab, query(full_path)),
         // Visual QA references (see `crate::visual`): what an element is,
@@ -3796,7 +3824,7 @@ impl CdpConnection {
     }
 
     /// Discover the tab's target and complete the websocket handshake.
-    fn open(tab: &Tab) -> Result<Self, String> {
+    pub(crate) fn open(tab: &Tab) -> Result<Self, String> {
         let discovery = http_get(&format!("127.0.0.1:{}", tab.cdp_port), "/json")?;
         let ws = match &tab.target {
             Some(id) => json_objects(&discovery)
@@ -5255,6 +5283,7 @@ fn navigate_with_vault(
     inject: bool,
     auth_enabled: bool,
 ) -> (&'static str, &'static str, String) {
+    crate::console::ensure(tab);
     let host = url_host(url);
     let vault = crate::vault::Vault::open(&state.data_dir).ok();
     let (mut injected, mut session_hint, mut credentials) = (false, "none", 0usize);

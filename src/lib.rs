@@ -1,6 +1,7 @@
 //! Minimal client SDK for a running `cu` session server.
 pub mod actions;
 pub mod challenge;
+pub mod console;
 pub mod diagnostics;
 pub mod execution;
 pub mod human;
