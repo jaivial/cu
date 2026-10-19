@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.3.0] - 2026-10-19
+
+### Added
+
+- **`cu console`: every console level, plus what breaks around it.** Agents
+  only saw page text, never the console. `cu console [--level L] [--grep S]
+  [--limit N] [--since N] [--clear] [--json]` (`GET /v1/console`) returns
+  `debug` (alias `verbose`), `log`, `info`, `trace`, `warn`, `error`, and also
+  `exception` (uncaught errors, unhandled rejections), `csp` (violations) and
+  `network` (failed sub-resources, failed or 4xx/5xx `fetch`/XHR). `--level`
+  takes a list (`warn,error`), `all`, or `LEVEL+` for that level and worse
+  (`warn+`). Capture runs in the page, so cu still never sends
+  `Runtime.enable`; console methods are wrapped in `Proxy`s and stay native to
+  `toString()`. A tab is captured from its first `cu navigate`/`cu console`.
+  `CU_CONSOLE=off` disables it.
+
 ## [1.2.0] - 2026-10-19
 
 ### Added
