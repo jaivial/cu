@@ -61,6 +61,32 @@ pub enum Action {
         reference: Option<String>,
         files: Vec<String>,
     },
+    /// Mouse-wheel scroll by `dx`/`dy` CSS px at the viewport centre (or over `ref`),
+    /// or jump with `to` = top | bottom.
+    Scroll {
+        reference: Option<String>,
+        dx: f64,
+        dy: f64,
+        to: Option<String>,
+    },
+    /// Touch gesture: tap | longpress | swipe | pinch. Target is `ref` (centre) or `x`,`y`.
+    /// swipe moves the content by (`dx`,`dy`) px; pinch uses `scale` (>1 zooms in).
+    Touch {
+        gesture: String,
+        reference: Option<String>,
+        at: Option<(f64, f64)>,
+        dx: f64,
+        dy: f64,
+        scale: f64,
+        ms: u64,
+    },
+    /// Device emulation: `mobile` (390x844 touch), `tablet`, `desktop` (clears it),
+    /// or explicit `width`/`height`.
+    Emulate {
+        mode: String,
+        width: u32,
+        height: u32,
+    },
 }
 
 /// A parsed `POST /v1/act` body.
@@ -120,6 +146,67 @@ pub fn parse_action(object: &str) -> Result<Action, String> {
             value: text("value")?,
         },
         "navigate" => Action::Navigate { url: text("url")? },
+        "scroll" => {
+            let num = |k: &str| json_value(object, k).and_then(|v| v.parse::<f64>().ok());
+            let to = json_string_value(object, "to");
+            if let Some(t) = &to
+                && t != "top"
+                && t != "bottom"
+            {
+                return Err("scroll \"to\" must be top or bottom".into());
+            }
+            let reference = match json_string_value(object, "ref") {
+                Some(_) => Some(reference()?),
+                None => None,
+            };
+            if to.is_none() && num("dy").is_none() && num("dx").is_none() {
+                return Err("scroll needs \"dy\"/\"dx\" (px) or \"to\":\"top|bottom\"".into());
+            }
+            Action::Scroll {
+                reference,
+                dx: num("dx").unwrap_or(0.0),
+                dy: num("dy").unwrap_or(0.0),
+                to,
+            }
+        }
+        "tap" | "longpress" | "swipe" | "pinch" => {
+            let num = |k: &str| json_value(object, k).and_then(|v| v.parse::<f64>().ok());
+            let reference = match json_string_value(object, "ref") {
+                Some(_) => Some(reference()?),
+                None => None,
+            };
+            let at = match (num("x"), num("y")) {
+                (Some(x), Some(y)) => Some((x, y)),
+                _ => None,
+            };
+            if reference.is_none() && at.is_none() {
+                return Err(format!("{kind} needs \"ref\" or \"x\" and \"y\""));
+            }
+            if kind == "swipe" && num("dx").is_none() && num("dy").is_none() {
+                return Err("swipe needs \"dx\" and/or \"dy\" (px the content moves)".into());
+            }
+            Action::Touch {
+                gesture: kind.clone(),
+                reference,
+                at,
+                dx: num("dx").unwrap_or(0.0),
+                dy: num("dy").unwrap_or(0.0),
+                scale: num("scale").unwrap_or(1.5),
+                ms: json_value(object, "ms").and_then(|v| v.parse().ok()).unwrap_or(0),
+            }
+        }
+        "emulate" => {
+            let mode = json_string_value(object, "mode").unwrap_or_else(|| "mobile".into());
+            if !["mobile", "tablet", "desktop", "custom"].contains(&mode.as_str()) {
+                return Err("emulate \"mode\" must be mobile, tablet, desktop or custom".into());
+            }
+            let n = |k: &str, d: u32| json_value(object, k).and_then(|v| v.parse().ok()).unwrap_or(d);
+            Action::Emulate {
+                mode,
+                width: n("width", 390),
+                height: n("height", 844),
+            }
+        }
         "wait" => Action::Wait {
             ms: json_value(object, "ms")
                 .and_then(|v| v.parse().ok())
@@ -604,6 +691,66 @@ impl Page {
                 self.upload(reference.as_deref(), files)?;
                 false
             }
+            Action::Scroll {
+                reference,
+                dx,
+                dy,
+                to,
+            } => {
+                self.scroll(reference.as_deref(), *dx, *dy, to.as_deref())?;
+                false
+            }
+            Action::Touch {
+                gesture,
+                reference,
+                at,
+                dx,
+                dy,
+                scale,
+                ms,
+            } => {
+                let mut watch = NavWatch::new(&self.frame);
+                let (x, y) = match (reference, at) {
+                    (Some(r), _) => self.locate(r, true)?.at,
+                    (None, Some(p)) => *p,
+                    _ => return Err("touch needs a target".into()),
+                };
+                let source = "\"gestureSourceType\":\"touch\"";
+                let (method, params) = match gesture.as_str() {
+                    "tap" => (
+                        "Input.synthesizeTapGesture",
+                        format!("{{\"x\":{x:.1},\"y\":{y:.1},\"duration\":{},{source}}}", (*ms).max(30)),
+                    ),
+                    "longpress" => (
+                        "Input.synthesizeTapGesture",
+                        format!("{{\"x\":{x:.1},\"y\":{y:.1},\"duration\":{},{source}}}", (*ms).max(800)),
+                    ),
+                    "swipe" => (
+                        "Input.synthesizeScrollGesture",
+                        // CDP distances are the finger's travel; the content moves with it.
+                        format!(
+                            "{{\"x\":{x:.1},\"y\":{y:.1},\"xDistance\":{dx:.1},\"yDistance\":{dy:.1},\"speed\":800,{source}}}"
+                        ),
+                    ),
+                    _ => (
+                        "Input.synthesizePinchGesture",
+                        format!("{{\"x\":{x:.1},\"y\":{y:.1},\"scaleFactor\":{scale:.3},\"relativeSpeed\":400,{source}}}"),
+                    ),
+                };
+                self.input(method, &params, &mut watch)?;
+                let navigated = self.settle(&mut watch)?;
+                download = watch.download.take();
+                popup = watch.popup;
+                navigated
+            }
+            Action::Emulate {
+                mode,
+                width,
+                height,
+            } => {
+                self.emulate(mode, *width, *height)?;
+                false
+            }
         };
         Ok(Outcome {
             navigated,
@@ -616,6 +763,69 @@ impl Page {
 
     /// Call a registry helper in the frame that owns `reference`, or explain
     /// that the page has no refs yet.
+    fn scroll(
+        &mut self,
+        reference: Option<&str>,
+        dx: f64,
+        dy: f64,
+        to: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(t) = to {
+            let y = if t == "top" { "0" } else { "document.documentElement.scrollHeight" };
+            self.conn().call(
+                "Runtime.evaluate",
+                &format!("{{\"expression\":\"window.scrollTo({{top:{y},behavior:'instant'}})\",\"returnByValue\":true}}"),
+            )?;
+            std::thread::sleep(Duration::from_millis(250));
+            return Ok(());
+        }
+        let mut watch = NavWatch::new(&self.frame);
+        let at = match reference {
+            Some(r) => self.locate(r, false)?.at,
+            None => {
+                let v = self.conn().call(
+                    "Runtime.evaluate",
+                    "{\"expression\":\"innerWidth+','+innerHeight\",\"returnByValue\":true}",
+                )?;
+                let t = json_string_value(&v, "value").unwrap_or_default();
+                let mut p = t.split(',').filter_map(|x| x.parse::<f64>().ok());
+                (p.next().unwrap_or(800.0) / 2.0, p.next().unwrap_or(600.0) / 2.0)
+            }
+        };
+        self.input(
+            "Input.dispatchMouseEvent",
+            &format!(
+                "{{\"type\":\"mouseWheel\",\"x\":{:.1},\"y\":{:.1},\"deltaX\":{dx:.1},\"deltaY\":{dy:.1}}}",
+                at.0, at.1
+            ),
+            &mut watch,
+        )?;
+        std::thread::sleep(Duration::from_millis(300));
+        Ok(())
+    }
+
+    fn emulate(&mut self, mode: &str, width: u32, height: u32) -> Result<(), String> {
+        if mode == "desktop" {
+            self.conn().call("Emulation.clearDeviceMetricsOverride", "{}")?;
+            self.conn().call("Emulation.setTouchEmulationEnabled", "{\"enabled\":false}")?;
+            return Ok(());
+        }
+        let (w, h, mobile) = match mode {
+            "mobile" => (390, 844, true),
+            "tablet" => (820, 1180, true),
+            _ => (width, height, width < 820),
+        };
+        self.conn().call(
+            "Emulation.setDeviceMetricsOverride",
+            &format!("{{\"width\":{w},\"height\":{h},\"deviceScaleFactor\":2,\"mobile\":{mobile}}}"),
+        )?;
+        self.conn().call(
+            "Emulation.setTouchEmulationEnabled",
+            &format!("{{\"enabled\":true,\"maxTouchPoints\":5}}"),
+        )?;
+        Ok(())
+    }
+
     fn registry_for(&mut self, reference: &str, call: &str) -> Result<String, String> {
         let expression = format!(
             "{REGISTRY}?{REGISTRY}.{call}:JSON.stringify({{error:'this page has no refs yet; take a snapshot first'}})"

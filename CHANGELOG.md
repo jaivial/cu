@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.2.0] - 2026-10-19
+
+### Added
+
+- **Scroll, touch and device emulation actions for `cu act`.** Agents could not
+  scroll or test mobile layouts. New batch actions:
+  - `{"do":"scroll","dy":300}` (also `dx`, optional `ref` to scroll over an
+    element) sends a mouse wheel; `{"do":"scroll","to":"top|bottom"}` jumps.
+  - `{"do":"tap"|"longpress"|"swipe"|"pinch", ...}` synthesise real touch
+    gestures (`ref` or `x`,`y`; `swipe` takes `dx`/`dy`, the finger travel in
+    px; `pinch` takes `scale`; `longpress` holds >= 800 ms, `ms` overrides).
+  - `{"do":"emulate","mode":"mobile|tablet|desktop|custom","width":..,"height":..}`
+    sets (or clears) a touch-capable mobile viewport.
+
 ## [1.1.3] - 2026-10-17
 
 ### Added
