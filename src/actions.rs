@@ -147,7 +147,7 @@ pub fn parse_action(object: &str) -> Result<Action, String> {
         },
         "navigate" => Action::Navigate { url: text("url")? },
         "scroll" => {
-            let num = |k: &str| json_value(object, k).and_then(|v| v.parse::<f64>().ok());
+            let num = |k: &str| crate::server::json_number(object, k);
             let to = json_string_value(object, "to");
             if let Some(t) = &to
                 && t != "top"
@@ -170,7 +170,7 @@ pub fn parse_action(object: &str) -> Result<Action, String> {
             }
         }
         "tap" | "longpress" | "swipe" | "pinch" => {
-            let num = |k: &str| json_value(object, k).and_then(|v| v.parse::<f64>().ok());
+            let num = |k: &str| crate::server::json_number(object, k);
             let reference = match json_string_value(object, "ref") {
                 Some(_) => Some(reference()?),
                 None => None,
@@ -709,6 +709,7 @@ impl Page {
                 scale,
                 ms,
             } => {
+                let _ = self.conn().call("Page.bringToFront", "{}");
                 let mut watch = NavWatch::new(&self.frame);
                 let (x, y) = match (reference, at) {
                     (Some(r), _) => self.locate(r, true)?.at,
@@ -779,6 +780,8 @@ impl Page {
             std::thread::sleep(Duration::from_millis(250));
             return Ok(());
         }
+        // A hidden tab never produces frames, so wheel input would wait forever.
+        let _ = self.conn().call("Page.bringToFront", "{}");
         let mut watch = NavWatch::new(&self.frame);
         let at = match reference {
             Some(r) => self.locate(r, false)?.at,
