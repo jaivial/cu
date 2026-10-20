@@ -1,0 +1,539 @@
+//! Push live view of one tab: Chromium's own screencast, relayed over a
+//! WebSocket, with the viewer's input coming back on the same socket.
+//!
+//! This sits next to [`crate::live`], which polls one JPEG per request. The
+//! gate is the same: a vault UI session (or the bearer token), so whoever can
+//! open the vault can watch and drive the browser, and nobody else. Nothing
+//! here recognises or answers a challenge; it relays a person's input and
+//! `release` hands the tab back to the agent, exactly as `live` does.
+//!
+//! Shape of the stream:
+//! - Chromium pushes `Page.screencastFrame` events only when the page paints.
+//!   Each is acknowledged no faster than every 100 ms (Chromium keeps at most
+//!   three frames unacknowledged, so this caps the stream near 30 fps).
+//! - The viewer may have `FRAME_WINDOW` frames in flight. Past that, only the
+//!   newest frame is kept and sent once an ack frees a slot: a slow viewer
+//!   skips frames instead of building a queue.
+//! - One viewer per tab at a time: a new connection takes over and the older
+//!   one is closed, so a stale page can never keep driving the browser.
+//!
+//! Binary frame to the viewer: `0x01`, seq (u32 BE), CSS width (u16 BE), CSS
+//! height (u16 BE), then the JPEG. Everything else is a JSON text message.
+use crate::server::{
+    AppState, CdpConnection, Tab, form_value, json_string, json_string_value, json_value,
+    named_tab,
+};
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Path of the socket.
+pub const PATH: &str = "/v1/vault/live/stream";
+/// The viewer page that speaks this protocol.
+pub const PAGE: &str = include_str!("vault_stream.html");
+
+const ACK_PACE: Duration = Duration::from_millis(100);
+const FRAME_WINDOW: u32 = 3;
+const HEARTBEAT: Duration = Duration::from_secs(10);
+/// A viewer that has said nothing for this long lost its connection.
+const SILENT: Duration = Duration::from_secs(30);
+const CONTROL_EVERY: Duration = Duration::from_secs(3);
+const MAX_CLIENT_MESSAGE: usize = 64 * 1024;
+const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/// Counts viewers; a viewer whose number is no longer the latest must stop.
+static VIEWER: AtomicU64 = AtomicU64::new(0);
+
+/// Whether this request asks for the live stream socket.
+pub fn wants(method: &str, path: &str, head: &str) -> bool {
+    method == "GET"
+        && path.split('?').next() == Some(PATH)
+        && header(head, "upgrade").is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+}
+
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+    })
+}
+
+fn refuse(stream: &mut TcpStream, status: &str, why: &str) {
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{why}",
+        why.len()
+    );
+}
+
+/// Same-origin only: a page on another site must not be able to open this
+/// socket with the person's cookie. A request with no `Origin` (a local
+/// client) is allowed; it still has to pass the session or bearer gate.
+fn origin_ok(head: &str) -> bool {
+    let Some(origin) = header(head, "origin") else {
+        return true;
+    };
+    let host = header(head, "host").unwrap_or("");
+    let origin_host = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))
+        .unwrap_or("");
+    !host.is_empty() && origin_host.eq_ignore_ascii_case(host)
+}
+
+/// Take over the connection: gate it, upgrade it, and serve the stream until
+/// either side goes away. Runs on the connection's own thread.
+pub fn serve(mut stream: TcpStream, head: &str, path: &str, bearer_ok: bool, state: &AppState) {
+    if !origin_ok(head) {
+        return refuse(&mut stream, "403 Forbidden", "cross-origin socket refused");
+    }
+    if !bearer_ok {
+        let token = header(head, "cookie").and_then(crate::vault::cookie_token);
+        let allowed = crate::vault::Vault::open(&state.data_dir)
+            .ok()
+            .and_then(|v| v.ui_session_check(token.as_deref()))
+            .is_some();
+        if !allowed {
+            return refuse(&mut stream, "401 Unauthorized", "vault: log in first");
+        }
+    }
+    let Some(key) = header(head, "sec-websocket-key") else {
+        return refuse(&mut stream, "400 Bad Request", "missing Sec-WebSocket-Key");
+    };
+    if let Err(e) = state.browser.wait(Duration::from_secs(20)) {
+        return refuse(&mut stream, "503 Service Unavailable", &e);
+    }
+    let query = path.split_once('?').map_or("", |(_, q)| q);
+    let wanted = form_value(query, "tab");
+    let tab = if wanted.is_empty() {
+        Ok(Tab::default_for(state.cdp_port))
+    } else {
+        named_tab(state.cdp_port, &wanted)
+    };
+    let tab = match tab {
+        Ok(t) => t,
+        Err(e) => return refuse(&mut stream, "400 Bad Request", &e),
+    };
+    let quality = form_value(query, "q").parse::<u32>().unwrap_or(60).clamp(20, 90);
+    let max_width = form_value(query, "w").parse::<u32>().unwrap_or(1280).clamp(320, 2560);
+
+    let accept = crate::server::base64_encode(&sha1(format!("{key}{GUID}").as_bytes()));
+    if write!(
+        stream,
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+    )
+    .is_err()
+    {
+        return;
+    }
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(SILENT));
+    let Ok(writer) = stream.try_clone() else { return };
+
+    let me = VIEWER.fetch_add(1, Ordering::SeqCst) + 1;
+    let shared = Arc::new(Shared {
+        writer: Mutex::new(writer),
+        stop: AtomicBool::new(false),
+        window: Mutex::new(Window::default()),
+        size: Mutex::new((0.0, 0.0)),
+        me,
+    });
+    let pusher = {
+        let shared = Arc::clone(&shared);
+        let tab = tab.clone();
+        std::thread::spawn(move || push_frames(&shared, &tab, quality, max_width))
+    };
+    read_input(&mut stream, &shared, &tab);
+    shared.stop.store(true, Ordering::SeqCst);
+    let _ = pusher.join();
+    let _ = shared.write(0x8, &[0x03, 0xe8]);
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+#[derive(Default)]
+struct Window {
+    /// Frames sent and not yet acknowledged by the viewer.
+    in_flight: u32,
+    /// Sequence of the last frame sent.
+    seq: u32,
+    /// The newest frame that did not fit in the window.
+    pending: Option<(Vec<u8>, u16, u16)>,
+}
+
+struct Shared {
+    writer: Mutex<TcpStream>,
+    stop: AtomicBool,
+    window: Mutex<Window>,
+    /// CSS size of the page as the last frame described it.
+    size: Mutex<(f64, f64)>,
+    me: u64,
+}
+
+impl Shared {
+    fn live(&self) -> bool {
+        !self.stop.load(Ordering::SeqCst) && VIEWER.load(Ordering::SeqCst) == self.me
+    }
+
+    fn write(&self, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
+        let mut frame = vec![0x80 | opcode];
+        if payload.len() < 126 {
+            frame.push(payload.len() as u8);
+        } else if payload.len() < 65536 {
+            frame.push(126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            frame.push(127);
+            frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
+        frame.extend_from_slice(payload);
+        let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        w.write_all(&frame).inspect_err(|_| {
+            self.stop.store(true, Ordering::SeqCst);
+        })
+    }
+
+    fn text(&self, json: &str) {
+        let _ = self.write(0x1, json.as_bytes());
+    }
+
+    /// Send a frame if the viewer has room, else keep it as the newest one.
+    fn offer(&self, jpeg: Vec<u8>, w: u16, h: u16) {
+        let mut win = self.window.lock().unwrap_or_else(|e| e.into_inner());
+        if win.in_flight >= FRAME_WINDOW {
+            win.pending = Some((jpeg, w, h));
+            return;
+        }
+        self.send_locked(&mut win, jpeg, w, h);
+    }
+
+    fn send_locked(&self, win: &mut Window, jpeg: Vec<u8>, w: u16, h: u16) {
+        win.seq = win.seq.wrapping_add(1);
+        win.in_flight += 1;
+        let mut out = Vec::with_capacity(jpeg.len() + 9);
+        out.push(1);
+        out.extend_from_slice(&win.seq.to_be_bytes());
+        out.extend_from_slice(&w.to_be_bytes());
+        out.extend_from_slice(&h.to_be_bytes());
+        out.extend_from_slice(&jpeg);
+        let _ = self.write(0x2, &out);
+    }
+
+    /// The viewer drew a frame: free a slot and send the newest waiting one.
+    fn acked(&self) {
+        let mut win = self.window.lock().unwrap_or_else(|e| e.into_inner());
+        win.in_flight = win.in_flight.saturating_sub(1);
+        if win.in_flight < FRAME_WINDOW
+            && let Some((jpeg, w, h)) = win.pending.take()
+        {
+            self.send_locked(&mut win, jpeg, w, h);
+        }
+    }
+}
+
+/// Chromium to viewer: start the screencast on its own DevTools connection
+/// and relay each frame.
+fn push_frames(shared: &Shared, tab: &Tab, quality: u32, max_width: u32) {
+    let mut cdp = match CdpConnection::open(tab) {
+        Ok(c) => c,
+        Err(e) => {
+            shared.text(&format!("{{\"t\":\"error\",\"error\":{}}}", json_string(&e)));
+            shared.stop.store(true, Ordering::SeqCst);
+            return;
+        }
+    };
+    let started = cdp.call(
+        "Page.startScreencast",
+        &format!(
+            "{{\"format\":\"jpeg\",\"quality\":{quality},\"maxWidth\":{max_width},\"everyNthFrame\":1}}"
+        ),
+    );
+    if let Err(e) = started {
+        shared.text(&format!("{{\"t\":\"error\",\"error\":{}}}", json_string(&e)));
+        shared.stop.store(true, Ordering::SeqCst);
+        return;
+    }
+    let mut last_ack = Instant::now() - ACK_PACE;
+    let mut last_beat = Instant::now();
+    let mut last_control = Instant::now() - CONTROL_EVERY;
+    while shared.live() {
+        let mut frame: Option<(Vec<u8>, u16, u16, String)> = None;
+        // One event at a time with a short deadline, so the stop flag and the
+        // heartbeat are looked at even when the page is not painting.
+        let _ = cdp.pump_events(Instant::now() + Duration::from_millis(500), &mut |text| {
+            if !text.contains("\"Page.screencastFrame\"") {
+                return false;
+            }
+            let session = json_value(text, "sessionId").unwrap_or_default();
+            let data = json_value(text, "data").unwrap_or_default();
+            let w = number(text, "deviceWidth").unwrap_or(0.0);
+            let h = number(text, "deviceHeight").unwrap_or(0.0);
+            if let Some(jpeg) = base64_decode(&data) {
+                frame = Some((jpeg, w.round() as u16, h.round() as u16, session));
+            }
+            true
+        });
+        if let Some((jpeg, w, h, session)) = frame {
+            *shared.size.lock().unwrap_or_else(|e| e.into_inner()) = (w as f64, h as f64);
+            shared.offer(jpeg, w, h);
+            // Acknowledge at the pace, whether or not the viewer took the
+            // frame: Chromium stops sending while frames go unacknowledged.
+            let wait = (last_ack + ACK_PACE).saturating_duration_since(Instant::now());
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+            }
+            last_ack = Instant::now();
+            if !session.is_empty() {
+                cdp.send("Page.screencastFrameAck", &format!("{{\"sessionId\":{session}}}"));
+            }
+        }
+        if last_beat.elapsed() >= HEARTBEAT {
+            last_beat = Instant::now();
+            let _ = shared.write(0x9, b"cu");
+        }
+        if last_control.elapsed() >= CONTROL_EVERY {
+            last_control = Instant::now();
+            let held = crate::challenge::last(tab)
+                .is_some_and(|a| a.state == crate::challenge::ChallengeState::HumanRequired);
+            shared.text(&format!("{{\"t\":\"control\",\"held\":{held}}}"));
+        }
+    }
+    let _ = cdp.call("Page.stopScreencast", "{}");
+}
+
+/// One client frame, unmasked. `None` on a closed or broken socket.
+fn read_client(stream: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
+    let mut head = [0u8; 2];
+    stream.read_exact(&mut head).ok()?;
+    let opcode = head[0] & 0x0f;
+    // Fragmented messages are not part of this protocol.
+    if head[0] & 0x80 == 0 || opcode == 0 {
+        return None;
+    }
+    // A client must mask what it sends.
+    if head[1] & 0x80 == 0 {
+        return None;
+    }
+    let mut len = (head[1] & 0x7f) as usize;
+    if len == 126 {
+        let mut b = [0u8; 2];
+        stream.read_exact(&mut b).ok()?;
+        len = u16::from_be_bytes(b) as usize;
+    } else if len == 127 {
+        return None;
+    }
+    if len > MAX_CLIENT_MESSAGE {
+        return None;
+    }
+    let mut mask = [0u8; 4];
+    stream.read_exact(&mut mask).ok()?;
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).ok()?;
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b ^= mask[i % 4];
+    }
+    Some((opcode, payload))
+}
+
+/// Viewer to Chromium: acks and input until the viewer leaves.
+fn read_input(stream: &mut TcpStream, shared: &Shared, tab: &Tab) {
+    let mut focused = false;
+    while shared.live() {
+        let Some((opcode, payload)) = read_client(stream) else {
+            return;
+        };
+        match opcode {
+            0x8 => return,
+            0x9 => {
+                let _ = shared.write(0xA, &payload);
+            }
+            0x1 => {
+                let Ok(text) = String::from_utf8(payload) else {
+                    return;
+                };
+                handle_message(&text, shared, tab, &mut focused);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn dispatch(tab: &Tab, method: &str, params: &str) {
+    let _ = tab.command(method, params);
+}
+
+fn handle_message(msg: &str, shared: &Shared, tab: &Tab, focused: &mut bool) {
+    let kind = json_string_value(msg, "t").unwrap_or_default();
+    match kind.as_str() {
+        "ack" => shared.acked(),
+        "ping" => shared.text("{\"t\":\"pong\"}"),
+        "release" => {
+            let released = crate::challenge::release(tab);
+            shared.text(&format!("{{\"t\":\"released\",\"released\":{released}}}"));
+        }
+        "mouse" | "wheel" | "key" | "text" => {
+            if !*focused {
+                // A tab nobody is looking at ignores input; this one is being looked at.
+                dispatch(tab, "Page.bringToFront", "{}");
+                dispatch(tab, "Emulation.setFocusEmulationEnabled", "{\"enabled\":true}");
+                *focused = true;
+            }
+            let (w, h) = *shared.size.lock().unwrap_or_else(|e| e.into_inner());
+            let x = number(msg, "x").unwrap_or(0.0).clamp(0.0, 1.0) * w;
+            let y = number(msg, "y").unwrap_or(0.0).clamp(0.0, 1.0) * h;
+            let modifiers = number(msg, "mod").unwrap_or(0.0).clamp(0.0, 15.0) as u32;
+            match kind.as_str() {
+                "mouse" => {
+                    let action = json_string_value(msg, "a").unwrap_or_default();
+                    let button = match json_string_value(msg, "b").as_deref() {
+                        Some("middle") => "middle",
+                        Some("right") => "right",
+                        Some("left") => "left",
+                        _ => "none",
+                    };
+                    let (kind, buttons, count) = match action.as_str() {
+                        "down" => ("mousePressed", 1, 1),
+                        "up" => ("mouseReleased", 0, 1),
+                        _ => ("mouseMoved", if button == "none" { 0 } else { 1 }, 0),
+                    };
+                    dispatch(
+                        tab,
+                        "Input.dispatchMouseEvent",
+                        &format!(
+                            "{{\"type\":\"{kind}\",\"x\":{x:.1},\"y\":{y:.1},\"button\":\"{button}\",\"buttons\":{buttons},\"clickCount\":{count},\"modifiers\":{modifiers}}}"
+                        ),
+                    );
+                }
+                "wheel" => {
+                    let dx = number(msg, "dx").unwrap_or(0.0).clamp(-3000.0, 3000.0);
+                    let dy = number(msg, "dy").unwrap_or(0.0).clamp(-3000.0, 3000.0);
+                    dispatch(
+                        tab,
+                        "Input.dispatchMouseEvent",
+                        &format!(
+                            "{{\"type\":\"mouseWheel\",\"x\":{x:.1},\"y\":{y:.1},\"deltaX\":{dx:.0},\"deltaY\":{dy:.0},\"modifiers\":{modifiers}}}"
+                        ),
+                    );
+                }
+                "key" => {
+                    let down = json_string_value(msg, "a").as_deref() != Some("up");
+                    let key = json_string_value(msg, "key").unwrap_or_default();
+                    if key.is_empty() || key.len() > 32 {
+                        return;
+                    }
+                    let code = json_string_value(msg, "code").unwrap_or_default();
+                    let vk = number(msg, "vk").unwrap_or(0.0).clamp(0.0, 255.0) as u32;
+                    let text = json_string_value(msg, "text").unwrap_or_default();
+                    let text_part = if down && !text.is_empty() && text.chars().count() == 1 {
+                        format!(",\"text\":{}", json_string(&text))
+                    } else {
+                        String::new()
+                    };
+                    dispatch(
+                        tab,
+                        "Input.dispatchKeyEvent",
+                        &format!(
+                            "{{\"type\":\"{}\",\"key\":{},\"code\":{},\"windowsVirtualKeyCode\":{vk},\"modifiers\":{modifiers}{text_part}}}",
+                            if down { "keyDown" } else { "keyUp" },
+                            json_string(&key),
+                            json_string(&code)
+                        ),
+                    );
+                }
+                _ => {
+                    // Whole strings (mobile keyboards, IME, paste) go in as inserted text.
+                    let text = json_string_value(msg, "text").unwrap_or_default();
+                    if !text.is_empty() && text.len() <= 4096 {
+                        dispatch(tab, "Input.insertText", &format!("{{\"text\":{}}}", json_string(&text)));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A JSON number under `key` (`json_value` stops at the first non-digit).
+fn number(body: &str, key: &str) -> Option<f64> {
+    let needle = format!("\"{key}\"");
+    let rest = body[body.find(&needle)? + needle.len()..]
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E')))
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let mut acc = 0u32;
+    let mut bits = 0;
+    for c in input.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\n' | b'\r' => continue,
+            _ => return None,
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// SHA-1, for `Sec-WebSocket-Accept` only (RFC 6455 requires it; it protects
+/// nothing here, the session gate does).
+fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&((data.len() as u64) * 8).to_be_bytes());
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = h;
+        for (i, wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5A827999),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let t = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+    let mut out = [0u8; 20];
+    for (i, v) in h.iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&v.to_be_bytes());
+    }
+    out
+}

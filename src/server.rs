@@ -704,6 +704,12 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
         let _ = stream.write_all(MANROPE);
         return;
     }
+    // The live stream is a WebSocket: it takes the connection over instead of
+    // answering one request, and gates itself (vault session or bearer).
+    if host_ok && crate::live_stream::wants(method, path, head) {
+        crate::live_stream::serve(stream, head, path, authorized, &state);
+        return;
+    }
     let mut set_cookie: Option<String> = None;
     let (status, content_type, response) = if !host_ok {
         (
@@ -4715,6 +4721,12 @@ fn vault_route_with(
             None,
         ),
         ("GET", "/vault/otp") => ("200 OK", "text/html; charset=utf-8", OTP_PAGE.into(), None),
+        ("GET", "/vault/live2") => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            crate::live_stream::PAGE.into(),
+            None,
+        ),
         ("POST", "/v1/vault/ui/login") => {
             if !crate::vault::login_allowed() {
                 return (

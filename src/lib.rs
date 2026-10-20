@@ -7,6 +7,7 @@ pub mod execution;
 pub mod human;
 pub mod input;
 pub mod live;
+pub mod live_stream;
 pub mod otp;
 pub mod policy;
 pub mod qr;
