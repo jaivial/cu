@@ -4070,6 +4070,39 @@ impl CdpConnection {
         }
     }
 
+    /// The next message, or `Ok(None)` when nothing arrived within `idle`.
+    ///
+    /// The idle wait is a `peek`, which consumes nothing, so a timeout can
+    /// never leave half a frame in the stream. Once the first byte is there
+    /// the whole frame is read with `frame_limit` as the bound; a failure
+    /// after that point is an error, and the connection must be dropped, not
+    /// read again.
+    pub(crate) fn wait_event(
+        &mut self,
+        idle: Duration,
+        frame_limit: Duration,
+    ) -> Result<Option<String>, String> {
+        let _ = self
+            .stream
+            .set_read_timeout(Some(idle.max(Duration::from_millis(1))));
+        let mut one = [0u8; 1];
+        match self.stream.peek(&mut one) {
+            Ok(0) => return Err("Chromium closed the DevTools connection".into()),
+            Ok(_) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+        let _ = self.stream.set_read_timeout(Some(frame_limit));
+        let message = self.next_message(MAX_CDP_MESSAGE);
+        let _ = self.stream.set_read_timeout(Some(CDP_HTTP_TIMEOUT));
+        message.map(Some)
+    }
+
     /// How long the next read may wait: the auth window pumps the stream
     /// directly and bounds each read by the time it has left.
     pub(crate) fn set_read_timeout(&self, timeout: Duration) {

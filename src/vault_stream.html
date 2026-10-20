@@ -41,12 +41,13 @@
     <input id="text" placeholder="Type here, then Send" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false">
     <button id="send" class="primary">Send</button>
   </div>
+  <button id="take" class="primary">Take control</button>
   <button id="release" class="done">I'm done, hand back to the agent</button>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
 const cv = $('view'), ctx = cv.getContext('2d');
-let ws = null, tab = '', held = false, closedByUs = false, delay = 1000;
+let ws = null, tab = '', held = false, controlling = false, closedByUs = false, delay = 1000;
 let frames = 0, bytes = 0, shown = 0, lastTick = performance.now(), fps = 0, kbps = 0, size = '';
 
 async function loadTabs() {
@@ -60,21 +61,31 @@ async function loadTabs() {
   } catch (e) {}
 }
 function status(extra) {
-  $('status').textContent = (ws && ws.readyState === 1 ? (held ? 'Waiting for you. ' : 'Streaming. ') : 'Offline. ')
+  const mode = !ws || ws.readyState !== 1 ? 'Offline. '
+    : controlling ? (held ? 'You have control; the agent is paused. ' : 'You have control; the agent may still be acting. ')
+    : 'Watching only. ';
+  $('status').textContent = mode
     + fps.toFixed(0) + ' fps, ' + kbps.toFixed(0) + ' kB/s ' + size + (extra ? ' ' + extra : '');
 }
-function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+function send(o) {
+  if (!ws || ws.readyState !== 1) return;
+  // Input only goes out once the person has taken control.
+  if (['mouse', 'wheel', 'key', 'text'].includes(o.t) && !controlling) return;
+  ws.send(JSON.stringify(o));
+}
 
 function connect() {
   closedByUs = false;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(proto + '//' + location.host + '/v1/vault/live/stream' + (tab ? '?tab=' + encodeURIComponent(tab) : ''));
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { delay = 1000; status(); };
+  ws.onopen = () => { delay = 1000; controlling = false; status(); };
   ws.onmessage = async (ev) => {
     if (typeof ev.data === 'string') {
       const m = JSON.parse(ev.data);
-      if (m.t === 'control') { held = !!m.held; status(); }
+      if (m.t === 'control') { if ('held' in m) held = !!m.held; if ('controlling' in m) controlling = !!m.controlling; status(); }
+      else if (m.t === 'denied') { controlling = false; status('Press Take control first.'); }
+      else if (m.t === 'reopening') status('Reconnecting to the browser…');
       else if (m.t === 'error') status(m.error);
       return;
     }
@@ -94,6 +105,7 @@ function connect() {
     send({ t: 'ack', seq: v.getUint32(1) });
   };
   ws.onclose = () => {
+    controlling = false;
     status('Reconnecting…');
     if (!closedByUs) setTimeout(connect, delay), delay = Math.min(delay * 2, 15000);
   };
@@ -159,7 +171,8 @@ for (const type of ['keydown', 'keyup']) cv.addEventListener(type, ev => {
 });
 // Phone keyboard and paste: whole strings.
 $('send').onclick = () => { const t = $('text').value; if (t) { send({ t: 'text', text: t }); $('text').value = ''; } };
-$('release').onclick = () => send({ t: 'release' });
+$('take').onclick = () => { send({ t: 'take' }); cv.focus(); };
+$('release').onclick = () => { send({ t: 'release' }); controlling = false; status(); };
 loadTabs().then(connect);
 setInterval(loadTabs, 15000);
 </script>

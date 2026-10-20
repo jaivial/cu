@@ -9,8 +9,18 @@
 //!
 //! Shape of the stream:
 //! - Chromium pushes `Page.screencastFrame` events only when the page paints.
-//!   Each is acknowledged no faster than every 100 ms (Chromium keeps at most
-//!   three frames unacknowledged, so this caps the stream near 30 fps).
+//!   Each frame is acknowledged 100 ms after it arrived, each on its own
+//!   timer. Chromium keeps at most three frames unacknowledged, so the
+//!   ceiling is three frames per 100 ms. That is a ceiling, not a measured
+//!   rate: the real rate is read from the viewer page on Kraken.
+//! - The DevTools socket is read with `wait_event`, whose idle wait consumes
+//!   nothing. If a frame still breaks half way, the connection is reopened and
+//!   the screencast restarted instead of reading on from a torn stream.
+//! - The vault session is re-checked every few seconds: logging out or an
+//!   expired session closes the socket. A bearer caller has no session to
+//!   revoke.
+//! - The viewer only watches until it sends `take`. Input from a viewer that
+//!   has not taken control is ignored.
 //! - The viewer may have `FRAME_WINDOW` frames in flight. Past that, only the
 //!   newest frame is kept and sent once an ack frees a slot: a slow viewer
 //!   skips frames instead of building a queue.
@@ -25,6 +35,8 @@ use crate::server::{
 };
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -34,12 +46,18 @@ pub const PATH: &str = "/v1/vault/live/stream";
 /// The viewer page that speaks this protocol.
 pub const PAGE: &str = include_str!("vault_stream.html");
 
-const ACK_PACE: Duration = Duration::from_millis(100);
+const ACK_DELAY: Duration = Duration::from_millis(100);
 const FRAME_WINDOW: u32 = 3;
 const HEARTBEAT: Duration = Duration::from_secs(10);
 /// A viewer that has said nothing for this long lost its connection.
 const SILENT: Duration = Duration::from_secs(30);
 const CONTROL_EVERY: Duration = Duration::from_secs(3);
+/// How often a cookie session is checked again.
+const SESSION_EVERY: Duration = Duration::from_secs(2);
+/// Once a frame has started to arrive, the rest of it must follow within this.
+const FRAME_LIMIT: Duration = Duration::from_secs(10);
+/// Times the screencast is reopened after a broken read before giving up.
+const REOPEN_LIMIT: u32 = 3;
 const MAX_CLIENT_MESSAGE: usize = 64 * 1024;
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -89,13 +107,13 @@ pub fn serve(mut stream: TcpStream, head: &str, path: &str, bearer_ok: bool, sta
     if !origin_ok(head) {
         return refuse(&mut stream, "403 Forbidden", "cross-origin socket refused");
     }
+    let session_token = if bearer_ok {
+        None
+    } else {
+        header(head, "cookie").and_then(crate::vault::cookie_token)
+    };
     if !bearer_ok {
-        let token = header(head, "cookie").and_then(crate::vault::cookie_token);
-        let allowed = crate::vault::Vault::open(&state.data_dir)
-            .ok()
-            .and_then(|v| v.ui_session_check(token.as_deref()))
-            .is_some();
-        if !allowed {
+        if !session_alive(&state.data_dir, session_token.as_deref()) {
             return refuse(&mut stream, "401 Unauthorized", "vault: log in first");
         }
     }
@@ -138,18 +156,30 @@ pub fn serve(mut stream: TcpStream, head: &str, path: &str, bearer_ok: bool, sta
         stop: AtomicBool::new(false),
         window: Mutex::new(Window::default()),
         size: Mutex::new((0.0, 0.0)),
+        controlling: AtomicBool::new(false),
         me,
     });
     let pusher = {
         let shared = Arc::clone(&shared);
         let tab = tab.clone();
-        std::thread::spawn(move || push_frames(&shared, &tab, quality, max_width))
+        let data_dir = state.data_dir.clone();
+        std::thread::spawn(move || {
+            push_frames(&shared, &tab, quality, max_width, &data_dir, session_token.as_deref())
+        })
     };
     read_input(&mut stream, &shared, &tab);
     shared.stop.store(true, Ordering::SeqCst);
     let _ = pusher.join();
     let _ = shared.write(0x8, &[0x03, 0xe8]);
     let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+/// Whether a vault UI session token is still valid (logout and expiry end it).
+fn session_alive(data_dir: &PathBuf, token: Option<&str>) -> bool {
+    crate::vault::Vault::open(data_dir)
+        .ok()
+        .and_then(|v| v.ui_session_check(token))
+        .is_some()
 }
 
 #[derive(Default)]
@@ -168,6 +198,8 @@ struct Shared {
     window: Mutex<Window>,
     /// CSS size of the page as the last frame described it.
     size: Mutex<(f64, f64)>,
+    /// Set by the viewer's `take`, cleared by `release`.
+    controlling: AtomicBool,
     me: u64,
 }
 
@@ -232,74 +264,107 @@ impl Shared {
     }
 }
 
-/// Chromium to viewer: start the screencast on its own DevTools connection
-/// and relay each frame.
-fn push_frames(shared: &Shared, tab: &Tab, quality: u32, max_width: u32) {
-    let mut cdp = match CdpConnection::open(tab) {
-        Ok(c) => c,
-        Err(e) => {
-            shared.text(&format!("{{\"t\":\"error\",\"error\":{}}}", json_string(&e)));
-            shared.stop.store(true, Ordering::SeqCst);
-            return;
-        }
-    };
-    let started = cdp.call(
-        "Page.startScreencast",
-        &format!(
-            "{{\"format\":\"jpeg\",\"quality\":{quality},\"maxWidth\":{max_width},\"everyNthFrame\":1}}"
-        ),
-    );
-    if let Err(e) = started {
-        shared.text(&format!("{{\"t\":\"error\",\"error\":{}}}", json_string(&e)));
-        shared.stop.store(true, Ordering::SeqCst);
-        return;
-    }
-    let mut last_ack = Instant::now() - ACK_PACE;
+/// Chromium to viewer: run the screencast on its own DevTools connection and
+/// relay each frame. Returns when the viewer is gone, replaced, logged out, or
+/// the browser could not be read again.
+fn push_frames(
+    shared: &Shared,
+    tab: &Tab,
+    quality: u32,
+    max_width: u32,
+    data_dir: &PathBuf,
+    token: Option<&str>,
+) {
+    let mut reopened = 0;
     let mut last_beat = Instant::now();
     let mut last_control = Instant::now() - CONTROL_EVERY;
-    while shared.live() {
-        let mut frame: Option<(Vec<u8>, u16, u16, String)> = None;
-        // One event at a time with a short deadline, so the stop flag and the
-        // heartbeat are looked at even when the page is not painting.
-        let _ = cdp.pump_events(Instant::now() + Duration::from_millis(500), &mut |text| {
-            if !text.contains("\"Page.screencastFrame\"") {
-                return false;
+    let mut last_session = Instant::now();
+    'connection: while shared.live() {
+        let mut cdp = match CdpConnection::open(tab) {
+            Ok(c) => c,
+            Err(e) => return fail(shared, &e),
+        };
+        let started = cdp.call(
+            "Page.startScreencast",
+            &format!(
+                "{{\"format\":\"jpeg\",\"quality\":{quality},\"maxWidth\":{max_width},\"everyNthFrame\":1}}"
+            ),
+        );
+        if let Err(e) = started {
+            return fail(shared, &e);
+        }
+        // Each frame is acknowledged 100 ms after it arrived, on its own timer.
+        let mut acks: VecDeque<(Instant, String)> = VecDeque::new();
+        while shared.live() {
+            let now = Instant::now();
+            while acks.front().is_some_and(|(due, _)| *due <= now) {
+                if let Some((_, session)) = acks.pop_front() {
+                    cdp.send("Page.screencastFrameAck", &format!("{{\"sessionId\":{session}}}"));
+                }
             }
-            let session = json_value(text, "sessionId").unwrap_or_default();
-            let data = json_value(text, "data").unwrap_or_default();
-            let w = number(text, "deviceWidth").unwrap_or(0.0);
-            let h = number(text, "deviceHeight").unwrap_or(0.0);
-            if let Some(jpeg) = base64_decode(&data) {
-                frame = Some((jpeg, w.round() as u16, h.round() as u16, session));
+            let idle = acks
+                .front()
+                .map_or(Duration::from_millis(250), |(due, _)| due.saturating_duration_since(now))
+                .min(Duration::from_millis(250));
+            match cdp.wait_event(idle, FRAME_LIMIT) {
+                Ok(Some(text)) if text.contains("\"Page.screencastFrame\"") => {
+                    let session = json_value(&text, "sessionId").unwrap_or_default();
+                    let data = json_value(&text, "data").unwrap_or_default();
+                    let w = number(&text, "deviceWidth").unwrap_or(0.0);
+                    let h = number(&text, "deviceHeight").unwrap_or(0.0);
+                    if !session.is_empty() {
+                        // Acknowledged whether or not the viewer takes this frame:
+                        // Chromium stops sending while frames go unacknowledged.
+                        acks.push_back((Instant::now() + ACK_DELAY, session));
+                    }
+                    if let Some(jpeg) = base64_decode(&data) {
+                        *shared.size.lock().unwrap_or_else(|e| e.into_inner()) = (w, h);
+                        shared.offer(jpeg, w.round() as u16, h.round() as u16);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    // The stream may be torn: never read on from it.
+                    reopened += 1;
+                    if reopened > REOPEN_LIMIT {
+                        return fail(shared, &format!("DevTools stream lost: {e}"));
+                    }
+                    shared.text("{\"t\":\"reopening\"}");
+                    continue 'connection;
+                }
             }
-            true
-        });
-        if let Some((jpeg, w, h, session)) = frame {
-            *shared.size.lock().unwrap_or_else(|e| e.into_inner()) = (w as f64, h as f64);
-            shared.offer(jpeg, w, h);
-            // Acknowledge at the pace, whether or not the viewer took the
-            // frame: Chromium stops sending while frames go unacknowledged.
-            let wait = (last_ack + ACK_PACE).saturating_duration_since(Instant::now());
-            if !wait.is_zero() {
-                std::thread::sleep(wait);
+            if last_beat.elapsed() >= HEARTBEAT {
+                last_beat = Instant::now();
+                let _ = shared.write(0x9, b"cu");
             }
-            last_ack = Instant::now();
-            if !session.is_empty() {
-                cdp.send("Page.screencastFrameAck", &format!("{{\"sessionId\":{session}}}"));
+            if last_session.elapsed() >= SESSION_EVERY {
+                last_session = Instant::now();
+                if token.is_some() && !session_alive(data_dir, token) {
+                    shared.text("{\"t\":\"error\",\"error\":\"vault session ended\"}");
+                    shared.stop.store(true, Ordering::SeqCst);
+                    // Closes the viewer's socket, which ends its reader too.
+                    let _ = shared.writer.lock().map(|w| w.shutdown(std::net::Shutdown::Both));
+                    break 'connection;
+                }
+            }
+            if last_control.elapsed() >= CONTROL_EVERY {
+                last_control = Instant::now();
+                let held = crate::challenge::last(tab)
+                    .is_some_and(|a| a.state == crate::challenge::ChallengeState::HumanRequired);
+                let controlling = shared.controlling.load(Ordering::SeqCst);
+                shared.text(&format!(
+                    "{{\"t\":\"control\",\"held\":{held},\"controlling\":{controlling}}}"
+                ));
             }
         }
-        if last_beat.elapsed() >= HEARTBEAT {
-            last_beat = Instant::now();
-            let _ = shared.write(0x9, b"cu");
-        }
-        if last_control.elapsed() >= CONTROL_EVERY {
-            last_control = Instant::now();
-            let held = crate::challenge::last(tab)
-                .is_some_and(|a| a.state == crate::challenge::ChallengeState::HumanRequired);
-            shared.text(&format!("{{\"t\":\"control\",\"held\":{held}}}"));
-        }
+        let _ = cdp.call("Page.stopScreencast", "{}");
+        return;
     }
-    let _ = cdp.call("Page.stopScreencast", "{}");
+}
+
+fn fail(shared: &Shared, why: &str) {
+    shared.text(&format!("{{\"t\":\"error\",\"error\":{}}}", json_string(why)));
+    shared.stop.store(true, Ordering::SeqCst);
 }
 
 /// One client frame, unmasked. `None` on a closed or broken socket.
@@ -368,11 +433,21 @@ fn handle_message(msg: &str, shared: &Shared, tab: &Tab, focused: &mut bool) {
     match kind.as_str() {
         "ack" => shared.acked(),
         "ping" => shared.text("{\"t\":\"pong\"}"),
+        "take" => {
+            shared.controlling.store(true, Ordering::SeqCst);
+            shared.text("{\"t\":\"control\",\"controlling\":true}");
+        }
         "release" => {
+            shared.controlling.store(false, Ordering::SeqCst);
+            *focused = false;
             let released = crate::challenge::release(tab);
             shared.text(&format!("{{\"t\":\"released\",\"released\":{released}}}"));
         }
         "mouse" | "wheel" | "key" | "text" => {
+            if !shared.controlling.load(Ordering::SeqCst) {
+                shared.text("{\"t\":\"denied\"}");
+                return;
+            }
             if !*focused {
                 // A tab nobody is looking at ignores input; this one is being looked at.
                 dispatch(tab, "Page.bringToFront", "{}");
