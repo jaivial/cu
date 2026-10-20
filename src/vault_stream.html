@@ -50,10 +50,25 @@ const cv = $('view'), ctx = cv.getContext('2d');
 let ws = null, tab = '', held = false, controlling = false, closedByUs = false, delay = 1000;
 let frames = 0, bytes = 0, shown = 0, lastTick = performance.now(), fps = 0, kbps = 0, size = '';
 
+
+// Signed out or expired. Top level: go to the login page. Inside a frame the
+// login page cannot be framed, so show a link that opens it in its own tab
+// and never navigate the frame.
+function signedOut() {
+  closedByUs = true;
+  if (window.top === window.self) { location.href = '/vault'; return; }
+  const st = $('status');
+  st.textContent = 'Session ended. ';
+  const a = document.createElement('a');
+  a.href = '/vault'; a.target = '_blank'; a.rel = 'noopener noreferrer';
+  a.textContent = 'Open login in a new tab';
+  st.appendChild(a);
+}
+
 async function loadTabs() {
   try {
     const r = await fetch('/v1/vault/live/tabs');
-    if (r.status === 401) { location.href = '/vault'; return; }
+    if (r.status === 401) { signedOut(); return; }
     const tabs = ((await r.json()).tabs || []).filter(t => !t.url.startsWith('chrome'));
     // Page titles and URLs come from sites the agent visited: text only, never markup.
     const sel = $('tabs');
@@ -113,7 +128,7 @@ function connect() {
     // a logged-out or expired session goes to the login page, never into a retry loop.
     try {
       const r = await fetch('/v1/vault/live/tabs');
-      if (r.status === 401) { location.href = '/vault'; return; }
+      if (r.status === 401) { signedOut(); return; }
       if (r.status === 403 || r.status === 421) { status('Refused by the server.'); return; }
     } catch (e) {}
     status('Reconnecting…');
