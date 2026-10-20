@@ -390,6 +390,33 @@ kraken serves the daemon on port 8801 as `https://cucredentials.menustudioai.com
 
 5. **Check.** `https://<host>/login` answers 200 with the form, `https://<host>/v1/status` answers 404 (nginx), and `cu login` prints the public URL.
 
+## One-time codes and 2FA setup
+
+`cu otp` covers the two moments a site asks for a one-time code, without a
+live takeover of the browser:
+
+- **Sign-in with an enrolled authenticator.** `cu otp code DOMAIN` mints the
+  current TOTP code from the seed sealed in the domain's credential (`totp`
+  field, an `otpauth://` URI or a bare base32 key; SHA-1/256/512, 4-8
+  digits). With no seed on file, `cu otp request DOMAIN --wait` opens a
+  hand-off and prints a `/vault/otp?t=…` link for the person: a temporary
+  page, one random token per request, that takes their code (after the vault
+  login if their session is out) and answers the waiting call the moment
+  they send it. Links live ten minutes by default, are single-use, and the
+  code is deleted as the agent picks it up — the vault UI's Codes view shows
+  every hand-off and its outcome.
+- **Enrollment (a setup QR on screen).** `cu otp capture --domain DOMAIN`
+  finds the QR on the page, decodes it in pure Rust and seals the URI as the
+  credential's `totp` field; the reply names issuer and account, never the
+  seed. Enrollment's confirmation code is then just `cu otp code`. To put
+  the same seed on the person's own authenticator, capture with
+  `--request ID` from a `--kind setup` hand-off: the temporary page renders
+  the same QR for them to scan.
+
+Answering a hand-off is the person's side and stays UI-only: the daemon's
+bearer token cannot look up, answer or render the QR of a request, the same
+rule as secret-request approvals.
+
 ## SDK
 
 ```rust

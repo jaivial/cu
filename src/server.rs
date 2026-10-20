@@ -692,6 +692,18 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
         state.public_host.as_deref(),
         state.vault_host.as_deref(),
     );
+    // The vault's bundled typeface (OFL Manrope) is binary: it never
+    // passes through the String response type. Served on page-route terms
+    // (the login page needs it before any session exists).
+    if host_ok && method == "GET" && path == "/vault/manrope.ttf" {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: font/ttf\r\nContent-Length: {}\r\nCache-Control: max-age=86400\r\nConnection: close\r\n\r\n",
+            MANROPE.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(MANROPE);
+        return;
+    }
     let mut set_cookie: Option<String> = None;
     let (status, content_type, response) = if !host_ok {
         (
@@ -776,7 +788,17 @@ fn is_vault_path(path: &str) -> bool {
 /// would reduce the human's approval to a formality. Approving or denying is
 /// for the person in front of the vault UI.
 fn is_vault_ui_only(path: &str) -> bool {
-    path.ends_with("/approve") || path.ends_with("/deny")
+    let path = path.split('?').next().unwrap_or(path);
+    path.ends_with("/approve")
+        || path.ends_with("/deny")
+        // The one-time-code hand-off: looking up, answering or viewing the
+        // setup QR of a request is the person's side, exactly like deciding
+        // a secret request. An agent holds the bearer token; it must not
+        // answer its own hand-off.
+        || matches!(
+            path,
+            "/v1/vault/otp/answer" | "/v1/vault/otp/lookup" | "/v1/vault/otp/qr"
+        )
 }
 
 /// Normalise a public base URL (`https://login.example.com[:port][/]`) and
@@ -4620,11 +4642,15 @@ pub fn decode_base64(s: &str) -> Result<Vec<u8>, String> {
 /// session. `cookie` is the request's `Cookie:` header value if it had one.
 fn vault_route(
     method: &str,
-    path: &str,
+    full_path: &str,
     body: &str,
     state: &AppState,
     cookie: Option<&str>,
 ) -> (&'static str, &'static str, String, Option<String>) {
+    // The query selects content (the hand-off page's token, the login
+    // page's `next`), never a different route — so match without it and
+    // hand the whole thing to the API below.
+    let path = full_path.split('?').next().unwrap_or(full_path);
     match (method, path) {
         ("GET", "/vault") => (
             "200 OK",
@@ -4639,6 +4665,7 @@ fn vault_route(
             crate::live::PAGE.into(),
             None,
         ),
+        ("GET", "/vault/otp") => ("200 OK", "text/html; charset=utf-8", OTP_PAGE.into(), None),
         ("POST", "/v1/vault/ui/login") => {
             if !crate::vault::login_allowed() {
                 return (
@@ -4813,7 +4840,7 @@ fn vault_route(
             // every authenticated request, so an active session never expires
             // under the person working, and an abandoned one still dies after
             // its whole lifetime of silence.
-            let (status, kind, response) = vault_api(method, path, body, state);
+            let (status, kind, response) = vault_api(method, full_path, body, state);
             (
                 status,
                 kind,
@@ -4828,6 +4855,8 @@ fn vault_route(
 }
 
 const LOGIN_PAGE: &str = include_str!("vault_login.html");
+const OTP_PAGE: &str = include_str!("vault_otp.html");
+const MANROPE: &[u8] = include_bytes!("manrope.ttf");
 const APP_PAGE: &str = include_str!("vault_app.html");
 
 /// The `Set-Cookie` value for a vault UI session.
@@ -5116,12 +5145,249 @@ fn vault_api(
                 Err(e) => error_json(&e),
             }
         }
+        // ---- one-time-code hand-offs ----
+        // An agent opens a hand-off when a page asks for a code it cannot
+        // mint (no stored seed) or when enrollment needs the person's own
+        // authenticator. It hands the URL to the person and polls by id.
+        ("POST", "/v1/vault/otp/requests") => {
+            let field = |k: &str| json_value(body, k).unwrap_or_default();
+            let domain = field("domain");
+            if domain.is_empty() {
+                return error_json("domain is required");
+            }
+            let kind = {
+                let k = field("kind");
+                if k.is_empty() { "code".to_string() } else { k }
+            };
+            let ttl = json_value(body, "ttl_secs")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(crate::vault::OTP_REQUEST_TTL_SECS);
+            match vault.create_otp_request(
+                &domain,
+                &field("reason"),
+                &kind,
+                &field("requested_by"),
+                ttl,
+            ) {
+                Ok((id, token, expires_at)) => {
+                    let path = format!("/vault/otp?t={token}");
+                    // The daemon knows the vault's public host when a proxy
+                    // forwards one; only then is a full URL meaningful.
+                    let url = state
+                        .vault_host
+                        .as_deref()
+                        .map(|host| format!(",\"url\":\"https://{host}{path}\""))
+                        .unwrap_or_default();
+                    (
+                        "200 OK",
+                        "application/json",
+                        format!(
+                            "{{\"id\":{id},\"token\":{},\"path\":{}{url},\"expires_at\":{expires_at}}}",
+                            json_string(&token),
+                            json_string(&path),
+                        ),
+                    )
+                }
+                Err(e) => error_json(&e),
+            }
+        }
+        ("GET", "/v1/vault/otp/requests") => match vault.list_otp_requests() {
+            Ok(body) => ("200 OK", "application/json", body),
+            Err(e) => error_json(&e),
+        },
+        // The agent's poll: status only while pending; the moment the row is
+        // answered the response is handed over once and deleted (see
+        // `poll_otp_request`). `?wait=S` parks like `cu challenge wait`.
+        ("GET", p) if p.starts_with("/v1/vault/otp/requests/") => {
+            let tail = &p["/v1/vault/otp/requests/".len()..];
+            let Ok(id) = tail.parse::<i64>() else {
+                return error_json("request id must be a number");
+            };
+            let wait_for = seconds_param(query(path), "wait", 0.0);
+            let deadline = std::time::Instant::now()
+                + Duration::from_secs_f64(wait_for.clamp(0.0, wait_ceiling_s()));
+            loop {
+                match vault.poll_otp_request(id, true) {
+                    Ok(Some(body)) => {
+                        let done = json_string_value(&body, "status")
+                            .map(|s| s != "pending")
+                            .unwrap_or(true);
+                        if done || wait_for <= 0.0 || std::time::Instant::now() >= deadline {
+                            return ("200 OK", "application/json", body);
+                        }
+                    }
+                    Ok(None) => return error_json("no such request"),
+                    Err(e) => return error_json(&e),
+                }
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        }
+        ("DELETE", p) if p.starts_with("/v1/vault/otp/requests/") => {
+            let tail = &p["/v1/vault/otp/requests/".len()..];
+            let Ok(id) = tail.parse::<i64>() else {
+                return error_json("request id must be a number");
+            };
+            match vault.cancel_otp_request(id) {
+                Ok(true) => ("200 OK", "application/json", "{\"cancelled\":true}".into()),
+                Ok(false) => error_json("request is not pending any more"),
+                Err(e) => error_json(&e),
+            }
+        }
+        // Capture the setup QR off the page. The decoded URI is a seed: it
+        // is sealed into the credential (and, for a setup hand-off, into the
+        // request so the temporary page can re-render it as a QR). The reply
+        // carries the issuer and account for confirmation, never the URI.
+        ("POST", "/v1/vault/otp/capture") => otp_capture(state, path, body, &vault, None),
+        ("POST", p) if p.starts_with("/v1/vault/otp/requests/") && p.ends_with("/capture") => {
+            let tail = &p["/v1/vault/otp/requests/".len()..p.len() - "/capture".len()];
+            let Ok(id) = tail.parse::<i64>() else {
+                return error_json("request id must be a number");
+            };
+            otp_capture(state, path, body, &vault, Some(id))
+        }
+        // The current code from a stored seed — the whole point of capturing
+        // one. `{"domain": "..."}` or `{"credential_id": N}`.
+        ("POST", "/v1/vault/otp/code") => {
+            let credential_id =
+                json_value(body, "credential_id").and_then(|v| v.parse::<i64>().ok());
+            let found = match credential_id {
+                Some(id) => vault
+                    .totp_for_credential(id)
+                    .map(|opt| opt.map(|(code, left)| (id, code, left))),
+                None => {
+                    let domain = json_value(body, "domain").unwrap_or_default();
+                    if domain.is_empty() {
+                        return error_json("domain or credential_id is required");
+                    }
+                    vault.totp_for_domain(&domain)
+                }
+            };
+            match found {
+                Ok(Some((id, code, left))) => (
+                    "200 OK",
+                    "application/json",
+                    format!(
+                        "{{\"credential_id\":{id},\"code\":{},\"seconds_remaining\":{left}}}",
+                        json_string(&code)
+                    ),
+                ),
+                Ok(None) => error_json("no stored TOTP seed covers this"),
+                Err(e) => error_json(&e),
+            }
+        }
+        // The person's side. Reached only with a live UI session: these
+        // paths are UI-only (see `is_vault_ui_only`).
+        ("POST", "/v1/vault/otp/answer") => {
+            let token = json_value(body, "token").unwrap_or_default();
+            let code = json_value(body, "code").unwrap_or_default();
+            match vault.answer_otp_request(&token, &code) {
+                Ok(true) => ("200 OK", "application/json", "{\"answered\":true}".into()),
+                Ok(false) => error_json("this hand-off is spent, expired or unknown"),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("GET", "/v1/vault/otp/lookup") => {
+            let token = form_value(query(path), "t");
+            match vault.otp_request_by_token(&token) {
+                Ok(Some(body)) => ("200 OK", "application/json", body),
+                Ok(None) => (
+                    "404 Not Found",
+                    "application/json",
+                    "{\"error\":\"unknown or expired hand-off\"}".into(),
+                ),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("GET", "/v1/vault/otp/qr") => {
+            let token = form_value(query(path), "t");
+            match vault.otp_request_seed_by_token(&token) {
+                Ok(Some(uri)) => match crate::qr::render_svg(&uri) {
+                    Ok(svg) => ("200 OK", "image/svg+xml", svg),
+                    Err(e) => error_json(&e),
+                },
+                Ok(None) => (
+                    "404 Not Found",
+                    "application/json",
+                    "{\"error\":\"no setup code on this hand-off\"}".into(),
+                ),
+                Err(e) => error_json(&e),
+            }
+        }
         _ => (
             "404 Not Found",
             "application/json",
             "{\"error\":\"not found\"}".into(),
         ),
     }
+}
+
+/// Shared by the two capture routes: decode the page's setup QR, seal the
+/// URI into the credential it belongs to, and (for a setup hand-off) onto
+/// the request, so the temporary page can show the same QR to the person.
+fn otp_capture(
+    state: &AppState,
+    path: &str,
+    body: &str,
+    vault: &crate::vault::Vault,
+    request_id: Option<i64>,
+) -> (&'static str, &'static str, String) {
+    if let Err(e) = wait_until_ready(state) {
+        return error_json(&e);
+    }
+    let wanted = form_value(query(path), "tab");
+    let tab = if wanted.is_empty() {
+        Tab::default_for(state.cdp_port)
+    } else {
+        match named_tab(state.cdp_port, &wanted) {
+            Ok(tab) => tab,
+            Err(e) => return error_json(&e),
+        }
+    };
+    let uri = match crate::qr::capture_otpauth(&tab) {
+        Ok(uri) => uri,
+        Err(e) => return error_json(&e),
+    };
+    let parsed = match crate::otp::parse(&uri) {
+        Ok(parsed) => parsed,
+        Err(e) => return error_json(&e),
+    };
+    let domain = {
+        let asked = json_value(body, "domain").unwrap_or_default();
+        if !asked.is_empty() {
+            asked
+        } else if let Some(id) = request_id {
+            vault.otp_request_domain(id).unwrap_or_default()
+        } else {
+            String::new()
+        }
+    };
+    if domain.is_empty() {
+        return error_json("domain is required (or capture through a hand-off that names one)");
+    }
+    let credential_id = json_value(body, "credential_id").and_then(|v| v.parse::<i64>().ok());
+    let label = if parsed.account.is_empty() {
+        "2FA".to_string()
+    } else {
+        parsed.account.clone()
+    };
+    let id = match vault.put_totp(credential_id, &domain, &label, &uri) {
+        Ok(id) => id,
+        Err(e) => return error_json(&e),
+    };
+    if let Some(request) = request_id
+        && let Err(e) = vault.set_otp_request_seed(request, &uri)
+    {
+        return error_json(&e);
+    }
+    (
+        "200 OK",
+        "application/json",
+        format!(
+            "{{\"stored\":true,\"credential_id\":{id},\"issuer\":{},\"account\":{}}}",
+            json_string(&parsed.issuer),
+            json_string(&parsed.account),
+        ),
+    )
 }
 
 fn error_json(error: &str) -> (&'static str, &'static str, String) {
@@ -6256,6 +6522,159 @@ mod vault_session_tests {
 }
 
 #[cfg(test)]
+mod otp_tests {
+    use super::*;
+
+    fn tmp_state(tag: &str) -> AppState {
+        let dir = std::env::temp_dir().join(format!(
+            "cu-otp-route-{tag}-{}-{}",
+            std::process::id(),
+            crate::vault::ui_session_token()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        AppState {
+            vault_host: None,
+            daemon: false,
+            data_dir: dir,
+            token: "t".into(),
+            cdp_port: 1,
+            browser: BrowserState::new(),
+            public_host: None,
+        }
+    }
+
+    /// Create → look up by token → answer → collect once. The answer is
+    /// single-use, the pickup deletes the code, and nothing on the way ever
+    /// prints the URL token's hash.
+    #[test]
+    fn a_hand_off_round_trip_collects_once() {
+        let state = tmp_state("roundtrip");
+        let vault = crate::vault::Vault::open(&state.data_dir).expect("vault");
+        let (id, token, _expires) = vault
+            .create_otp_request("example.com", "login code", "code", "test-agent", 600)
+            .expect("create");
+
+        // The token lookup the temporary page does.
+        let meta = vault.otp_request_by_token(&token).expect("lookup").unwrap();
+        assert!(meta.contains("\"status\":\"pending\""), "{meta}");
+        assert!(meta.contains("example.com"), "{meta}");
+
+        // The person answers; the token is spent by that one answer.
+        assert!(vault.answer_otp_request(&token, "123456").unwrap());
+        assert!(
+            !vault.answer_otp_request(&token, "654321").unwrap(),
+            "a spent token must not answer twice"
+        );
+
+        // The agent collects the code exactly once; afterwards the row
+        // holds no value and says "collected".
+        let collected = vault.poll_otp_request(id, true).expect("poll").unwrap();
+        assert!(
+            collected.contains("\"status\":\"collected\""),
+            "{collected}"
+        );
+        assert!(collected.contains("123456"), "{collected}");
+        let again = vault.poll_otp_request(id, true).expect("poll").unwrap();
+        assert!(!again.contains("123456"), "the code must be gone: {again}");
+        assert!(again.contains("\"status\":\"collected\""), "{again}");
+    }
+
+    #[test]
+    fn expired_hand_offs_answer_nothing() {
+        let state = tmp_state("expired");
+        let vault = crate::vault::Vault::open(&state.data_dir).expect("vault");
+        let (id, token, _) = vault
+            .create_otp_request(
+                "example.com",
+                "",
+                "code",
+                "",
+                crate::vault::OTP_REQUEST_MIN_TTL_SECS,
+            )
+            .expect("create");
+        // Force the expiry into the past.
+        rusqlite::Connection::open(state.data_dir.join("vault.db"))
+            .unwrap()
+            .execute(
+                "UPDATE otp_requests SET expires_at = ?1 WHERE id = ?2",
+                [1_i64, id],
+            )
+            .unwrap();
+        assert!(
+            !vault.answer_otp_request(&token, "123456").unwrap(),
+            "an expired token answers nothing"
+        );
+        let meta = vault.otp_request_by_token(&token).expect("lookup").unwrap();
+        assert!(meta.contains("\"status\":\"expired\""), "{meta}");
+    }
+
+    #[test]
+    fn the_person_side_is_ui_only() {
+        for path in [
+            "/v1/vault/otp/answer",
+            "/v1/vault/otp/lookup",
+            "/v1/vault/otp/qr",
+            "/v1/vault/otp/lookup?t=otp-abc",
+        ] {
+            assert!(is_vault_ui_only(path), "{path} must be UI-only");
+        }
+        for path in [
+            "/v1/vault/otp/requests",
+            "/v1/vault/otp/requests/1",
+            "/v1/vault/otp/code",
+        ] {
+            assert!(!is_vault_ui_only(path), "{path} is the agent's side");
+        }
+    }
+
+    #[test]
+    fn the_page_and_lookup_need_a_session() {
+        let state = tmp_state("gate");
+        // The hand-off page itself is an open shell (like the login page)…
+        let (status, _, body, _) = vault_route("GET", "/vault/otp?t=otp-x", "", &state, None);
+        assert_eq!(status, "200 OK");
+        assert!(!body.contains("otp-x"), "the page is a shell, no data");
+        // …but its data routes 401 without a live UI session.
+        for (method, path) in [
+            ("GET", "/v1/vault/otp/lookup?t=otp-x"),
+            ("GET", "/v1/vault/otp/qr?t=otp-x"),
+            ("POST", "/v1/vault/otp/answer"),
+        ] {
+            let (status, _, _, _) = vault_route(method, path, "{}", &state, None);
+            assert_eq!(status, "401 Unauthorized", "{path}");
+        }
+    }
+
+    #[test]
+    fn a_captured_seed_mints_codes_without_leaking_itself() {
+        let state = tmp_state("seed");
+        let vault = crate::vault::Vault::open(&state.data_dir).expect("vault");
+        let uri = "otpauth://totp/Example:ada@example.com?secret=JBSWY3DPEHPK3PXP";
+        let id = vault
+            .put_totp(None, "example.com", "ada@example.com", uri)
+            .expect("store seed");
+        // The field list names the field but the value stays sealed.
+        let listed = vault.list_credentials("").unwrap();
+        assert!(listed.contains("totp"), "{listed}");
+        assert!(
+            !listed.contains("JBSWY3DPEHPK3PXP"),
+            "seed leaked: {listed}"
+        );
+        // A second capture replaces the field instead of piling up.
+        vault
+            .put_totp(None, "example.com", "ada@example.com", uri)
+            .expect("replace seed");
+        let full = vault.get_credential(id).unwrap().unwrap();
+        assert_eq!(full.matches("\"name\":\"totp\"").count(), 1, "{full}");
+        // And it mints a code for the domain.
+        let (cred, code, left) = vault.totp_for_domain("example.com").unwrap().unwrap();
+        assert_eq!(cred, id);
+        assert_eq!(code.len(), 6);
+        assert!(left >= 1 && left <= 30, "{left}");
+    }
+}
+
+#[cfg(test)]
 mod login_page_tests {
     use super::*;
 
@@ -6264,7 +6683,7 @@ mod login_page_tests {
     /// bytes is the only check that catches a regression here.
     #[test]
     fn every_login_input_is_sixteen_pixels() {
-        for (page, name) in [(LOGIN_PAGE, "login"), (APP_PAGE, "app")] {
+        for (page, name) in [(LOGIN_PAGE, "login"), (APP_PAGE, "app"), (OTP_PAGE, "otp")] {
             assert!(
                 page.contains("font-size: max(16px, 1em)"),
                 "{name} page lost the 16px input floor: a zoomed iOS viewport \
@@ -6305,9 +6724,15 @@ mod login_page_tests {
 
     #[test]
     fn the_login_page_respects_the_colour_scheme_and_focus() {
+        // The vault wears the Bizvaretto identity: a light, clean surface in
+        // Manrope, not the old dark theme.
         assert!(
-            LOGIN_PAGE.contains("prefers-color-scheme: dark"),
-            "login page is dark-only"
+            LOGIN_PAGE.contains("--paper: #f5f6fa"),
+            "login page lost the Bizvaretto light surface"
+        );
+        assert!(
+            LOGIN_PAGE.contains("manrope.ttf"),
+            "login page lost the Manrope typeface"
         );
         assert!(
             LOGIN_PAGE.contains(":focus-visible"),

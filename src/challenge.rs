@@ -794,6 +794,22 @@ impl Assessment {
         Some(match self.state {
             ChallengeState::Ready => return None,
             ChallengeState::HumanRequired => {
+                // A first-party checkpoint with a code form is often just an
+                // OTP: mintable from a stored seed, or a short hand-off link
+                // instead of a full live takeover.
+                if self.vendor == Some("first-party")
+                    && self.signals.iter().any(|s| s.contains("code"))
+                {
+                    return Some(
+                        "a one-time code page: if the vault holds a seed for this domain, \
+                         `cu otp code <domain>` mints the code to fill; otherwise \
+                         `cu otp request <domain> --wait` sends the person a short link to \
+                         type it into, and answers here when they do. A full takeover \
+                         (/vault/live) is the fallback; automatic actions on this tab are \
+                         paused until a fresh check shows it cleared (cu challenge), or \
+                         the hand-off is released (cu challenge release)",
+                    );
+                }
                 "a person must complete this check in the browser (cu already runs headful on \
                  an X display by default; a daemon started with CU_HEADLESS=1 is the one that \
                  needs CU_HEADLESS=0 to get a window, and CU_STEALTH=0 turns the hardening off); \

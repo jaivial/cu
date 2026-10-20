@@ -330,9 +330,12 @@ fn windowed_agent_for(executable: &Path) -> Option<String> {
 }
 
 fn parse_windowed_agent(version_output: &str) -> Option<String> {
-    let major: u32 = version_output
-        .split_whitespace()
-        .find_map(|word| word.split('.').next().and_then(|m| m.parse().ok()).filter(|_| word.contains('.')))?;
+    let major: u32 = version_output.split_whitespace().find_map(|word| {
+        word.split('.')
+            .next()
+            .and_then(|m| m.parse().ok())
+            .filter(|_| word.contains('.'))
+    })?;
     Some(format!(
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
     ))

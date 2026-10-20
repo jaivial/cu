@@ -5,29 +5,54 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>cu live</title>
 <style>
-  :root { color-scheme: dark; }
+  :root {
+    --paper: #f5f6fa; --white: #fff; --ink: #20242f; --muted: #636774;
+    --blue: #3649ed; --blue-dark: #293ac8; --lilac: #e2def9; --mint: #deebe4;
+    --line: #dfe1e9;
+  }
+  @font-face {
+    font-family: 'Manrope';
+    src: url('/vault/manrope.ttf') format('truetype');
+    font-weight: 200 800; font-display: swap;
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; font: 16px/1.4 system-ui, sans-serif; background: #0f1115; color: #e6e6e6;
-         min-height: 100dvh; display: flex; flex-direction: column; }
-  header { display: flex; gap: .5rem; align-items: center; padding: .5rem .6rem; background: #171a21;
-           border-bottom: 1px solid #2a2f3a; position: sticky; top: 0; z-index: 2; }
-  header h1 { font-size: .9rem; margin: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  button, select, input { font-size: 16px; min-height: 46px; border-radius: 10px; border: 1px solid #2a2f3a;
-           background: #232936; color: inherit; padding: 0 .9rem; }
-  button.primary { background: #3b82f6; border-color: #3b82f6; color: #fff; }
-  button.done { background: #166534; border-color: #166534; color: #fff; }
+  body {
+    margin: 0; font: 16px/1.4 'Manrope', system-ui, sans-serif;
+    background: var(--paper); color: var(--ink);
+    min-height: 100dvh; display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; gap: .5rem; align-items: center; padding: .5rem .6rem;
+    background: var(--white); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 2;
+  }
+  header h1 {
+    font-size: .9rem; font-weight: 700; letter-spacing: -.01em; margin: 0; flex: 1;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  button, select, input {
+    font-size: 16px; min-height: 46px; border-radius: 100px; border: 1px solid var(--line);
+    background: var(--white); color: inherit; padding: 0 .9rem; font-family: inherit; font-weight: 600;
+  }
+  input { border-radius: 12px; font-weight: 400; }
+  button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  button.primary:hover { background: var(--blue-dark); border-color: var(--blue-dark); }
+  button.done { background: var(--ink); border-color: var(--ink); color: var(--paper); }
+  header a { color: var(--muted); font-weight: 600; text-decoration: none; }
   #stage { flex: 1; display: flex; justify-content: flex-start; align-items: flex-start; padding: .5rem; overflow: auto; }
   #wrap { position: relative; width: 100%; flex: none; touch-action: none; user-select: none; }
   #wrap.zoomed { touch-action: pan-x pan-y; }
-  #shot { width: 100%; display: block; border-radius: 8px; border: 1px solid #2a2f3a; background: #000; }
+  #shot { width: 100%; display: block; border-radius: 12px; border: 1px solid var(--line); background: #000; }
   #dot { position: absolute; width: 22px; height: 22px; margin: -11px 0 0 -11px; border-radius: 50%;
-         background: rgba(59,130,246,.55); pointer-events: none; display: none; }
-  #bar { position: sticky; bottom: 0; background: #171a21; border-top: 1px solid #2a2f3a;
-         padding: .5rem .6rem calc(.5rem + env(safe-area-inset-bottom)); display: grid; gap: .5rem; }
+         background: rgba(54, 73, 237, .5); pointer-events: none; display: none; }
+  #bar {
+    position: sticky; bottom: 0; background: var(--white); border-top: 1px solid var(--line);
+    padding: .5rem .6rem calc(.5rem + env(safe-area-inset-bottom)); display: grid; gap: .5rem;
+  }
   #bar .row { display: flex; gap: .5rem; }
   #bar .row > * { flex: 1; }
   #text { flex: 3; min-width: 0; }
-  #status { font-size: .8rem; color: #8b93a7; padding: 0 .2rem; word-break: break-all; }
+  #status { font-size: .8rem; color: var(--muted); padding: 0 .2rem; word-break: break-all; }
 </style>
 </head>
 <body>
@@ -35,7 +60,7 @@
   <h1 id="title">cu live</h1>
   <select id="tabs" aria-label="Tab" style="max-width:5.5rem;padding:0 .4rem"></select>
   <button id="zout" aria-label="Zoom out">−</button><button id="zin" aria-label="Zoom in">+</button>
-  <a href="/vault/app" style="color:#8b93a7">Vault</a>
+  <a href="/vault/app">Vault</a>
 </header>
 <div id="stage"><div id="wrap"><img id="shot" alt="browser view"><div id="dot"></div></div></div>
 <div id="bar">

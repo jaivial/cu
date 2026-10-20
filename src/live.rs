@@ -199,7 +199,10 @@ pub fn api(method: &str, full_path: &str, body: &str, state: &AppState) -> Optio
                 Ok(t) => t,
                 Err(e) => return Some(err("400 Bad Request", &e)),
             };
-            let quality = form_value(query, "q").parse::<u32>().unwrap_or(55).clamp(20, 90);
+            let quality = form_value(query, "q")
+                .parse::<u32>()
+                .unwrap_or(55)
+                .clamp(20, 90);
             let shot = tab.command(
                 "Page.captureScreenshot",
                 &format!("{{\"format\":\"jpeg\",\"quality\":{quality}}}"),
@@ -209,9 +212,16 @@ pub fn api(method: &str, full_path: &str, body: &str, state: &AppState) -> Optio
                     let data = json_value(&result, "data").unwrap_or_default();
                     let (w, h) = viewport(&tab).unwrap_or((0.0, 0.0));
                     let url = tab
-                        .command("Runtime.evaluate", "{\"expression\":\"location.href\",\"returnByValue\":true}")
+                        .command(
+                            "Runtime.evaluate",
+                            "{\"expression\":\"location.href\",\"returnByValue\":true}",
+                        )
                         .ok()
-                        .and_then(|r| r.split("\"value\":\"").nth(1).map(|s| s.split('"').next().unwrap_or("").to_string()))
+                        .and_then(|r| {
+                            r.split("\"value\":\"")
+                                .nth(1)
+                                .map(|s| s.split('"').next().unwrap_or("").to_string())
+                        })
                         .unwrap_or_default();
                     ok(format!(
                         "{{\"jpeg_base64\":\"{data}\",\"width\":{w},\"height\":{h},\"url\":\"{}\",\"held\":{}}}",
@@ -244,26 +254,59 @@ pub fn api(method: &str, full_path: &str, body: &str, state: &AppState) -> Optio
                     if kind == "tap" {
                         let steps = (|| {
                             // A real pointer arrives, rests a moment, then presses.
-                            mouse(&tab, "mouseMoved", x - 6.0, y - 4.0, ",\"button\":\"none\",\"buttons\":0")?;
+                            mouse(
+                                &tab,
+                                "mouseMoved",
+                                x - 6.0,
+                                y - 4.0,
+                                ",\"button\":\"none\",\"buttons\":0",
+                            )?;
                             std::thread::sleep(jitter(40, 110));
-                            mouse(&tab, "mouseMoved", x, y, ",\"button\":\"none\",\"buttons\":0")?;
+                            mouse(
+                                &tab,
+                                "mouseMoved",
+                                x,
+                                y,
+                                ",\"button\":\"none\",\"buttons\":0",
+                            )?;
                             std::thread::sleep(jitter(60, 160));
-                            mouse(&tab, "mousePressed", x, y, ",\"button\":\"left\",\"buttons\":1,\"clickCount\":1")?;
+                            mouse(
+                                &tab,
+                                "mousePressed",
+                                x,
+                                y,
+                                ",\"button\":\"left\",\"buttons\":1,\"clickCount\":1",
+                            )?;
                             std::thread::sleep(jitter(50, 120));
-                            mouse(&tab, "mouseReleased", x, y, ",\"button\":\"left\",\"buttons\":0,\"clickCount\":1")
+                            mouse(
+                                &tab,
+                                "mouseReleased",
+                                x,
+                                y,
+                                ",\"button\":\"left\",\"buttons\":0,\"clickCount\":1",
+                            )
                         })();
                         steps
                     } else {
                         let dy = number(body, "dy").unwrap_or(0.0).clamp(-3000.0, 3000.0);
                         let dx = number(body, "dx").unwrap_or(0.0).clamp(-3000.0, 3000.0);
-                        mouse(&tab, "mouseWheel", x, y, &format!(",\"deltaX\":{dx:.0},\"deltaY\":{dy:.0}"))
+                        mouse(
+                            &tab,
+                            "mouseWheel",
+                            x,
+                            y,
+                            &format!(",\"deltaX\":{dx:.0},\"deltaY\":{dy:.0}"),
+                        )
                     }
                 }
                 "type" => type_text(
                     &tab,
                     &crate::server::json_string_value(body, "text").unwrap_or_default(),
                 ),
-                "press" => key(&tab, &crate::server::json_string_value(body, "name").unwrap_or_default()),
+                "press" => key(
+                    &tab,
+                    &crate::server::json_string_value(body, "name").unwrap_or_default(),
+                ),
                 _ => Err("do must be tap, scroll, type or press".into()),
             };
             match result {
@@ -276,7 +319,10 @@ pub fn api(method: &str, full_path: &str, body: &str, state: &AppState) -> Optio
                 Ok(t) => t,
                 Err(e) => return Some(err("400 Bad Request", &e)),
             };
-            ok(format!("{{\"released\":{}}}", crate::challenge::release(&tab)))
+            ok(format!(
+                "{{\"released\":{}}}",
+                crate::challenge::release(&tab)
+            ))
         }
         _ => err("404 Not Found", "no such live route"),
     })

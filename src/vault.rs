@@ -154,7 +154,7 @@ impl Vault {
         // The secret-requests DDL goes first so the migration (which may
         // have just created the table in the current shape) and a fresh
         // database end up with the same schema.
-        conn.execute_batch(&format!("{SECRET_REQUESTS_DDL}{SCHEMA}"))
+        conn.execute_batch(&format!("{SECRET_REQUESTS_DDL}{OTP_REQUESTS_DDL}{SCHEMA}"))
             .map_err(|e| format!("vault schema: {e}"))?;
         let _ = conn.execute(
             "INSERT OR REPLACE INTO vault_meta(key, value) VALUES ('schema_version', '1')",
@@ -625,6 +625,359 @@ impl Vault {
         Ok(true)
     }
 
+    // ---- one-time-code hand-offs (an agent waits, a person answers) ----
+
+    /// Open a one-time-code hand-off for `domain`. Returns the id, the URL
+    /// token and the expiry. The token itself is never stored — only its
+    /// SHA-256 — so a database read cannot mint answer links, and the link
+    /// the agent hands to the person is the only copy.
+    pub fn create_otp_request(
+        &self,
+        domain: &str,
+        reason: &str,
+        kind: &str,
+        requested_by: &str,
+        ttl_secs: i64,
+    ) -> Result<(i64, String, i64), String> {
+        let kind = match kind {
+            "code" | "setup" => kind,
+            _ => return Err("kind must be code or setup".into()),
+        };
+        let ttl = ttl_secs.clamp(OTP_REQUEST_MIN_TTL_SECS, OTP_REQUEST_MAX_TTL_SECS);
+        let conn = self.connect()?;
+        reap_otp_requests(&conn);
+        let token = format!("otp-{}", hex_encode(&rand_bytes::<24>()));
+        let at = now();
+        conn.execute(
+            "INSERT INTO otp_requests(token_hash, domain, reason, kind, requested_by,
+                                      status, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7)",
+            rusqlite::params![
+                token_hash(&token),
+                domain,
+                reason,
+                kind,
+                requested_by,
+                at,
+                at + ttl
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok((conn.last_insert_rowid(), token, at + ttl))
+    }
+
+    /// What the temporary page shows: the metadata of the request `token`
+    /// names, never its response or seed. Lazily expires a stale pending row.
+    pub fn otp_request_by_token(&self, token: &str) -> Result<Option<String>, String> {
+        let conn = self.connect()?;
+        let row = conn
+            .query_row(
+                "SELECT id, domain, reason, kind, requested_by, status, expires_at,
+                        seed IS NOT NULL
+                 FROM otp_requests WHERE token_hash = ?1",
+                [token_hash(token)],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, bool>(7)?,
+                    ))
+                },
+            )
+            .ok();
+        let Some((id, domain, reason, kind, requested_by, status, expires_at, has_seed)) = row
+        else {
+            return Ok(None);
+        };
+        let status = expire_if_stale(&conn, "otp_requests", id, &status, expires_at);
+        Ok(Some(format!(
+            "{{\"id\":{id},\"domain\":{},\"reason\":{},\"kind\":{},\"requested_by\":{},\"status\":{},\"expires_in\":{},\"has_seed\":{}}}",
+            json_string(&domain),
+            json_string(&reason),
+            json_string(&kind),
+            json_string(&requested_by),
+            json_string(&status),
+            (expires_at - now()).max(0),
+            has_seed,
+        )))
+    }
+
+    /// The person's answer. Single-use and expiry are enforced in the
+    /// UPDATE's WHERE, not in a check that could race: a token that is
+    /// spent, expired or unknown updates zero rows.
+    pub fn answer_otp_request(&self, token: &str, response: &str) -> Result<bool, String> {
+        let response = response.trim();
+        if response.is_empty() || response.len() > 128 {
+            return Err("a code is 1-128 characters".into());
+        }
+        let sealed = seal(&self.key, response.as_bytes())?;
+        let n = self
+            .connect()?
+            .execute(
+                "UPDATE otp_requests SET status='answered', response=?2, answered_at=?3
+                 WHERE token_hash=?1 AND status='pending' AND expires_at > ?3",
+                rusqlite::params![token_hash(token), sealed, now()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(n > 0)
+    }
+
+    /// The agent's poll. With `collect`, an answered response is returned
+    /// once and only once: the row flips to `collected` and the sealed value
+    /// is deleted in the same transaction, so a code does not linger at rest
+    /// after the agent has it.
+    pub fn poll_otp_request(&self, id: i64, collect: bool) -> Result<Option<String>, String> {
+        let conn = self.connect()?;
+        let row = conn
+            .query_row(
+                "SELECT status, expires_at, response FROM otp_requests WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                },
+            )
+            .ok();
+        let Some((status, expires_at, response)) = row else {
+            return Ok(None);
+        };
+        let status = expire_if_stale(&conn, "otp_requests", id, &status, expires_at);
+        if collect && status == "answered" {
+            let response = match response {
+                Some(sealed) => unseal(&self.key, &sealed)?,
+                None => return Err("answered request without a response".into()),
+            };
+            conn.execute(
+                "UPDATE otp_requests SET status='collected', response=NULL, seed=NULL
+                 WHERE id=?1 AND status='answered'",
+                [id],
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(Some(format!(
+                "{{\"id\":{id},\"status\":\"collected\",\"expires_in\":0,\"response\":{}}}",
+                json_string(&response),
+            )));
+        }
+        Ok(Some(format!(
+            "{{\"id\":{id},\"status\":{},\"expires_in\":{}}}",
+            json_string(&status),
+            (expires_at - now()).max(0),
+        )))
+    }
+
+    /// Give up a pending hand-off (the agent took another path).
+    pub fn cancel_otp_request(&self, id: i64) -> Result<bool, String> {
+        let n = self
+            .connect()?
+            .execute(
+                "UPDATE otp_requests SET status='cancelled', response=NULL, seed=NULL
+                 WHERE id=?1 AND status='pending'",
+                [id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(n > 0)
+    }
+
+    /// Recent hand-offs for the vault UI, newest first, never with secrets.
+    pub fn list_otp_requests(&self) -> Result<String, String> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, domain, reason, kind, requested_by, status, created_at, expires_at
+                 FROM otp_requests ORDER BY id DESC LIMIT 50",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, domain, reason, kind, requested_by, status, created_at, expires_at) =
+                row.map_err(|e| e.to_string())?;
+            let status = expire_if_stale(&conn, "otp_requests", id, &status, expires_at);
+            out.push(format!(
+                "{{\"id\":{id},\"domain\":{},\"reason\":{},\"kind\":{},\"requested_by\":{},\"status\":{},\"created_at\":{created_at},\"expires_at\":{expires_at}}}",
+                json_string(&domain),
+                json_string(&reason),
+                json_string(&kind),
+                json_string(&requested_by),
+                json_string(&status),
+            ));
+        }
+        Ok(format!("{{\"requests\":[{}]}}", out.join(",")))
+    }
+
+    /// The domain a hand-off names (for the capture route's attach step).
+    pub fn otp_request_domain(&self, id: i64) -> Option<String> {
+        self.connect()
+            .ok()?
+            .query_row(
+                "SELECT domain FROM otp_requests WHERE id = ?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+    }
+
+    /// Attach the seed a QR capture decoded to a pending setup request, so
+    /// the temporary page can render it as a QR for the person's own
+    /// authenticator. Sealed like any other field.
+    pub fn set_otp_request_seed(&self, id: i64, uri: &str) -> Result<(), String> {
+        let sealed = seal(&self.key, uri.as_bytes())?;
+        self.connect()?
+            .execute(
+                "UPDATE otp_requests SET seed=?2 WHERE id=?1 AND status='pending'",
+                rusqlite::params![id, sealed],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// The seed of a pending, unexpired request, for the QR the temporary
+    /// page renders. Only the person holding the URL token and a live UI
+    /// session reaches this (the route is UI-only).
+    pub fn otp_request_seed_by_token(&self, token: &str) -> Result<Option<String>, String> {
+        let conn = self.connect()?;
+        let row = conn
+            .query_row(
+                "SELECT seed FROM otp_requests
+                 WHERE token_hash=?1 AND status='pending' AND expires_at > ?2",
+                rusqlite::params![token_hash(token), now()],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .ok()
+            .flatten();
+        row.map(|sealed| unseal(&self.key, &sealed)).transpose()
+    }
+
+    /// Merge a TOTP seed into a credential's fields, replacing any earlier
+    /// `totp` one. With `credential_id: None` the domain must resolve to
+    /// exactly one credential; with none at all a fresh credential holds the
+    /// seed, labelled with the account the URI names.
+    pub fn put_totp(
+        &self,
+        credential_id: Option<i64>,
+        domain: &str,
+        label: &str,
+        uri: &str,
+    ) -> Result<i64, String> {
+        let (id, domain, label, notes, fields) = match credential_id {
+            Some(id) => {
+                let full = self.get_credential(id)?.ok_or("no such credential")?;
+                let fields =
+                    crate::server::json_array(&full, "fields").unwrap_or_else(|| "[]".into());
+                (
+                    Some(id),
+                    crate::server::json_string_value(&full, "domain").unwrap_or_default(),
+                    crate::server::json_string_value(&full, "label").unwrap_or_default(),
+                    crate::server::json_string_value(&full, "notes").unwrap_or_default(),
+                    fields,
+                )
+            }
+            None => {
+                let matches = self.credentials_for_domain(domain)?;
+                match matches.len() {
+                    0 => (
+                        None,
+                        domain.to_string(),
+                        label.to_string(),
+                        String::new(),
+                        "[]".into(),
+                    ),
+                    1 => {
+                        let full = self
+                            .get_credential(matches[0].0)?
+                            .ok_or("no such credential")?;
+                        (
+                            Some(matches[0].0),
+                            crate::server::json_string_value(&full, "domain").unwrap_or_default(),
+                            crate::server::json_string_value(&full, "label").unwrap_or_default(),
+                            crate::server::json_string_value(&full, "notes").unwrap_or_default(),
+                            crate::server::json_array(&full, "fields")
+                                .unwrap_or_else(|| "[]".into()),
+                        )
+                    }
+                    _ => {
+                        return Err(
+                            "several credentials cover this domain; pass credential_id".into()
+                        );
+                    }
+                }
+            }
+        };
+        let mut kept: Vec<String> = crate::server::json_objects(&fields)
+            .into_iter()
+            .filter(|f| {
+                crate::server::json_string_value(f, "name")
+                    .map(|n| !n.eq_ignore_ascii_case("totp"))
+                    .unwrap_or(true)
+            })
+            .collect();
+        kept.push(format!(
+            "{{\"name\":\"totp\",\"value\":{},\"secret\":true,\"type\":\"password\"}}",
+            json_string(uri)
+        ));
+        self.put_credential(
+            id,
+            &domain,
+            &label,
+            &format!("[{}]", kept.join(",")),
+            &notes,
+        )
+    }
+
+    /// The current code of the credential's stored `totp` field, if it has
+    /// one that parses: (code, seconds left in its step).
+    pub fn totp_for_credential(&self, id: i64) -> Result<Option<(String, u64)>, String> {
+        let Some(full) = self.get_credential(id)? else {
+            return Ok(None);
+        };
+        let fields = crate::server::json_array(&full, "fields").unwrap_or_default();
+        let Some(uri) = crate::server::json_objects(&fields)
+            .into_iter()
+            .find(|f| {
+                crate::server::json_string_value(f, "name")
+                    .map(|n| n.eq_ignore_ascii_case("totp"))
+                    .unwrap_or(false)
+            })
+            .and_then(|f| crate::server::json_string_value(&f, "value"))
+        else {
+            return Ok(None);
+        };
+        let totp = crate::otp::parse(&uri)?;
+        Ok(Some(totp.code()))
+    }
+
+    /// The current code from the newest credential covering `domain` that
+    /// holds a parseable `totp` field: (credential id, code, seconds left).
+    pub fn totp_for_domain(&self, domain: &str) -> Result<Option<(i64, String, u64)>, String> {
+        for (id, _, _) in self.credentials_for_domain(domain)? {
+            if let Some((code, left)) = self.totp_for_credential(id)? {
+                return Ok(Some((id, code, left)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Credentials for `domain` with their field values, decrypted, most
     /// recently updated first. For the basic-auth responder and the
     /// approve-with-default: both are server-side, and both are guarded
@@ -759,6 +1112,46 @@ fn field_names(fields: &str) -> Vec<String> {
         .collect()
 }
 
+/// A one-time-code hand-off lives ten minutes unless the agent says
+/// otherwise; anything between one minute and fifteen is honoured. Short on
+/// purpose: a code typed into a stale page is a code typed into a stale page.
+pub const OTP_REQUEST_TTL_SECS: i64 = 10 * 60;
+pub const OTP_REQUEST_MIN_TTL_SECS: i64 = 60;
+pub const OTP_REQUEST_MAX_TTL_SECS: i64 = 15 * 60;
+
+/// Flip a still-`pending` row to `expired` when its time ran out, returning
+/// the status to report. Shared by the token and id lookups.
+fn expire_if_stale(
+    conn: &Connection,
+    table: &str,
+    id: i64,
+    status: &str,
+    expires_at: i64,
+) -> String {
+    if status == "pending" && now() >= expires_at {
+        let _ = conn.execute(
+            &format!("UPDATE {table} SET status='expired', response=NULL, seed=NULL WHERE id=?1 AND status='pending'"),
+            [id],
+        );
+        return "expired".into();
+    }
+    status.to_string()
+}
+
+/// Housekeeping on each new hand-off: terminal rows an hour past expiry go,
+/// and no terminal row keeps a response or seed at rest. Metadata (who
+/// asked, for what, how it ended) stays as the audit trail.
+fn reap_otp_requests(conn: &Connection) {
+    let cutoff = now() - 3600;
+    let _ = conn.execute("DELETE FROM otp_requests WHERE expires_at < ?1", [cutoff]);
+    let _ = conn.execute(
+        "UPDATE otp_requests SET response=NULL, seed=NULL
+         WHERE status IN ('collected', 'cancelled', 'expired')
+           AND (response IS NOT NULL OR seed IS NOT NULL)",
+        [],
+    );
+}
+
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -860,6 +1253,24 @@ CREATE TABLE IF NOT EXISTS secret_requests (
   credential_id INTEGER,
   created_at    INTEGER NOT NULL,
   decided_at    INTEGER
+);
+";
+
+const OTP_REQUESTS_DDL: &str = "
+CREATE TABLE IF NOT EXISTS otp_requests (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  token_hash    TEXT NOT NULL UNIQUE,
+  domain        TEXT NOT NULL,
+  reason        TEXT NOT NULL DEFAULT '',
+  kind          TEXT NOT NULL DEFAULT 'code',
+  requested_by  TEXT NOT NULL DEFAULT '',
+  status        TEXT NOT NULL DEFAULT 'pending',
+  response      BLOB,
+  seed          BLOB,
+  credential_id INTEGER,
+  created_at    INTEGER NOT NULL,
+  expires_at    INTEGER NOT NULL,
+  answered_at   INTEGER
 );
 ";
 

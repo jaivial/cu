@@ -1,5 +1,52 @@
 # Changelog
 
+## [1.4.0] - 2026-10-20
+
+### Added
+
+- **One-time codes without a takeover: `cu otp`.** A 2FA page no longer means
+  handing the whole browser to a person.
+  - `cu otp code DOMAIN` (or `--credential ID`) mints the current TOTP code
+    from a seed the vault holds — RFC 6238 over SHA-1/256/512, 4-8 digits,
+    any period, parsed from the full `otpauth://` URI or a bare base32 key.
+  - `cu otp request DOMAIN [--kind code|setup] [--wait]` opens a hand-off
+    and prints a short `/vault/otp?t=…` link: a temporary page, one token
+    per request, where the person types the code (or, for setup, scans the
+    same QR the agent captured). The agent's `--wait` parks until the answer
+    lands, the link expires, or the budget runs out — the navigation resumes
+    by itself, no polling loop.
+  - `cu otp capture --domain D` reads the setup QR off the page itself:
+    square QR-looking elements first (attribute text mentioning qr/otp/2fa
+    ranks highest), the full viewport as fallback, decoded in pure Rust
+    (`rqrr`). The URI is sealed into the domain's credential as a secret
+    `totp` field (replacing, never duplicating) and is never returned,
+    logged or rendered outside the hand-off page. The reply names only the
+    issuer and account it was stored for.
+  - The challenge hint on a first-party code page now points here: seed →
+    `cu otp code`, no seed → `cu otp request`, live takeover stays the
+    fallback.
+- **The vault UI wears the Bizvaretto identity.** Light, clean and minimal:
+  Manrope (bundled, OFL, served at `/vault/manrope.ttf`), the studio's paper
+  and ink palette, pill buttons, calm cards — login, app, live view and the
+  new hand-off page share the language. The login honours `?next=` so a
+  hand-off link returns to its page after unlocking.
+- **The vault shows code hand-offs.** A Codes view lists them (waiting,
+  answered, expired, cancelled) and can cancel a pending one; the badge
+  counts pending hand-offs like it counts secret requests.
+
+### Security
+
+- Hand-off tokens are 192 bits of randomness; only their SHA-256 is stored,
+  so a database read cannot mint answer links. Answers are single-use
+  (enforced in the answering UPDATE, not in a check that could race),
+  sealed at rest, handed to the polling agent exactly once and deleted in
+  the same write; expiry is ten minutes by default (1-15 honoured). Rows a
+  day past usefulness are reaped; metadata alone stays as the audit trail.
+- Answering, looking up or viewing the setup QR of a hand-off is UI-only —
+  the bearer token every local agent holds cannot answer its own request,
+  exactly as with secret-request approvals. The temporary page also requires
+  the vault's UI session, so a forwarded link is not a key by itself.
+
 ## [1.3.0] - 2026-10-19
 
 ### Added

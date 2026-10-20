@@ -225,6 +225,7 @@ fn main() {
         // The global `--tab` lifter has already taken a `--tab ID` out of
         // the arguments; the vault session save wants it.
         Some("vault") => vault(&args[1..], tab.clone()),
+        Some("otp") => otp(&args[1..], tab.clone()),
         _ => {
             print_help();
             Ok(())
@@ -277,7 +278,7 @@ fn wait_for_handoff(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<
 
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release|wait [--timeout S]]\n  cu handoff [wait [--timeout S]]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]\n          levels: debug|verbose log info trace warn error exception csp network, all, LEVEL+\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release|wait [--timeout S]]\n  cu handoff [wait [--timeout S]]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]\n          levels: debug|verbose log info trace warn error exception csp network, all, LEVEL+\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n  cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup]\n          [--wait] [--timeout S]\n  cu otp wait ID [--timeout S] | cancel ID | list\n  cu otp capture [--domain D] [--request ID] [--credential ID]\n  cu otp code DOMAIN | --credential ID\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
     );
 }
 
@@ -880,7 +881,9 @@ fn daemon(args: &[String]) -> Result<(), String> {
     let mut policy = BrowserPolicy::resolve(mode)?;
     // `CU_HEADLESS=0` opts the daemon into a windowed browser on a virtual
     // display (`CU_DISPLAY`): closer to a real browser, fewer bot checks.
-    let windowed = std::env::var("CU_HEADLESS").map(|v| v.trim() == "0").unwrap_or(false);
+    let windowed = std::env::var("CU_HEADLESS")
+        .map(|v| v.trim() == "0")
+        .unwrap_or(false);
     if !(windowed && policy.display.is_some() && !policy.headless) {
         policy.headless = true;
         policy.display = None;
@@ -957,6 +960,197 @@ fn free_port_from(from: u16) -> u16 {
         }
     }
     from
+}
+
+/// `cu otp`: one-time codes — hand-offs a person answers from the phone,
+/// setup-QR capture, and codes minted from a stored seed.
+fn otp(args: &[String], tab: Option<String>) -> Result<(), String> {
+    let usage = "usage: cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup] [--wait] [--timeout S] | wait ID [--timeout S] | cancel ID | list | capture [--domain D] [--request ID] [--credential ID] [--tab T] | code DOMAIN | code --credential ID";
+    let action = args.first().ok_or(usage)?;
+    match action.as_str() {
+        "request" => {
+            let domain = args
+                .get(1)
+                .filter(|a| !a.starts_with("--"))
+                .ok_or("usage: cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup] [--wait] [--timeout S]")?;
+            let mut reason = String::new();
+            let mut from = String::new();
+            let mut kind = "code".to_string();
+            let mut wait = false;
+            let mut timeout = 600.0f64;
+            let mut rest = &args[2..];
+            while let [flag, value, tail @ ..] = rest {
+                match flag.as_str() {
+                    "--reason" => {
+                        reason = value.clone();
+                        rest = tail;
+                    }
+                    "--from" => {
+                        from = value.clone();
+                        rest = tail;
+                    }
+                    "--kind" => {
+                        kind = value.clone();
+                        rest = tail;
+                    }
+                    "--timeout" => {
+                        timeout = value.parse().map_err(|_| "--timeout takes seconds")?;
+                        rest = tail;
+                    }
+                    _ => break,
+                }
+            }
+            if rest.first().map(String::as_str) == Some("--wait") {
+                wait = true;
+            }
+            let created = request(
+                "POST",
+                "/v1/vault/otp/requests",
+                Some(&format!(
+                    "{{\"domain\":{},\"reason\":{},\"kind\":{},\"requested_by\":{}}}",
+                    server::json_string(domain),
+                    server::json_string(&reason),
+                    server::json_string(&kind),
+                    server::json_string(&from),
+                )),
+            )?;
+            println!("{created}");
+            if wait {
+                let id = server::json_string_value(&created, "id").ok_or("no id in reply")?;
+                otp_wait(&id, timeout)?;
+            }
+            Ok(())
+        }
+        "wait" => {
+            let id = args
+                .get(1)
+                .filter(|a| !a.starts_with("--"))
+                .ok_or("usage: cu otp wait ID [--timeout S]")?;
+            let mut timeout = 600.0f64;
+            let mut rest = &args[2..];
+            while let [flag, value, tail @ ..] = rest {
+                if flag.as_str() == "--timeout" {
+                    timeout = value.parse().map_err(|_| "--timeout takes seconds")?;
+                    rest = tail;
+                } else {
+                    break;
+                }
+            }
+            otp_wait(id, timeout)
+        }
+        "cancel" => {
+            let id = args.get(1).ok_or("usage: cu otp cancel ID")?;
+            request(
+                "DELETE",
+                &format!("/v1/vault/otp/requests/{id}"),
+                Some("{}"),
+            )
+            .map(|s| println!("{s}"))
+        }
+        "list" => request("GET", "/v1/vault/otp/requests", None).map(|s| println!("{s}")),
+        "capture" => {
+            let mut domain = String::new();
+            let mut request_id = String::new();
+            let mut credential_id = String::new();
+            let mut rest = &args[1..];
+            while let [flag, value, tail @ ..] = rest {
+                match flag.as_str() {
+                    "--domain" => {
+                        domain = value.clone();
+                        rest = tail;
+                    }
+                    "--request" => {
+                        request_id = value.clone();
+                        rest = tail;
+                    }
+                    "--credential" => {
+                        credential_id = value.clone();
+                        rest = tail;
+                    }
+                    _ => return Err(format!("unknown option {flag}")),
+                }
+            }
+            if request_id.is_empty() && domain.is_empty() {
+                return Err("cu otp capture needs --domain D or --request ID".into());
+            }
+            let path = if request_id.is_empty() {
+                "/v1/vault/otp/capture".to_string()
+            } else {
+                format!("/v1/vault/otp/requests/{request_id}/capture")
+            };
+            let path = match &tab {
+                Some(id) => format!("{path}?tab={id}"),
+                None => path,
+            };
+            let mut body = String::from("{");
+            if !domain.is_empty() {
+                body.push_str(&format!("\"domain\":{},", server::json_string(&domain)));
+            }
+            if !credential_id.is_empty() {
+                body.push_str(&format!(
+                    "\"credential_id\":{},",
+                    server::json_string(&credential_id)
+                ));
+            }
+            body.push('}');
+            // The reply names the issuer and account the seed was stored
+            // for; the seed itself never leaves the vault.
+            request("POST", &path, Some(&body)).map(|s| println!("{s}"))
+        }
+        "code" => {
+            let domain = args.get(1).filter(|a| !a.starts_with("--"));
+            let mut credential_id = String::new();
+            let mut rest = if domain.is_some() {
+                &args[2..]
+            } else {
+                &args[1..]
+            };
+            while let [flag, value, tail @ ..] = rest {
+                if flag.as_str() == "--credential" {
+                    credential_id = value.clone();
+                    rest = tail;
+                } else {
+                    return Err(format!("unknown option {flag}"));
+                }
+            }
+            let body = if !credential_id.is_empty() {
+                format!(
+                    "{{\"credential_id\":{}}}",
+                    server::json_string(&credential_id)
+                )
+            } else if let Some(domain) = domain {
+                format!("{{\"domain\":{}}}", server::json_string(domain))
+            } else {
+                return Err("usage: cu otp code DOMAIN | code --credential ID".into());
+            };
+            request("POST", "/v1/vault/otp/code", Some(&body)).map(|s| println!("{s}"))
+        }
+        _ => Err(usage.into()),
+    }
+}
+
+/// Park on a hand-off until the person answers, it expires or the local
+/// budget runs out; the server-side wait caps each poll, so loop it.
+fn otp_wait(id: &str, timeout: f64) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(format!("no answer after {timeout:.0}s; giving up"));
+        }
+        let body = request(
+            "GET",
+            &format!("/v1/vault/otp/requests/{id}?wait={}", left.as_secs().max(1)),
+            None,
+        )?;
+        println!("{body}");
+        match server::json_string_value(&body, "status").as_deref() {
+            Some("pending") => continue,
+            Some("collected") => return Ok(()),
+            Some(other) => return Err(format!("hand-off ended as {other}")),
+            None => return Err("unexpected reply from the daemon".into()),
+        }
+    }
 }
 
 /// `cu vault`: the credential and session store, from the CLI.
@@ -1181,7 +1375,8 @@ mod tests {
 /// `cu console`: the page's console output, filtered by level.
 fn console_cmd(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), String> {
     let usage = "usage: cu console [--level L[,L]|warn+|all] [--grep TEXT] [--limit N] [--since N] [--clear] [--json]";
-    let (mut level, mut grep, mut limit, mut since) = (String::new(), String::new(), String::new(), String::new());
+    let (mut level, mut grep, mut limit, mut since) =
+        (String::new(), String::new(), String::new(), String::new());
     let (mut clear, mut json) = (false, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -1198,12 +1393,20 @@ fn console_cmd(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), S
     let enc = |s: &str| {
         s.bytes()
             .map(|b| match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b',' => (b as char).to_string(),
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b',' => {
+                    (b as char).to_string()
+                }
                 _ => format!("%{b:02X}"),
             })
             .collect::<String>()
     };
-    let mut q = format!("level={}&grep={}&limit={}&since={}", enc(&level), enc(&grep), enc(&limit), enc(&since));
+    let mut q = format!(
+        "level={}&grep={}&limit={}&since={}",
+        enc(&level),
+        enc(&grep),
+        enc(&limit),
+        enc(&since)
+    );
     if clear {
         q.push_str("&clear=1");
     }
