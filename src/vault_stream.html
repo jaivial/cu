@@ -47,7 +47,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const cv = $('view'), ctx = cv.getContext('2d');
-let ws = null, tab = '', held = false, controlling = false, closedByUs = false, delay = 1000;
+let ended = false, ws = null, tab = '', held = false, controlling = false, closedByUs = false, delay = 1000;
 let frames = 0, bytes = 0, shown = 0, lastTick = performance.now(), fps = 0, kbps = 0, size = '';
 
 
@@ -55,17 +55,17 @@ let frames = 0, bytes = 0, shown = 0, lastTick = performance.now(), fps = 0, kbp
 // login page cannot be framed, so show a link that opens it in its own tab
 // and never navigate the frame.
 function signedOut() {
+  if (ended) return;
+  ended = true;
   closedByUs = true;
   if (window.top === window.self) { location.href = '/vault'; return; }
-  const st = $('status');
-  st.textContent = 'Session ended. ';
-  const a = document.createElement('a');
-  a.href = '/vault'; a.target = '_blank'; a.rel = 'noopener noreferrer';
-  a.textContent = 'Open login in a new tab';
-  st.appendChild(a);
+  // Framed: the sandbox blocks popups, so a link here would do nothing. The
+  // parent panel owns the login link, outside the frame.
+  $('status').textContent = 'Session ended. Use "Open login" in the panel, then reopen it.';
 }
 
 async function loadTabs() {
+  if (ended) return;
   try {
     const r = await fetch('/v1/vault/live/tabs');
     if (r.status === 401) { signedOut(); return; }
@@ -92,6 +92,7 @@ function send(o) {
 }
 
 function connect() {
+  if (ended) return;
   closedByUs = false;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(proto + '//' + location.host + '/v1/vault/live/stream' + (tab ? '?tab=' + encodeURIComponent(tab) : ''));
