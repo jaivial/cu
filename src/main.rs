@@ -1098,20 +1098,20 @@ fn otp(args: &[String], tab: Option<String>) -> Result<(), String> {
                 Some(id) => format!("{path}?tab={id}"),
                 None => path,
             };
-            let mut body = String::from("{");
+            let mut fields = Vec::new();
             if force {
-                body.push_str("\"force\":true,");
+                fields.push("\"force\":true".to_string());
             }
             if !domain.is_empty() {
-                body.push_str(&format!("\"domain\":{},", server::json_string(&domain)));
+                fields.push(format!("\"domain\":{}", server::json_string(&domain)));
             }
             if !credential_id.is_empty() {
-                body.push_str(&format!(
-                    "\"credential_id\":{},",
+                fields.push(format!(
+                    "\"credential_id\":{}",
                     server::json_string(&credential_id)
                 ));
             }
-            body.push('}');
+            let body = format!("{{{}}}", fields.join(","));
             // The reply names the issuer and account the seed was stored
             // for; the seed itself never leaves the vault.
             request("POST", &path, Some(&body)).map(|s| println!("{s}"))
@@ -1150,21 +1150,71 @@ fn otp(args: &[String], tab: Option<String>) -> Result<(), String> {
 
 /// Park on a hand-off until the person answers, it expires or the local
 /// budget runs out; the server-side wait caps each poll, so loop it.
+///
+/// Collection is a two-step hand-over: the answer arrives with a one-owner
+/// collect token, and only the ACK - or the vault's collect window closing
+/// - wipes the stored code. The code is printed only after the ACK lands:
+/// a code the vault still holds for redelivery never reaches this
+/// transcript. A cut connection is retried by simply running
+/// `cu otp wait ID` again - the vault re-delivers to the same owner token
+/// as long as the window is open... except this process is gone by then, so
+/// the retry loop below covers the immediate failures instead.
 fn otp_wait(id: &str, timeout: f64) -> Result<(), String> {
     let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout);
+    let mut collect_token = String::new();
     loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
             return Err(format!("no answer after {timeout:.0}s; giving up"));
         }
-        let body = request(
-            "GET",
-            &format!("/v1/vault/otp/requests/{id}?wait={}", left.as_secs().max(1)),
-            None,
-        )?;
-        println!("{body}");
+        let mut path = format!("/v1/vault/otp/requests/{id}?wait={}", left.as_secs().max(1));
+        if !collect_token.is_empty() {
+            path.push_str(&format!("&collect_token={collect_token}"));
+        }
+        let body = request("GET", &path, None)?;
         match server::json_string_value(&body, "status").as_deref() {
             Some("pending") => continue,
+            Some("collecting") => {
+                if let Some(token) = server::json_string_value(&body, "collect_token") {
+                    collect_token = token;
+                }
+                if server::json_string_value(&body, "response").is_none() {
+                    if collect_token.is_empty() {
+                        return Err("this hand-off is being collected by another consumer".into());
+                    }
+                    continue;
+                }
+                // ACK first, print after: the vault wipes the stored code
+                // only once delivery is confirmed. Bounded immediate retries
+                // cover a cut connection; after those, fail WITHOUT printing
+                // so the code never leaves the vault unacknowledged.
+                let ack_body = format!(
+                    "{{\"collect_token\":{}}}",
+                    server::json_string(&collect_token)
+                );
+                let ack_path = format!("/v1/vault/otp/requests/{id}/ack");
+                let mut acked = request("POST", &ack_path, Some(&ack_body)).is_ok();
+                for _ in 0..2 {
+                    if acked {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                    acked = request("POST", &ack_path, Some(&ack_body)).is_ok();
+                }
+                if !acked {
+                    return Err(format!(
+                        "could not confirm delivery; the code stays in the vault - \
+                         run `cu otp wait {id}` again within its collection window to retry"
+                    ));
+                }
+                let response = server::json_string_value(&body, "response").unwrap_or_default();
+                println!(
+                    "{{\"id\":{},\"status\":\"collected\",\"response\":{}}}",
+                    server::json_string(id),
+                    server::json_string(&response),
+                );
+                return Ok(());
+            }
             Some("collected") => return Ok(()),
             Some(other) => return Err(format!("hand-off ended as {other}")),
             None => return Err("unexpected reply from the daemon".into()),

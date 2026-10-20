@@ -5211,10 +5211,16 @@ fn vault_api(
                 return error_json("request id must be a number");
             };
             let wait_for = seconds_param(query(path), "wait", 0.0);
+            let collect_token = form_value(query(path), "collect_token");
+            let collect_token = if collect_token.is_empty() {
+                None
+            } else {
+                Some(collect_token.as_str())
+            };
             let deadline = std::time::Instant::now()
                 + Duration::from_secs_f64(wait_for.clamp(0.0, wait_ceiling_s()));
             loop {
-                match vault.poll_otp_request(id, true) {
+                match vault.poll_otp_request(id, true, collect_token) {
                     Ok(Some(body)) => {
                         let done = json_string_value(&body, "status")
                             .map(|s| s != "pending")
@@ -5245,6 +5251,21 @@ fn vault_api(
         // request so the temporary page can re-render it as a QR). The reply
         // carries the issuer and account for confirmation, never the URI.
         ("POST", "/v1/vault/otp/capture") => otp_capture(state, path, body, &vault, None),
+        // The collector's acknowledgement: the code arrived; only now does
+        // the vault wipe it (see `poll_otp_request` for the two-step
+        // hand-over). Without the owning collect token this changes nothing.
+        ("POST", p) if p.starts_with("/v1/vault/otp/requests/") && p.ends_with("/ack") => {
+            let tail = &p["/v1/vault/otp/requests/".len()..p.len() - "/ack".len()];
+            let Ok(id) = tail.parse::<i64>() else {
+                return error_json("request id must be a number");
+            };
+            let token = json_value(body, "collect_token").unwrap_or_default();
+            match vault.ack_otp_request(id, &token) {
+                Ok(true) => ("200 OK", "application/json", "{\"acknowledged\":true}".into()),
+                Ok(false) => error_json("not collecting, or the collect token does not match"),
+                Err(e) => error_json(&e),
+            }
+        }
         ("POST", p) if p.starts_with("/v1/vault/otp/requests/") && p.ends_with("/capture") => {
             let tail = &p["/v1/vault/otp/requests/".len()..p.len() - "/capture".len()];
             let Ok(id) = tail.parse::<i64>() else {
@@ -5480,9 +5501,18 @@ fn issuer_matches_host(issuer: &str, host: &str) -> bool {
     if issuer.is_empty() {
         return true;
     }
-    host.split('.').any(|label| {
+    // Match against the meaningful labels only: the TLD (or a public
+    // suffix piece like `co`) never counts, and containment needs at least
+    // three characters on both sides so `co`/`app` cannot vouch for a seed.
+    let labels: Vec<&str> = host.split('.').collect();
+    let meaningful = &labels[..labels.len().saturating_sub(1)];
+    meaningful.iter().any(|label| {
         let label = norm(label);
-        !label.is_empty() && (label.contains(&issuer) || issuer.contains(&label))
+        !label.is_empty()
+            && (label == issuer
+                || (label.len() >= 3
+                    && issuer.len() >= 3
+                    && (label.contains(&issuer) || issuer.contains(&label))))
     })
 }
 

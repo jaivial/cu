@@ -156,6 +156,16 @@ impl Vault {
         // database end up with the same schema.
         conn.execute_batch(&format!("{SECRET_REQUESTS_DDL}{OTP_REQUESTS_DDL}{SCHEMA}"))
             .map_err(|e| format!("vault schema: {e}"))?;
+        // Databases created by an earlier 1.4 build: add the collect columns.
+        // A duplicate-column error just means they are already there.
+        let _ = conn.execute(
+            "ALTER TABLE otp_requests ADD COLUMN collect_token_hash TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE otp_requests ADD COLUMN collect_claimed_at INTEGER",
+            [],
+        );
         let _ = conn.execute(
             "INSERT OR REPLACE INTO vault_meta(key, value) VALUES ('schema_version', '1')",
             [],
@@ -727,68 +737,120 @@ impl Vault {
         Ok(n > 0)
     }
 
-    /// The agent's poll. With `collect`, an answered response is returned
-    /// once and only once: the row flips to `collected` and the sealed value
-    /// is deleted in the same transaction, so a code does not linger at rest
-    /// after the agent has it.
-    pub fn poll_otp_request(&self, id: i64, collect: bool) -> Result<Option<String>, String> {
+    /// The agent's poll. Collection is a two-step hand-over, because
+    /// handing the code over and wiping it in one shot loses it whenever
+    /// the connection drops mid-reply:
+    ///
+    /// 1. The first collect claims the row (answered -> collecting) and
+    ///    returns the response together with a one-owner collect token.
+    ///    Only that token can re-fetch the response (a retry after a cut
+    ///    connection) or acknowledge it; another collector never sees it.
+    /// 2. The ACK ([`Vault::ack_otp_request`]) wipes the stored value and
+    ///    closes the hand-off. Without it the reaper closes the row once
+    ///    the collect window ([`OTP_COLLECT_TTL_SECS`]) ends, wiping the
+    ///    code undelivered rather than keeping it at rest.
+    ///
+    /// This is at-most-once to one owner with bounded redelivery - it does
+    /// not promise exactly-once.
+    pub fn poll_otp_request(
+        &self,
+        id: i64,
+        collect: bool,
+        collect_token: Option<&str>,
+    ) -> Result<Option<String>, String> {
         let conn = self.connect()?;
+        reap_otp_requests(&conn);
         let row = conn
             .query_row(
-                "SELECT status, expires_at, response FROM otp_requests WHERE id = ?1",
+                "SELECT status, expires_at, response, collect_token_hash, collect_claimed_at
+                 FROM otp_requests WHERE id = ?1",
                 [id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
                     ))
                 },
             )
             .ok();
-        let Some((status, expires_at, response)) = row else {
+        let Some((status, expires_at, response, claim_hash, claimed_at)) = row else {
             return Ok(None);
         };
         let status = expire_if_stale(&conn, "otp_requests", id, &status, expires_at);
+        if status == "collecting" {
+            let left = (OTP_COLLECT_TTL_SECS - (now() - claimed_at.unwrap_or(0))).max(0);
+            // Only the claiming owner re-fetches the code while the
+            // delivery window is open.
+            let owner = match (collect_token, &claim_hash) {
+                (Some(token), Some(hash)) => *hash == token_hash(token),
+                _ => false,
+            };
+            if owner {
+                let response = match response {
+                    Some(sealed) => unseal(&self.key, &sealed)?,
+                    None => return Err("collecting request without a response".into()),
+                };
+                return Ok(Some(format!(
+                    "{{\"id\":{id},\"status\":\"collecting\",\"expires_in\":{left},\"response\":{}}}",
+                    json_string(&response),
+                )));
+            }
+            return Ok(Some(format!(
+                "{{\"id\":{id},\"status\":\"collecting\",\"expires_in\":{left}}}"
+            )));
+        }
         if collect && status == "answered" {
-            // Claim the row first, atomically: exactly one collector flips
-            // answered -> collecting, so the code is delivered once even
-            // under concurrent polls.
+            // Claim first, atomically: exactly one collector flips
+            // answered -> collecting and gets the owner token.
+            let token = format!("otc-{}", hex_encode(&rand_bytes::<24>()));
             let claimed = conn
                 .execute(
-                    "UPDATE otp_requests SET status='collecting'
+                    "UPDATE otp_requests
+                     SET status='collecting', collect_token_hash=?2, collect_claimed_at=?3
                      WHERE id=?1 AND status='answered'",
-                    [id],
+                    rusqlite::params![id, token_hash(&token), now()],
                 )
                 .map_err(|e| e.to_string())?;
             if claimed == 0 {
                 return Ok(Some(format!(
-                    "{{\"id\":{id},\"status\":\"collected\",\"expires_in\":0}}"
+                    "{{\"id\":{id},\"status\":\"collecting\",\"expires_in\":0}}"
                 )));
             }
             let response = match response {
                 Some(sealed) => unseal(&self.key, &sealed)?,
                 None => return Err("answered request without a response".into()),
             };
-            // Build the reply before wiping the stored value: a body that
-            // failed to build must not cost the person their answer.
-            let body = format!(
-                "{{\"id\":{id},\"status\":\"collected\",\"expires_in\":0,\"response\":{}}}",
+            return Ok(Some(format!(
+                "{{\"id\":{id},\"status\":\"collecting\",\"expires_in\":{OTP_COLLECT_TTL_SECS},\"response\":{},\"collect_token\":{}}}",
                 json_string(&response),
-            );
-            conn.execute(
-                "UPDATE otp_requests SET status='collected', response=NULL, seed=NULL
-                 WHERE id=?1",
-                [id],
-            )
-            .map_err(|e| e.to_string())?;
-            return Ok(Some(body));
+                json_string(&token),
+            )));
         }
         Ok(Some(format!(
             "{{\"id\":{id},\"status\":{},\"expires_in\":{}}}",
             json_string(&status),
             (expires_at - now()).max(0),
         )))
+    }
+
+    /// The collector's acknowledgement: the code arrived intact. Only now
+    /// is the stored value wiped and the hand-off closed; without the
+    /// owning collect token this changes nothing.
+    pub fn ack_otp_request(&self, id: i64, collect_token: &str) -> Result<bool, String> {
+        let n = self
+            .connect()?
+            .execute(
+                "UPDATE otp_requests
+                 SET status='collected', response=NULL, seed=NULL,
+                     collect_token_hash=NULL, collect_claimed_at=NULL
+                 WHERE id=?1 AND status='collecting' AND collect_token_hash=?2",
+                rusqlite::params![id, token_hash(collect_token)],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(n > 0)
     }
 
     /// Give up a pending hand-off (the agent took another path).
@@ -1186,6 +1248,10 @@ fn field_names(fields: &str) -> Vec<String> {
 pub const OTP_REQUEST_TTL_SECS: i64 = 10 * 60;
 pub const OTP_REQUEST_MIN_TTL_SECS: i64 = 60;
 pub const OTP_REQUEST_MAX_TTL_SECS: i64 = 15 * 60;
+/// How long a claimed answer waits for its collector's ACK before the
+/// reaper wipes it undelivered: long enough for a cut connection's bounded
+/// retries, short enough that a code never lingers.
+pub const OTP_COLLECT_TTL_SECS: i64 = 5 * 60;
 
 /// Flip a still-`pending` row to `expired` when its time ran out, returning
 /// the status to report. Shared by the token and id lookups.
@@ -1198,7 +1264,7 @@ fn expire_if_stale(
 ) -> String {
     if status == "pending" && now() >= expires_at {
         let _ = conn.execute(
-            &format!("UPDATE {table} SET status='expired', response=NULL, seed=NULL WHERE id=?1 AND status='pending'"),
+            &format!("UPDATE {table} SET status='expired', response=NULL, seed=NULL, collect_token_hash=NULL WHERE id=?1 AND status='pending'"),
             [id],
         );
         return "expired".into();
@@ -1213,10 +1279,20 @@ fn reap_otp_requests(conn: &Connection) {
     let cutoff = now() - 3600;
     let _ = conn.execute("DELETE FROM otp_requests WHERE expires_at < ?1", [cutoff]);
     let _ = conn.execute(
-        "UPDATE otp_requests SET response=NULL, seed=NULL
+        "UPDATE otp_requests SET response=NULL, seed=NULL, collect_token_hash=NULL
          WHERE status IN ('collected', 'cancelled', 'expired')
-           AND (response IS NOT NULL OR seed IS NOT NULL)",
+           AND (response IS NOT NULL OR seed IS NOT NULL OR collect_token_hash IS NOT NULL)",
         [],
+    );
+    // A claimed answer whose collector never came back: the delivery window
+    // closes and the code is wiped undelivered, never re-exposed.
+    let collect_cutoff = now() - OTP_COLLECT_TTL_SECS;
+    let _ = conn.execute(
+        "UPDATE otp_requests
+         SET status='collected', response=NULL, seed=NULL,
+             collect_token_hash=NULL, collect_claimed_at=NULL
+         WHERE status='collecting' AND collect_claimed_at < ?1",
+        [collect_cutoff],
     );
 }
 
@@ -1338,7 +1414,9 @@ CREATE TABLE IF NOT EXISTS otp_requests (
   credential_id INTEGER,
   created_at    INTEGER NOT NULL,
   expires_at    INTEGER NOT NULL,
-  answered_at   INTEGER
+  answered_at   INTEGER,
+  collect_token_hash TEXT,
+  collect_claimed_at INTEGER
 );
 ";
 

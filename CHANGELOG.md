@@ -46,9 +46,13 @@
   so a database read cannot mint answer links. The hand-off page strips its
   token from the address bar on load and every reply carries
   `Referrer-Policy: no-referrer`; UI-only POSTs carrying an Origin header
-  from another host get 403. Collecting an answer is atomic (one claimant
-  flips the row, then the reply is built, then the stored value is wiped),
-  so a code is delivered exactly once. Answers are single-use
+  from another host get 403. Collecting an answer is a two-step hand-over:
+  the first collect claims the row and hands the code over with a one-owner
+  collect token; only that token can re-fetch the code after a cut
+  connection or acknowledge it, and the stored value is wiped on the ACK -
+  or by the reaper when the five-minute collection window closes, never
+  re-exposed, never delivered to a second collector (at-most-once to one
+  owner with bounded redelivery, not exactly-once). Answers are single-use
   (enforced in the answering UPDATE, not in a check that could race),
   sealed at rest, handed to the polling agent exactly once and deleted in
   the same write; expiry is ten minutes by default (1-15 honoured). Rows a
