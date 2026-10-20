@@ -10,6 +10,16 @@
     --blue: #3649ed; --blue-dark: #293ac8; --lilac: #e2def9; --mint: #deebe4;
     --line: #dfe1e9; --danger: #c0352b;
   }
+
+  /* Bizvaretto is a light identity; people whose system is dark keep a
+     tuned dark scheme instead of a blinding page. */
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #171a23; --white: #20242f; --ink: #e9ebf3; --muted: #9aa1b5;
+      --blue: #6a78ff; --blue-dark: #8b96ff; --lilac: #2a2745; --mint: #1f2d27;
+      --line: #323748; --danger: #ff8080;
+    }
+  }
   @font-face {
     font-family: 'Manrope';
     src: url('/vault/manrope.ttf') format('truetype');
@@ -114,6 +124,10 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const token = new URLSearchParams(location.search).get('t') || '';
+// The one-time token leaves the address bar now: no browser history, no
+// referrer, no shoulder-surfed URL keeps it.
+const selfUrl = location.pathname + location.search;
+history.replaceState(null, '', location.pathname);
 let expiresAt = 0, finished = false;
 
 function end(icon, title, sub) {
@@ -141,7 +155,7 @@ async function lookup() {
     reply = await fetch('/v1/vault/otp/lookup?t=' + encodeURIComponent(token));
   } catch (e) { return; }
   if (reply.status === 401) {
-    location.replace('/vault?next=' + encodeURIComponent(location.pathname + location.search));
+    location.replace('/vault?next=' + encodeURIComponent(selfUrl));
     return;
   }
   if (reply.status === 404) {

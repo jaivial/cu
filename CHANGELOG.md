@@ -19,9 +19,13 @@
     square QR-looking elements first (attribute text mentioning qr/otp/2fa
     ranks highest), the full viewport as fallback, decoded in pure Rust
     (`rqrr`). The URI is sealed into the domain's credential as a secret
-    `totp` field (replacing, never duplicating) and is never returned,
-    logged or rendered outside the hand-off page. The reply names only the
-    issuer and account it was stored for.
+    `totp` field and is never returned, logged or rendered outside the
+    hand-off page. The reply names only the issuer and account it was stored
+    for. Capture refuses to guess: the tab must actually be on the claimed
+    domain, the QR's issuer must match that host, several different setup
+    QRs on one page are an error, and a credential that already holds a
+    live seed is only replaced with an explicit `--replace` (the reply then
+    says `replaced: true` and names the previous account).
   - The challenge hint on a first-party code page now points here: seed →
     `cu otp code`, no seed → `cu otp request`, live takeover stays the
     fallback.
@@ -37,7 +41,12 @@
 ### Security
 
 - Hand-off tokens are 192 bits of randomness; only their SHA-256 is stored,
-  so a database read cannot mint answer links. Answers are single-use
+  so a database read cannot mint answer links. The hand-off page strips its
+  token from the address bar on load and every reply carries
+  `Referrer-Policy: no-referrer`; UI-only POSTs carrying an Origin header
+  from another host get 403. Collecting an answer is atomic (one claimant
+  flips the row, then the reply is built, then the stored value is wiped),
+  so a code is delivered exactly once. Answers are single-use
   (enforced in the answering UPDATE, not in a check that could race),
   sealed at rest, handed to the polling agent exactly once and deleted in
   the same write; expiry is ten minutes by default (1-15 honoured). Rows a

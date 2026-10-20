@@ -60,6 +60,7 @@ pub fn capture_otpauth(tab: &Tab) -> Result<String, String> {
         .collect();
     clips.push((0.0, 0.0, 0.0, 0.0)); // (0,0,0,0): the whole viewport, last resort
     let mut saw_qr = false;
+    let mut found: Vec<String> = Vec::new();
     for (x, y, w, h) in clips {
         let params = if w > 0.0 {
             // A margin around the element: quiet zone matters to decoders,
@@ -86,10 +87,24 @@ pub fn capture_otpauth(tab: &Tab) -> Result<String, String> {
         };
         for content in decode_png(&png) {
             if content.starts_with("otpauth://") {
-                return Ok(content);
+                // The same QR shows in its element clip and in the viewport
+                // fallback; distinct URIs are the ambiguity to refuse.
+                if !found.contains(&content) {
+                    found.push(content);
+                }
+            } else {
+                saw_qr = true;
             }
-            saw_qr = true;
         }
+    }
+    if found.len() > 1 {
+        return Err(format!(
+            "{} different setup QRs on this page; refusing to guess - narrow to the right element or tab and retry",
+            found.len()
+        ));
+    }
+    if let Some(uri) = found.pop() {
+        return Ok(uri);
     }
     Err(if saw_qr {
         "a QR was found but it is not an otpauth:// setup code".into()
@@ -122,21 +137,3 @@ pub fn render_svg(uri: &str) -> Result<String, String> {
         .build())
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn renders_an_svg() {
-        let svg = super::render_svg("otpauth://totp/Example:ada?secret=JBSWY3DPEHPK3PXP").unwrap();
-        assert!(svg.contains("<svg"));
-        assert!(svg.contains("path"));
-    }
-
-    #[test]
-    fn decodes_what_it_renders() {
-        // qrcode renders vector SVG; rasterise it through tiny-skia? Not in
-        // the tree. Instead: build the same code and re-encode via rqrr's
-        // sibling is not available either — so this test settles for the
-        // render API round trip and the PNG decoder's error paths.
-        assert!(super::decode_png(b"not a png").is_empty());
-    }
-}

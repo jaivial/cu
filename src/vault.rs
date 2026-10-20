@@ -751,20 +751,38 @@ impl Vault {
         };
         let status = expire_if_stale(&conn, "otp_requests", id, &status, expires_at);
         if collect && status == "answered" {
+            // Claim the row first, atomically: exactly one collector flips
+            // answered -> collecting, so the code is delivered once even
+            // under concurrent polls.
+            let claimed = conn
+                .execute(
+                    "UPDATE otp_requests SET status='collecting'
+                     WHERE id=?1 AND status='answered'",
+                    [id],
+                )
+                .map_err(|e| e.to_string())?;
+            if claimed == 0 {
+                return Ok(Some(format!(
+                    "{{\"id\":{id},\"status\":\"collected\",\"expires_in\":0}}"
+                )));
+            }
             let response = match response {
                 Some(sealed) => unseal(&self.key, &sealed)?,
                 None => return Err("answered request without a response".into()),
             };
+            // Build the reply before wiping the stored value: a body that
+            // failed to build must not cost the person their answer.
+            let body = format!(
+                "{{\"id\":{id},\"status\":\"collected\",\"expires_in\":0,\"response\":{}}}",
+                json_string(&response),
+            );
             conn.execute(
                 "UPDATE otp_requests SET status='collected', response=NULL, seed=NULL
-                 WHERE id=?1 AND status='answered'",
+                 WHERE id=?1",
                 [id],
             )
             .map_err(|e| e.to_string())?;
-            return Ok(Some(format!(
-                "{{\"id\":{id},\"status\":\"collected\",\"expires_in\":0,\"response\":{}}}",
-                json_string(&response),
-            )));
+            return Ok(Some(body));
         }
         Ok(Some(format!(
             "{{\"id\":{id},\"status\":{},\"expires_in\":{}}}",
@@ -843,12 +861,19 @@ impl Vault {
     /// authenticator. Sealed like any other field.
     pub fn set_otp_request_seed(&self, id: i64, uri: &str) -> Result<(), String> {
         let sealed = seal(&self.key, uri.as_bytes())?;
-        self.connect()?
+        let n = self
+            .connect()?
             .execute(
                 "UPDATE otp_requests SET seed=?2 WHERE id=?1 AND status='pending'",
                 rusqlite::params![id, sealed],
             )
             .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err(
+                "the hand-off is no longer pending (answered, expired or cancelled); seed not attached"
+                    .into(),
+            );
+        }
         Ok(())
     }
 
@@ -869,17 +894,24 @@ impl Vault {
         row.map(|sealed| unseal(&self.key, &sealed)).transpose()
     }
 
-    /// Merge a TOTP seed into a credential's fields, replacing any earlier
-    /// `totp` one. With `credential_id: None` the domain must resolve to
-    /// exactly one credential; with none at all a fresh credential holds the
-    /// seed, labelled with the account the URI names.
+    /// Merge a TOTP seed into a credential's fields. An existing `totp`
+    /// field is a live 2FA setup: replacing it needs `force` - the explicit
+    /// confirmation of whoever runs the capture - otherwise this refuses
+    /// instead of destroying a working setup. Returns the credential id
+    /// and, when a replacement did happen, the account the previous seed
+    /// named so the caller can surface it.
+    ///
+    /// With `credential_id: None` the domain must resolve to exactly one
+    /// credential; with none at all a fresh credential holds the seed,
+    /// labelled with the account the URI names.
     pub fn put_totp(
         &self,
         credential_id: Option<i64>,
         domain: &str,
         label: &str,
         uri: &str,
-    ) -> Result<i64, String> {
+        force: bool,
+    ) -> Result<(i64, Option<String>), String> {
         let (id, domain, label, notes, fields) = match credential_id {
             Some(id) => {
                 let full = self.get_credential(id)?.ok_or("no such credential")?;
@@ -924,6 +956,29 @@ impl Vault {
                 }
             }
         };
+        let existing: Vec<String> = crate::server::json_objects(&fields)
+            .into_iter()
+            .filter(|f| {
+                crate::server::json_string_value(f, "name")
+                    .map(|n| n.eq_ignore_ascii_case("totp"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        if !existing.is_empty() && !force {
+            return Err(
+                "this credential already holds a live TOTP seed; re-run with force \
+                 (cu otp capture --replace) only after explicitly confirming the \
+                 existing 2FA setup is being replaced"
+                    .into(),
+            );
+        }
+        // The account the outgoing seed named, for the caller's report.
+        // Metadata only - the seed itself is never returned.
+        let previous_account = existing
+            .first()
+            .and_then(|f| crate::server::json_string_value(f, "value"))
+            .and_then(|old_uri| crate::otp::parse(&old_uri).ok())
+            .map(|old| old.account);
         let mut kept: Vec<String> = crate::server::json_objects(&fields)
             .into_iter()
             .filter(|f| {
@@ -936,13 +991,14 @@ impl Vault {
             "{{\"name\":\"totp\",\"value\":{},\"secret\":true,\"type\":\"password\"}}",
             json_string(uri)
         ));
-        self.put_credential(
+        let id = self.put_credential(
             id,
             &domain,
             &label,
             &format!("[{}]", kept.join(",")),
             &notes,
-        )
+        )?;
+        Ok((id, previous_account))
     }
 
     /// The current code of the credential's stored `totp` field, if it has

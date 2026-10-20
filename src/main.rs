@@ -278,7 +278,7 @@ fn wait_for_handoff(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<
 
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release|wait [--timeout S]]\n  cu handoff [wait [--timeout S]]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]\n          levels: debug|verbose log info trace warn error exception csp network, all, LEVEL+\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n  cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup]\n          [--wait] [--timeout S]\n  cu otp wait ID [--timeout S] | cancel ID | list\n  cu otp capture [--domain D] [--request ID] [--credential ID]\n  cu otp code DOMAIN | --credential ID\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release|wait [--timeout S]]\n  cu handoff [wait [--timeout S]]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]\n          levels: debug|verbose log info trace warn error exception csp network, all, LEVEL+\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n  cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup]\n          [--wait] [--timeout S]\n  cu otp wait ID [--timeout S] | cancel ID | list\n  cu otp capture [--domain D] [--request ID] [--credential ID] [--replace]\n  cu otp code DOMAIN | --credential ID\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
     );
 }
 
@@ -965,7 +965,7 @@ fn free_port_from(from: u16) -> u16 {
 /// `cu otp`: one-time codes — hand-offs a person answers from the phone,
 /// setup-QR capture, and codes minted from a stored seed.
 fn otp(args: &[String], tab: Option<String>) -> Result<(), String> {
-    let usage = "usage: cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup] [--wait] [--timeout S] | wait ID [--timeout S] | cancel ID | list | capture [--domain D] [--request ID] [--credential ID] [--tab T] | code DOMAIN | code --credential ID";
+    let usage = "usage: cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup] [--wait] [--timeout S] | wait ID [--timeout S] | cancel ID | list | capture [--domain D] [--request ID] [--credential ID] [--replace] [--tab T] | code DOMAIN | code --credential ID";
     let action = args.first().ok_or(usage)?;
     match action.as_str() {
         "request" => {
@@ -1016,7 +1016,9 @@ fn otp(args: &[String], tab: Option<String>) -> Result<(), String> {
             )?;
             println!("{created}");
             if wait {
-                let id = server::json_string_value(&created, "id").ok_or("no id in reply")?;
+                let id = server::json_string_value(&created, "id")
+                .or_else(|| server::json_number(&created, "id").map(|n| (n as i64).to_string()))
+                .ok_or("no id in reply")?;
                 otp_wait(&id, timeout)?;
             }
             Ok(())
@@ -1049,10 +1051,18 @@ fn otp(args: &[String], tab: Option<String>) -> Result<(), String> {
         }
         "list" => request("GET", "/v1/vault/otp/requests", None).map(|s| println!("{s}")),
         "capture" => {
+            // Replacing a credential's live TOTP seed needs this explicit
+            // flag - the operator's confirmation, never an inference.
+            let force = args.iter().any(|a| a == "--replace");
+            let cleaned: Vec<String> = args[1..]
+                .iter()
+                .filter(|a| a.as_str() != "--replace")
+                .cloned()
+                .collect();
             let mut domain = String::new();
             let mut request_id = String::new();
             let mut credential_id = String::new();
-            let mut rest = &args[1..];
+            let mut rest = &cleaned[..];
             while let [flag, value, tail @ ..] = rest {
                 match flag.as_str() {
                     "--domain" => {
@@ -1083,6 +1093,9 @@ fn otp(args: &[String], tab: Option<String>) -> Result<(), String> {
                 None => path,
             };
             let mut body = String::from("{");
+            if force {
+                body.push_str("\"force\":true,");
+            }
             if !domain.is_empty() {
                 body.push_str(&format!("\"domain\":{},", server::json_string(&domain)));
             }
