@@ -728,8 +728,14 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
         // Approve/deny are UI-only even for a bearer caller: every agent on
         // this machine holds the same bearer token, so an agent allowed to
         // answer its own secret request would make the approval theatre.
-        let (status, kind, response, cookie) =
-            vault_route(method, path, body, &state, header_value(head, "cookie"));
+        let (status, kind, response, cookie) = vault_route_with(
+            method,
+            path,
+            body,
+            &state,
+            header_value(head, "cookie"),
+            header_value(head, "x-cu-otp-collect-token"),
+        );
         set_cookie = cookie;
         (status, kind, response)
     } else if !authorized {
@@ -739,7 +745,13 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
             "{\"error\":\"missing or invalid bearer token\"}".into(),
         )
     } else {
-        route(method, path, body, &state)
+        route_with(
+            method,
+            path,
+            body,
+            &state,
+            header_value(head, "x-cu-otp-collect-token"),
+        )
     };
     let mut head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n",
@@ -857,6 +869,17 @@ pub fn route(
     full_path: &str,
     body: &str,
     state: &AppState,
+) -> (&'static str, &'static str, String) {
+    route_with(method, full_path, body, state, None)
+}
+
+/// `route` plus the OTP collect token header, threaded to the vault API.
+fn route_with(
+    method: &str,
+    full_path: &str,
+    body: &str,
+    state: &AppState,
+    collect_token: Option<&str>,
 ) -> (&'static str, &'static str, String) {
     // A query string selects options (`?format=png`), never a different
     // resource, so the match below is on the path alone.
@@ -1366,7 +1389,9 @@ pub fn route(
         }
         // Bearer-authorized vault access (the local CLI, an agent). The
         // full path: the vault API reads its own query (`?tab=`, `?query=`).
-        (_, p) if p.starts_with("/v1/vault") => vault_api(method, full_path, body, state),
+        (_, p) if p.starts_with("/v1/vault") => {
+            vault_api(method, full_path, body, state, collect_token)
+        }
         _ => (
             "404 Not Found",
             "application/json",
@@ -4647,12 +4672,29 @@ pub fn decode_base64(s: &str) -> Result<Vec<u8>, String> {
 /// (a browser). Page routes answer whatever the cookie says (the pages
 /// themselves decide by fetching data); data routes 401 without a live UI
 /// session. `cookie` is the request's `Cookie:` header value if it had one.
+// The signature the vault-route tests were written against; production
+// goes through `vault_route_with`, which also carries the OTP collect
+// token header.
+#[cfg(test)]
 fn vault_route(
     method: &str,
     full_path: &str,
     body: &str,
     state: &AppState,
     cookie: Option<&str>,
+) -> (&'static str, &'static str, String, Option<String>) {
+    vault_route_with(method, full_path, body, state, cookie, None)
+}
+
+/// `vault_route` plus the OTP collect token, which arrives as a header -
+/// never in the URL query, where it would land in history and logs.
+fn vault_route_with(
+    method: &str,
+    full_path: &str,
+    body: &str,
+    state: &AppState,
+    cookie: Option<&str>,
+    collect_token: Option<&str>,
 ) -> (&'static str, &'static str, String, Option<String>) {
     // The query selects content (the hand-off page's token, the login
     // page's `next`), never a different route — so match without it and
@@ -4847,7 +4889,7 @@ fn vault_route(
             // every authenticated request, so an active session never expires
             // under the person working, and an abandoned one still dies after
             // its whole lifetime of silence.
-            let (status, kind, response) = vault_api(method, full_path, body, state);
+            let (status, kind, response) = vault_api(method, full_path, body, state, collect_token);
             (
                 status,
                 kind,
@@ -4899,6 +4941,7 @@ fn vault_api(
     path: &str,
     body: &str,
     state: &AppState,
+    collect_token: Option<&str>,
 ) -> (&'static str, &'static str, String) {
     // The live view of a tab (a person finishing a check an agent must not
     // solve) is a vault route: same session, same gate.
@@ -5211,12 +5254,6 @@ fn vault_api(
                 return error_json("request id must be a number");
             };
             let wait_for = seconds_param(query(path), "wait", 0.0);
-            let collect_token = form_value(query(path), "collect_token");
-            let collect_token = if collect_token.is_empty() {
-                None
-            } else {
-                Some(collect_token.as_str())
-            };
             let deadline = std::time::Instant::now()
                 + Duration::from_secs_f64(wait_for.clamp(0.0, wait_ceiling_s()));
             loop {

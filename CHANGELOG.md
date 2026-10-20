@@ -52,10 +52,15 @@
   connection or acknowledge it, and the stored value is wiped on the ACK -
   or by the reaper when the five-minute collection window closes, never
   re-exposed, never delivered to a second collector (at-most-once to one
-  owner with bounded redelivery, not exactly-once). The CLI proposes its
-  own collect token up front, so even the loss of the claim reply itself
-  leaves the token in the caller's hands; the ACK is idempotent, so a lost
-  ACK reply is safe to retry. Answers are single-use
+  owner with bounded redelivery, not exactly-once). The CLI generates its
+  own collect token from the OS CSPRNG, keeps it - and the retrieved code,
+  once it lands - in a 0600 state file next to the daemon's data, and sends
+  it as a header, never in the URL; a crashed or killed `cu otp wait` is
+  resumed by running it again, and transport errors retry inside the
+  budget instead of killing the process. The ACK is idempotent, so a lost
+  ACK reply is safe to retry. The five-minute collection window is the
+  vault's delivery retention, not the code's validity - a TOTP code lives
+  about thirty seconds and is used immediately. Answers are single-use
   (enforced in the answering UPDATE, not in a check that could race),
   sealed at rest, handed to the polling agent exactly once and deleted in
   the same write; expiry is ten minutes by default (1-15 honoured). Rows a

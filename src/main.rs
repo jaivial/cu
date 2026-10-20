@@ -418,10 +418,20 @@ fn login_url() -> String {
 /// retried, so a plain `cu ...` works on a fresh boot without anyone having
 /// run `cu daemon` by hand.
 fn request(method: &str, path: &str, body: Option<&str>) -> Result<String, String> {
+    request_x(method, path, body, None)
+}
+
+/// `request` plus one extra header line (see `request_config_x`).
+fn request_x(
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    header: Option<(&str, &str)>,
+) -> Result<String, String> {
     if let Some(data) = env::var_os("CU_DATA_DIR") {
         let config = fs::read_to_string(PathBuf::from(&data).join("server.json"))
             .map_err(|_| "server not running (start it with `cu start`)")?;
-        return request_config(&config, method, path, body);
+        return request_config_x(&config, method, path, body, header);
     }
     let daemon_config = daemon_dir().join("server.json");
     let legacy_config = PathBuf::from(".cu").join("server.json");
@@ -430,7 +440,7 @@ fn request(method: &str, path: &str, body: Option<&str>) -> Result<String, Strin
             && let Some((port, _)) = endpoint(&config)
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
         {
-            return request_config(&config, method, path, body);
+            return request_config_x(&config, method, path, body, header);
         }
     }
     ensure_daemon()?;
@@ -440,7 +450,7 @@ fn request(method: &str, path: &str, body: Option<&str>) -> Result<String, Strin
     for _ in 0..2 {
         let config = fs::read_to_string(&daemon_config)
             .map_err(|_| "the daemon did not come up (see ~/.cu/daemon/daemon.log)")?;
-        match request_config(&config, method, path, body) {
+        match request_config_x(&config, method, path, body, header) {
             Ok(reply) => return Ok(reply),
             Err(_) => thread::sleep(Duration::from_millis(300)),
         }
@@ -456,11 +466,14 @@ fn endpoint(config: &str) -> Option<(u16, String)> {
 }
 
 /// One request against a server described by its `server.json` contents.
-fn request_config(
+/// One daemon request with an optional extra header line (the OTP collect
+/// token, which must not travel in the URL query).
+fn request_config_x(
     config: &str,
     method: &str,
     path: &str,
     body: Option<&str>,
+    header: Option<(&str, &str)>,
 ) -> Result<String, String> {
     let port = server::json_value(config, "port").ok_or("invalid server state")?;
     let token = server::json_value(config, "token").ok_or("invalid server state")?;
@@ -470,7 +483,11 @@ fn request_config(
     ))
     .map_err(|e| e.to_string())?;
     let body = body.unwrap_or("");
-    write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).map_err(|e| e.to_string())?;
+    let extra = match header {
+        Some((name, value)) => format!("{name}: {value}\r\n"),
+        None => String::new(),
+    };
+    write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\n\r\n{body}", body.len()).map_err(|e| e.to_string())?;
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
@@ -1151,78 +1168,198 @@ fn otp(args: &[String], tab: Option<String>) -> Result<(), String> {
 /// Park on a hand-off until the person answers, it expires or the local
 /// budget runs out; the server-side wait caps each poll, so loop it.
 ///
-/// Collection is a two-step hand-over: the answer arrives with a one-owner
-/// collect token, and only the ACK - or the vault's collect window closing
-/// - wipes the stored code. The code is printed only after the ACK lands:
-/// a code the vault still holds for redelivery never reaches this
-/// transcript. A cut connection is retried by simply running
-/// `cu otp wait ID` again - the vault re-delivers to the same owner token
-/// as long as the window is open.
+/// Collection survives this process: the collect token comes from the OS
+/// CSPRNG and lives - with the retrieved code, once it lands - in a 0600
+/// file next to the daemon's data until the ACK is confirmed or the
+/// hand-off ends. A crashed or killed wait is resumed by running
+/// `cu otp wait ID` again: same token, same code, never a second owner.
+/// The code is printed only after the vault confirmed the ACK (the ACK is
+/// idempotent, so a lost ACK reply is just retried). The five-minute
+/// collection window is the vault's delivery retention, NOT the code's
+/// validity - a TOTP code lives about 30 seconds, so the answer is
+/// collected and used immediately.
 fn otp_wait(id: &str, timeout: f64) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout);
-    // Our own collect token, generated BEFORE any claim call: if the
-    // daemon's claim reply is lost on the wire we still hold it, and the
-    // next poll re-fetches the same code. Uniqueness per process run is
-    // all it needs; the vault stores only its hash.
-    let nonce = format!(
-        "claim-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default()
-    );
-    let mut collect_token = nonce;
+    let deadline = Instant::now() + Duration::from_secs_f64(timeout);
+    let (collect_token, mut cached_response) = match otp_collect_load(id) {
+        Some((token, response)) => (token, response),
+        None => {
+            let token = otp_collect_token()?;
+            otp_collect_save(id, &token, None)?;
+            (token, None)
+        }
+    };
+    let header = ("X-Cu-Otp-Collect-Token", collect_token.as_str());
+    let ack = |token: &str| {
+        request(
+            "POST",
+            &format!("/v1/vault/otp/requests/{id}/ack"),
+            Some(&format!(
+                "{{\"collect_token\":{}}}",
+                server::json_string(token)
+            )),
+        )
+    };
     loop {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Err(format!("no answer after {timeout:.0}s; giving up"));
+            return Err(match &cached_response {
+                Some(_) => format!(
+                    "the code was retrieved but its ACK never confirmed before the local budget \
+                     ran out; it stays saved at {} - rerun `cu otp wait {id}` to confirm and print it",
+                    otp_collect_file(id).display(),
+                ),
+                None => format!("no answer after {timeout:.0}s; giving up"),
+            });
         }
-        let mut path = format!("/v1/vault/otp/requests/{id}?wait={}", left.as_secs().max(1));
-        if !collect_token.is_empty() {
-            path.push_str(&format!("&collect_token={collect_token}"));
+        // Holding the code already? Confirm the ACK and only then print.
+        if let Some(response) = &cached_response {
+            match ack(&collect_token) {
+                Ok(_) => {
+                    println!(
+                        "{{\"id\":{},\"status\":\"collected\",\"response\":{}}}",
+                        server::json_string(id),
+                        server::json_string(response),
+                    );
+                    otp_collect_drop(id);
+                    return Ok(());
+                }
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+            }
         }
-        let body = request("GET", &path, None)?;
+        // Transport errors (the claim reply lost on the wire included)
+        // never kill the process: the token survives in the state file and
+        // in memory, so every failure here is a bounded retry, not `?`.
+        let body = match request_x(
+            "GET",
+            &format!("/v1/vault/otp/requests/{id}?wait={}", left.as_secs().max(1)),
+            None,
+            Some(header),
+        ) {
+            Ok(body) => body,
+            Err(_) => {
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        };
         match server::json_string_value(&body, "status").as_deref() {
             Some("pending") => continue,
-            Some("collecting") => {
-                if let Some(token) = server::json_string_value(&body, "collect_token") {
-                    collect_token = token;
+            Some("collecting") => match server::json_string_value(&body, "response") {
+                Some(response) => {
+                    // Persist BEFORE the first ACK attempt: whatever happens
+                    // to this process now, the code stays recoverable until
+                    // the vault's delivery window closes.
+                    otp_collect_save(id, &collect_token, Some(&response))?;
+                    cached_response = Some(response);
                 }
-                if server::json_string_value(&body, "response").is_none() {
+                None => {
                     return Err(
-                        "this hand-off is collected elsewhere or its delivery window closed; \
-                         if it closed without reaching you, open a new hand-off"
+                        "this hand-off is being collected elsewhere (or its delivery window \
+                         closed); if an earlier run of yours was collecting it, its state file \
+                         is gone - wait for the vault's window to close and open a new hand-off"
                             .into(),
                     );
                 }
-                // ACK first, print after: the vault wipes the stored code
-                // only once delivery is confirmed. The ACK is idempotent,
-                // so a lost ACK reply is safe to retry; a failed ACK loops
-                // back (the vault re-delivers to our token) until the
-                // overall deadline, never printing an unacknowledged code.
-                let ack_body = format!(
-                    "{{\"collect_token\":{}}}",
-                    server::json_string(&collect_token)
-                );
-                let ack_path = format!("/v1/vault/otp/requests/{id}/ack");
-                if request("POST", &ack_path, Some(&ack_body)).is_err() {
-                    std::thread::sleep(Duration::from_millis(500));
-                    continue;
+            },
+            Some("collected") => {
+                // Our ACK may have landed while its reply was lost: confirm
+                // idempotently; only a token match prints the cached code.
+                if cached_response.is_some() {
+                    match ack(&collect_token) {
+                        Ok(_) => {
+                            let response = cached_response.unwrap_or_default();
+                            println!(
+                                "{{\"id\":{},\"status\":\"collected\",\"response\":{}}}",
+                                server::json_string(id),
+                                server::json_string(&response),
+                            );
+                            otp_collect_drop(id);
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            thread::sleep(Duration::from_millis(500));
+                            continue;
+                        }
+                    }
                 }
-                let response = server::json_string_value(&body, "response").unwrap_or_default();
-                println!(
-                    "{{\"id\":{},\"status\":\"collected\",\"response\":{}}}",
-                    server::json_string(id),
-                    server::json_string(&response),
-                );
+                otp_collect_drop(id);
                 return Ok(());
             }
-            Some("collected") => return Ok(()),
-            Some(other) => return Err(format!("hand-off ended as {other}")),
+            Some(other) => {
+                otp_collect_drop(id);
+                return Err(format!("hand-off ended as {other}"));
+            }
             None => return Err("unexpected reply from the daemon".into()),
         }
     }
+}
+
+/// The 0600 state file an in-flight collection resumes from, one per
+/// hand-off, in a 0700 directory next to the daemon's data.
+fn otp_collect_file(id: &str) -> PathBuf {
+    let base = env::var_os("CU_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(daemon_dir);
+    base.join("otp-collect").join(format!("{id}.json"))
+}
+
+fn otp_collect_load(id: &str) -> Option<(String, Option<String>)> {
+    let body = fs::read_to_string(otp_collect_file(id)).ok()?;
+    let token = server::json_string_value(&body, "collect_token")?;
+    let response = server::json_string_value(&body, "response");
+    Some((token, response))
+}
+
+fn otp_collect_save(id: &str, token: &str, response: Option<&str>) -> Result<(), String> {
+    let path = otp_collect_file(id);
+    let dir = path.parent().ok_or("no collect directory")?;
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    let response_field = match response {
+        Some(r) => format!("\"response\":{}", server::json_string(r)),
+        None => "\"response\":null".into(),
+    };
+    {
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&path).map_err(|e| e.to_string())?;
+        write!(
+            file,
+            "{{\"collect_token\":{},{response_field}}}",
+            server::json_string(token)
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn otp_collect_drop(id: &str) {
+    let _ = fs::remove_file(otp_collect_file(id));
+}
+
+/// A collect token from the OS CSPRNG - never time- or pid-derived.
+fn otp_collect_token() -> Result<String, String> {
+    let bytes = fs::read("/dev/urandom").map_err(|e| format!("CSPRNG unavailable: {e}"))?;
+    if bytes.len() < 24 {
+        return Err("CSPRNG short read".into());
+    }
+    Ok(bytes[..24].iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// `cu vault`: the credential and session store, from the CLI.

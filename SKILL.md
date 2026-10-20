@@ -79,10 +79,12 @@ Use `cu` when an agent needs a persistent local browser session.
     deliberate `--replace` overwrites it, and the reply says so. Never log,
     print or relay the seed or minted codes beyond typing them in.
     Collection is acknowledged: `cu otp wait` confirms receipt to the vault
-    before the code is printed, and the vault wipes it on that ACK (or when
-    the five-minute collection window closes). If a wait fails at the
-    delivery step, run `cu otp wait ID` again within the window - the vault
-    re-delivers to the same owner, never to anyone else.
+    before the code is printed, and the vault wipes it on that ACK. The
+    wait keeps its collect token (and a retrieved code) in a 0600 state
+    file, so a crashed or killed wait is genuinely resumed by running
+    `cu otp wait ID` again while the vault's delivery window (five minutes
+    - retention, not code validity; a TOTP code lives ~30 seconds) is open.
+    Never move the token or the code out of that file by hand.
     seals the seed into the domain's credential as a secret `totp` field and
     answers with only the issuer and account it stored. From then on
     `cu otp code` mints the codes, including the enrollment confirmation one.
