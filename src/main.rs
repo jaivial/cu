@@ -1334,8 +1334,51 @@ fn otp_collect_file(id: &str) -> PathBuf {
 /// of keeping a secret on disk indefinitely.
 const OTP_COLLECT_STATE_TTL_SECS: u64 = 10 * 60;
 
+/// Confined housekeeping of the collect directory: hand-off state past the
+/// TTL and orphaned temp files from interrupted saves are removed. This
+/// runs when a wait touches the directory - it is best-effort hygiene on
+/// use, NOT a guarantee that nothing outlives the delivery window: a
+/// crashed wait nobody reruns leaves its 0600 file (an expired token, a
+/// dead code) until the next `cu otp` invocation.
+fn otp_collect_sweep(dir: &std::path::Path) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".json") {
+            let stale = fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|body| server::json_number(&body, "saved_at"))
+                .map(|at| now - at as i64 > OTP_COLLECT_STATE_TTL_SECS as i64)
+                .unwrap_or(false);
+            if stale {
+                let _ = fs::remove_file(entry.path());
+            }
+        } else if name.starts_with('.') && name.contains(".tmp-") {
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| now - d.as_secs() as i64 > OTP_COLLECT_STATE_TTL_SECS as i64)
+                .unwrap_or(false);
+            if stale {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 fn otp_collect_load(id: &str) -> Option<(String, Option<String>)> {
     let path = otp_collect_file(id);
+    if let Some(dir) = path.parent() {
+        otp_collect_sweep(dir);
+    }
     let body = fs::read_to_string(&path).ok()?;
     let saved_at = server::json_number(&body, "saved_at").unwrap_or(0.0) as i64;
     let now = std::time::SystemTime::now()

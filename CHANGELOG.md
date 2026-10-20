@@ -62,8 +62,11 @@
   the token is not the owner's) ends the wait instead of retrying forever.
   The five-minute collection window is the vault's delivery retention, not
   the code's validity - a TOTP code lives about thirty seconds and is used
-  immediately; state files older than ten minutes are deleted on sight,
-  never resumed. Answers are single-use
+  immediately. State past ten minutes is deleted when a wait next touches
+  the collect directory (stale hand-off files and orphaned temp files
+  alike), never resumed - but note this is hygiene on use, not a guarantee:
+  a crashed wait nobody reruns can leave its 0600 file (expired token,
+  dead code) until the next `cu otp` invocation. Answers are single-use
   (enforced in the answering UPDATE, not in a check that could race),
   sealed at rest, handed to the polling agent exactly once and deleted in
   the same write; expiry is ten minutes by default (1-15 honoured). Rows a

@@ -84,10 +84,13 @@ Use `cu` when an agent needs a persistent local browser session.
     file (atomically written, symlink-safe), so a crashed or killed wait is
     genuinely resumed by running `cu otp wait ID` again while the vault's
     delivery window (five minutes - retention, not code validity; a TOTP
-    code lives ~30 seconds) is open. State older than ten minutes is
-    deleted on sight, never resumed, and a definitive vault refusal ends
-    the wait instead of retrying forever. Never move the token or the code
-    out of that file by hand.
+    code lives ~30 seconds) is open. State past ten minutes is deleted
+    when a wait next touches the directory, never resumed, and a definitive
+    vault refusal ends the wait instead of retrying forever. A crashed wait
+    nobody reruns can leave its 0600 file behind (an expired token, a dead
+    code) until the next `cu otp` run - same-UID, loopback-only hygiene,
+    not a guaranteed cleanup. Never move the token or the code out of that
+    file by hand.
     seals the seed into the domain's credential as a secret `totp` field and
     answers with only the issuer and account it stored. From then on
     `cu otp code` mints the codes, including the enrollment confirmation one.
