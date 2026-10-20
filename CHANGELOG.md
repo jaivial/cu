@@ -52,7 +52,10 @@
   connection or acknowledge it, and the stored value is wiped on the ACK -
   or by the reaper when the five-minute collection window closes, never
   re-exposed, never delivered to a second collector (at-most-once to one
-  owner with bounded redelivery, not exactly-once). Answers are single-use
+  owner with bounded redelivery, not exactly-once). The CLI proposes its
+  own collect token up front, so even the loss of the claim reply itself
+  leaves the token in the caller's hands; the ACK is idempotent, so a lost
+  ACK reply is safe to retry. Answers are single-use
   (enforced in the answering UPDATE, not in a check that could race),
   sealed at rest, handed to the polling agent exactly once and deleted in
   the same write; expiry is ten minutes by default (1-15 honoured). Rows a

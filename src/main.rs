@@ -1157,11 +1157,22 @@ fn otp(args: &[String], tab: Option<String>) -> Result<(), String> {
 /// a code the vault still holds for redelivery never reaches this
 /// transcript. A cut connection is retried by simply running
 /// `cu otp wait ID` again - the vault re-delivers to the same owner token
-/// as long as the window is open... except this process is gone by then, so
-/// the retry loop below covers the immediate failures instead.
+/// as long as the window is open.
 fn otp_wait(id: &str, timeout: f64) -> Result<(), String> {
     let deadline = std::time::Instant::now() + Duration::from_secs_f64(timeout);
-    let mut collect_token = String::new();
+    // Our own collect token, generated BEFORE any claim call: if the
+    // daemon's claim reply is lost on the wire we still hold it, and the
+    // next poll re-fetches the same code. Uniqueness per process run is
+    // all it needs; the vault stores only its hash.
+    let nonce = format!(
+        "claim-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let mut collect_token = nonce;
     loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
@@ -1179,33 +1190,25 @@ fn otp_wait(id: &str, timeout: f64) -> Result<(), String> {
                     collect_token = token;
                 }
                 if server::json_string_value(&body, "response").is_none() {
-                    if collect_token.is_empty() {
-                        return Err("this hand-off is being collected by another consumer".into());
-                    }
-                    continue;
+                    return Err(
+                        "this hand-off is collected elsewhere or its delivery window closed; \
+                         if it closed without reaching you, open a new hand-off"
+                            .into(),
+                    );
                 }
                 // ACK first, print after: the vault wipes the stored code
-                // only once delivery is confirmed. Bounded immediate retries
-                // cover a cut connection; after those, fail WITHOUT printing
-                // so the code never leaves the vault unacknowledged.
+                // only once delivery is confirmed. The ACK is idempotent,
+                // so a lost ACK reply is safe to retry; a failed ACK loops
+                // back (the vault re-delivers to our token) until the
+                // overall deadline, never printing an unacknowledged code.
                 let ack_body = format!(
                     "{{\"collect_token\":{}}}",
                     server::json_string(&collect_token)
                 );
                 let ack_path = format!("/v1/vault/otp/requests/{id}/ack");
-                let mut acked = request("POST", &ack_path, Some(&ack_body)).is_ok();
-                for _ in 0..2 {
-                    if acked {
-                        break;
-                    }
+                if request("POST", &ack_path, Some(&ack_body)).is_err() {
                     std::thread::sleep(Duration::from_millis(500));
-                    acked = request("POST", &ack_path, Some(&ack_body)).is_ok();
-                }
-                if !acked {
-                    return Err(format!(
-                        "could not confirm delivery; the code stays in the vault - \
-                         run `cu otp wait {id}` again within its collection window to retry"
-                    ));
+                    continue;
                 }
                 let response = server::json_string_value(&body, "response").unwrap_or_default();
                 println!(

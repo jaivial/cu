@@ -742,9 +742,11 @@ impl Vault {
     /// the connection drops mid-reply:
     ///
     /// 1. The first collect claims the row (answered -> collecting) and
-    ///    returns the response together with a one-owner collect token.
-    ///    Only that token can re-fetch the response (a retry after a cut
-    ///    connection) or acknowledge it; another collector never sees it.
+    ///    returns the response together with a one-owner collect token -
+    ///    ideally supplied by the caller, so a lost claim reply still
+    ///    leaves the token in the caller's hands. Only that token can
+    ///    re-fetch the response (a retry after a cut connection) or
+    ///    acknowledge it; another collector never sees it.
     /// 2. The ACK ([`Vault::ack_otp_request`]) wipes the stored value and
     ///    closes the hand-off. Without it the reaper closes the row once
     ///    the collect window ([`OTP_COLLECT_TTL_SECS`]) ends, wiping the
@@ -804,8 +806,13 @@ impl Vault {
         }
         if collect && status == "answered" {
             // Claim first, atomically: exactly one collector flips
-            // answered -> collecting and gets the owner token.
-            let token = format!("otc-{}", hex_encode(&rand_bytes::<24>()));
+            // answered -> collecting. The caller SHOULD supply its own
+            // collect token (a nonce it generated BEFORE the call): if this
+            // very reply is lost on the wire, the caller still holds the
+            // token and simply re-fetches. Without one, the server mints it.
+            let token = collect_token
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("otc-{}", hex_encode(&rand_bytes::<24>())));
             let claimed = conn
                 .execute(
                     "UPDATE otp_requests
@@ -840,17 +847,31 @@ impl Vault {
     /// is the stored value wiped and the hand-off closed; without the
     /// owning collect token this changes nothing.
     pub fn ack_otp_request(&self, id: i64, collect_token: &str) -> Result<bool, String> {
-        let n = self
-            .connect()?
+        let conn = self.connect()?;
+        let n = conn
             .execute(
                 "UPDATE otp_requests
-                 SET status='collected', response=NULL, seed=NULL,
-                     collect_token_hash=NULL, collect_claimed_at=NULL
+                 SET status='collected', response=NULL, seed=NULL, collect_claimed_at=NULL
                  WHERE id=?1 AND status='collecting' AND collect_token_hash=?2",
                 rusqlite::params![id, token_hash(collect_token)],
             )
             .map_err(|e| e.to_string())?;
-        Ok(n > 0)
+        if n > 0 {
+            return Ok(true);
+        }
+        // Idempotent: the ACK's own reply may have been lost after the wipe
+        // landed. The token hash is kept on the closed row (the reaper
+        // clears it later) exactly so a repeated ACK can be told apart from
+        // a foreign one.
+        let already = conn
+            .query_row(
+                "SELECT 1 FROM otp_requests
+                 WHERE id=?1 AND status='collected' AND collect_token_hash=?2",
+                rusqlite::params![id, token_hash(collect_token)],
+                |row| row.get::<_, i32>(0),
+            )
+            .is_ok();
+        Ok(already)
     }
 
     /// Give up a pending hand-off (the agent took another path).
