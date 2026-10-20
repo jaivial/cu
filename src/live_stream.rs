@@ -694,3 +694,17 @@ fn sha1(data: &[u8]) -> [u8; 20] {
     }
     out
 }
+
+/// The `frame-ancestors` value for the viewer page: the one origin in
+/// `CU_LIVE_FRAME_ORIGIN` when it is a plain `https://host[:port]`, else
+/// `'none'`. No wildcards, paths or lists are accepted.
+pub fn frame_ancestors() -> String {
+    let raw = std::env::var("CU_LIVE_FRAME_ORIGIN").unwrap_or_default();
+    let raw = raw.trim();
+    let ok = raw.strip_prefix("https://").is_some_and(|h| {
+        !h.is_empty()
+            && h.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
+    });
+    if ok { raw.to_string() } else { "'none'".to_string() }
+}
