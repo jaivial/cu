@@ -190,6 +190,12 @@ pub fn serve(mut stream: TcpStream, head: &str, path: &str, bearer_ok: bool, sta
         Ok(t) => t,
         Err(e) => return refuse(&mut stream, "400 Bad Request", &e),
     };
+    // `mode=view` is the read-only viewer, the only one that may sit in a frame.
+    // It can never take control, and it does not push out a person who has.
+    let readonly = form_value(query, "mode") == "view";
+    if readonly && taken(&tab) {
+        return refuse(&mut stream, "409 Conflict", "a person is controlling this tab in another window");
+    }
     let quality = form_value(query, "q").parse::<u32>().unwrap_or(60).clamp(20, 90);
     let max_width = form_value(query, "w").parse::<u32>().unwrap_or(1280).clamp(320, 2560);
 
@@ -215,6 +221,7 @@ pub fn serve(mut stream: TcpStream, head: &str, path: &str, bearer_ok: bool, sta
         window: Mutex::new(Window::default()),
         size: Mutex::new((0.0, 0.0)),
         controlling: AtomicBool::new(false),
+        readonly,
         tab_key: tab_key.clone(),
         me,
     });
@@ -267,6 +274,8 @@ struct Shared {
     size: Mutex<(f64, f64)>,
     /// Set by the viewer's `take`, cleared by `release`.
     controlling: AtomicBool,
+    /// A read-only viewer: `take` and every input are refused by the server.
+    readonly: bool,
     tab_key: String,
     me: u64,
 }
@@ -508,6 +517,9 @@ fn handle_message(msg: &str, shared: &Shared, tab: &Tab, focused: &mut bool) {
     match kind.as_str() {
         "ack" => shared.acked(),
         "ping" => shared.text("{\"t\":\"pong\"}"),
+        "take" | "release" | "mouse" | "wheel" | "key" | "text" if shared.readonly => {
+            shared.text("{\"t\":\"denied\",\"readonly\":true}");
+        }
         "take" => {
             // Exclusive: from here the daemon refuses the agent's automatic
             // actions on this tab until the person gives it back.

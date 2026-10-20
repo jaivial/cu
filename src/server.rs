@@ -766,14 +766,17 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
     if let Some(cookie) = set_cookie {
         head.push_str(&format!("Set-Cookie: {cookie}\r\n"));
     }
-    // Only the live viewer page may be framed, and only by the one origin
-    // named in CU_LIVE_FRAME_ORIGIN (an exact `https://host`). Without it
-    // nothing may frame it. Other routes keep their current headers.
-    if path.split('?').next() == Some("/vault/live2") {
-        head.push_str(&format!(
+    // Only the read-only viewer page may be framed, and only by the one origin
+    // named in CU_LIVE_FRAME_ORIGIN (an exact `https://host`); without it
+    // nothing may frame it. The page with controls, /vault/live2, may never be
+    // framed. Other routes keep their current headers.
+    match path.split('?').next() {
+        Some("/vault/live2/view") => head.push_str(&format!(
             "Content-Security-Policy: frame-ancestors {}\r\n",
             crate::live_stream::frame_ancestors()
-        ));
+        )),
+        Some("/vault/live2") => head.push_str("Content-Security-Policy: frame-ancestors 'none'\r\n"),
+        _ => {}
     }
     head.push_str("\r\n");
     let _ = write!(stream, "{head}{response}");
@@ -4784,6 +4787,13 @@ fn vault_route_with(
             "200 OK",
             "text/html; charset=utf-8",
             crate::live_stream::PAGE.into(),
+            None,
+        ),
+        // The same page, fixed to read-only: the one a frame may show.
+        ("GET", "/vault/live2/view") => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            crate::live_stream::PAGE.replacen("<body>", "<body data-mode=\"view\">", 1),
             None,
         ),
         ("POST", "/v1/vault/ui/login") => {

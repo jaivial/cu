@@ -26,6 +26,14 @@
   #bar .row > * { flex: 1; }
   #text { flex: 3; min-width: 0; }
   #status { font-size: .8rem; color: #8b93a7; padding: 0 .2rem; word-break: break-all; }
+  /* Read-only mode (served at /vault/live2/view): no controls at all, the picture fits the frame. */
+  body[data-mode=view] #bar, body[data-mode=view] header a { display: none; }
+  body[data-mode=view] header { position: static; padding: .25rem .4rem; }
+  body[data-mode=view] header h1 { display: none; }
+  body[data-mode=view] header select { min-height: 32px; font-size: 14px; flex: 1; max-width: none !important; }
+  body[data-mode=view] #stage { padding: .25rem; display: flex; align-items: center; justify-content: center; overflow: hidden; min-height: 0; }
+  body[data-mode=view] #view { width: auto; height: auto; max-width: 100%; max-height: calc(100dvh - 4.2rem); }
+  body[data-mode=view] #status { position: fixed; left: 0; right: 0; bottom: 0; background: #171a21; padding: .15rem .4rem; font-size: .7rem; }
 </style>
 </head>
 <body>
@@ -34,9 +42,9 @@
   <select id="tabs" aria-label="Tab" style="max-width:6rem;padding:0 .4rem"></select>
   <a href="/vault/app" style="color:#8b93a7">Vault</a>
 </header>
+<div id="status">Connecting…</div>
 <div id="stage"><canvas id="view" tabindex="0" width="16" height="9"></canvas></div>
 <div id="bar">
-  <div id="status">Connecting…</div>
   <div class="row">
     <input id="text" placeholder="Type here, then Send" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false">
     <button id="send" class="primary">Send</button>
@@ -46,6 +54,7 @@
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
+const viewOnly = document.body.dataset.mode === 'view';
 const cv = $('view'), ctx = cv.getContext('2d');
 let ended = false, ws = null, tab = '', held = false, controlling = false, closedByUs = false, delay = 1000;
 let frames = 0, bytes = 0, shown = 0, lastTick = performance.now(), fps = 0, kbps = 0, size = '';
@@ -70,6 +79,9 @@ async function loadTabs() {
     const r = await fetch('/v1/vault/live/tabs');
     if (r.status === 401) { signedOut(); return; }
     const tabs = ((await r.json()).tabs || []).filter(t => !t.url.startsWith('chrome'));
+    // A blank tab never repaints, so it shows 0 fps: prefer a tab with a page in it.
+    const shown = tabs.filter(t => t.url !== 'about:blank');
+    if (shown.length) { tabs.length = 0; tabs.push(...shown); }
     // Page titles and URLs come from sites the agent visited: text only, never markup.
     const sel = $('tabs');
     sel.replaceChildren(...tabs.map(t => new Option((t.title || t.url).slice(0, 28), t.id)));
@@ -95,14 +107,14 @@ function connect() {
   if (ended) return;
   closedByUs = false;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(proto + '//' + location.host + '/v1/vault/live/stream' + (tab ? '?tab=' + encodeURIComponent(tab) : ''));
+  ws = new WebSocket(proto + '//' + location.host + '/v1/vault/live/stream' + '?' + (viewOnly ? 'mode=view&' : '') + (tab ? 'tab=' + encodeURIComponent(tab) : ''));
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => { delay = 1000; controlling = false; status(); };
   ws.onmessage = async (ev) => {
     if (typeof ev.data === 'string') {
       const m = JSON.parse(ev.data);
       if (m.t === 'control') { if ('held' in m) held = !!m.held; if ('controlling' in m) controlling = !!m.controlling; status(); }
-      else if (m.t === 'denied') { controlling = false; status('Press Take control first.'); }
+      else if (m.t === 'denied') { controlling = false; status(m.readonly ? 'Read-only view.' : 'Press Take control first.'); }
       else if (m.t === 'reopening') status('Reconnecting to the browser…');
       else if (m.t === 'error') status(m.error);
       return;
