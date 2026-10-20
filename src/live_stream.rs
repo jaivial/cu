@@ -514,12 +514,15 @@ fn dispatch(tab: &Tab, method: &str, params: &str) {
 
 fn handle_message(msg: &str, shared: &Shared, tab: &Tab, focused: &mut bool) {
     let kind = json_string_value(msg, "t").unwrap_or_default();
+    // A read-only viewer may only ack frames and ping. Anything else, known or
+    // not, is refused before it reaches a handler.
+    if shared.readonly && !matches!(kind.as_str(), "ack" | "ping") {
+        shared.text("{\"t\":\"denied\",\"readonly\":true}");
+        return;
+    }
     match kind.as_str() {
         "ack" => shared.acked(),
         "ping" => shared.text("{\"t\":\"pong\"}"),
-        "take" | "release" | "mouse" | "wheel" | "key" | "text" if shared.readonly => {
-            shared.text("{\"t\":\"denied\",\"readonly\":true}");
-        }
         "take" => {
             // Exclusive: from here the daemon refuses the agent's automatic
             // actions on this tab until the person gives it back.
@@ -719,4 +722,14 @@ pub fn frame_ancestors() -> String {
                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
     });
     if ok { raw.to_string() } else { "'none'".to_string() }
+}
+
+/// The viewer page in control mode. The HTML ships read-only
+/// (`data-mode="view"`); control is the one explicit replacement, and if it
+/// cannot be made the page is refused rather than served in either mode by
+/// accident.
+pub fn control_page() -> Option<String> {
+    const VIEW: &str = "<body data-mode=\"view\">";
+    PAGE.contains(VIEW)
+        .then(|| PAGE.replacen(VIEW, "<body data-mode=\"control\">", 1))
 }

@@ -36,7 +36,7 @@
   body[data-mode=view] #status { position: fixed; left: 0; right: 0; bottom: 0; background: #171a21; padding: .15rem .4rem; font-size: .7rem; }
 </style>
 </head>
-<body>
+<body data-mode="view">
 <header>
   <h1 id="title">cu live stream</h1>
   <select id="tabs" aria-label="Tab" style="max-width:6rem;padding:0 .4rem"></select>
@@ -54,7 +54,7 @@
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
-const viewOnly = document.body.dataset.mode === 'view';
+const viewOnly = document.body.dataset.mode !== 'control';
 const cv = $('view'), ctx = cv.getContext('2d');
 let ended = false, ws = null, tab = '', held = false, controlling = false, closedByUs = false, delay = 1000;
 let frames = 0, bytes = 0, shown = 0, lastTick = performance.now(), fps = 0, kbps = 0, size = '';
@@ -80,8 +80,8 @@ async function loadTabs() {
     if (r.status === 401) { signedOut(); return; }
     const tabs = ((await r.json()).tabs || []).filter(t => !t.url.startsWith('chrome'));
     // A blank tab never repaints, so it shows 0 fps: prefer a tab with a page in it.
-    const shown = tabs.filter(t => t.url !== 'about:blank');
-    if (shown.length) { tabs.length = 0; tabs.push(...shown); }
+    const withPage = tabs.filter(t => t.url !== 'about:blank');
+    if (withPage.length) { tabs.length = 0; tabs.push(...withPage); }
     // Page titles and URLs come from sites the agent visited: text only, never markup.
     const sel = $('tabs');
     sel.replaceChildren(...tabs.map(t => new Option((t.title || t.url).slice(0, 28), t.id)));

@@ -4783,17 +4783,22 @@ fn vault_route_with(
             None,
         ),
         ("GET", "/vault/otp") => ("200 OK", "text/html; charset=utf-8", OTP_PAGE.into(), None),
-        ("GET", "/vault/live2") => (
-            "200 OK",
-            "text/html; charset=utf-8",
-            crate::live_stream::PAGE.into(),
-            None,
-        ),
-        // The same page, fixed to read-only: the one a frame may show.
+        // Control page: the one explicit route. If the page cannot be switched to
+        // control mode it is not served at all, never served in the wrong mode.
+        ("GET", "/vault/live2") => match crate::live_stream::control_page() {
+            Some(page) => ("200 OK", "text/html; charset=utf-8", page, None),
+            None => (
+                "500 Internal Server Error",
+                "text/plain; charset=utf-8",
+                "viewer page template is broken".into(),
+                None,
+            ),
+        },
+        // The page as shipped is read-only: the one a frame may show.
         ("GET", "/vault/live2/view") => (
             "200 OK",
             "text/html; charset=utf-8",
-            crate::live_stream::PAGE.replacen("<body>", "<body data-mode=\"view\">", 1),
+            crate::live_stream::PAGE.into(),
             None,
         ),
         ("POST", "/v1/vault/ui/login") => {
