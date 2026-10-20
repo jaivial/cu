@@ -24,8 +24,8 @@
 //! - The viewer may have `FRAME_WINDOW` frames in flight. Past that, only the
 //!   newest frame is kept and sent once an ack frees a slot: a slow viewer
 //!   skips frames instead of building a queue.
-//! - One viewer per tab at a time: a new connection takes over and the older
-//!   one is closed, so a stale page can never keep driving the browser.
+//! - One viewer per tab at a time (each tab has its own count): a new
+//!   connection to the same tab takes over and the older one is closed, so a stale page can never keep driving the browser.
 //!
 //! Binary frame to the viewer: `0x01`, seq (u32 BE), CSS width (u16 BE), CSS
 //! height (u16 BE), then the JPEG. Everything else is a JSON text message.
@@ -61,8 +61,16 @@ const REOPEN_LIMIT: u32 = 3;
 const MAX_CLIENT_MESSAGE: usize = 64 * 1024;
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-/// Counts viewers; a viewer whose number is no longer the latest must stop.
+/// Counts viewers across all tabs, for unique numbers.
 static VIEWER: AtomicU64 = AtomicU64::new(0);
+
+/// The current viewer of each tab. A viewer whose number is no longer the one
+/// listed for its tab must stop; a viewer of another tab is not affected.
+fn viewers() -> &'static Mutex<std::collections::HashMap<String, u64>> {
+    static VIEWERS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    VIEWERS.get_or_init(Default::default)
+}
 
 /// Whether this request asks for the live stream socket.
 pub fn wants(method: &str, path: &str, head: &str) -> bool {
@@ -151,12 +159,15 @@ pub fn serve(mut stream: TcpStream, head: &str, path: &str, bearer_ok: bool, sta
     let Ok(writer) = stream.try_clone() else { return };
 
     let me = VIEWER.fetch_add(1, Ordering::SeqCst) + 1;
+    let tab_key = format!("{}:{}", tab.cdp_port, tab.target.as_deref().unwrap_or("default"));
+    viewers().lock().unwrap_or_else(|e| e.into_inner()).insert(tab_key.clone(), me);
     let shared = Arc::new(Shared {
         writer: Mutex::new(writer),
         stop: AtomicBool::new(false),
         window: Mutex::new(Window::default()),
         size: Mutex::new((0.0, 0.0)),
         controlling: AtomicBool::new(false),
+        tab_key: tab_key.clone(),
         me,
     });
     let pusher = {
@@ -170,6 +181,12 @@ pub fn serve(mut stream: TcpStream, head: &str, path: &str, bearer_ok: bool, sta
     read_input(&mut stream, &shared, &tab);
     shared.stop.store(true, Ordering::SeqCst);
     let _ = pusher.join();
+    {
+        let mut all = viewers().lock().unwrap_or_else(|e| e.into_inner());
+        if all.get(&shared.tab_key) == Some(&me) {
+            all.remove(&shared.tab_key);
+        }
+    }
     let _ = shared.write(0x8, &[0x03, 0xe8]);
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
@@ -200,12 +217,18 @@ struct Shared {
     size: Mutex<(f64, f64)>,
     /// Set by the viewer's `take`, cleared by `release`.
     controlling: AtomicBool,
+    tab_key: String,
     me: u64,
 }
 
 impl Shared {
     fn live(&self) -> bool {
-        !self.stop.load(Ordering::SeqCst) && VIEWER.load(Ordering::SeqCst) == self.me
+        !self.stop.load(Ordering::SeqCst)
+            && viewers()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&self.tab_key)
+                .is_some_and(|current| *current == self.me)
     }
 
     fn write(&self, opcode: u8, payload: &[u8]) -> std::io::Result<()> {

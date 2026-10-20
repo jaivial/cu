@@ -55,7 +55,9 @@ async function loadTabs() {
     const r = await fetch('/v1/vault/live/tabs');
     if (r.status === 401) { location.href = '/vault'; return; }
     const tabs = ((await r.json()).tabs || []).filter(t => !t.url.startsWith('chrome'));
-    $('tabs').innerHTML = tabs.map(t => `<option value="${t.id}">${(t.title || t.url).slice(0, 28)}</option>`).join('');
+    // Page titles and URLs come from sites the agent visited: text only, never markup.
+    const sel = $('tabs');
+    sel.replaceChildren(...tabs.map(t => new Option((t.title || t.url).slice(0, 28), t.id)));
     if (!tab && tabs.length) tab = (tabs.find(t => t.default) || tabs[0]).id;
     $('tabs').value = tab;
   } catch (e) {}
@@ -104,10 +106,18 @@ function connect() {
     // Tell the server the frame is drawn so it can send the next one.
     send({ t: 'ack', seq: v.getUint32(1) });
   };
-  ws.onclose = () => {
+  ws.onclose = async () => {
     controlling = false;
+    if (closedByUs) return;
+    // A refused upgrade shows up as a plain close. Ask the API why before retrying:
+    // a logged-out or expired session goes to the login page, never into a retry loop.
+    try {
+      const r = await fetch('/v1/vault/live/tabs');
+      if (r.status === 401) { location.href = '/vault'; return; }
+      if (r.status === 403 || r.status === 421) { status('Refused by the server.'); return; }
+    } catch (e) {}
     status('Reconnecting…');
-    if (!closedByUs) setTimeout(connect, delay), delay = Math.min(delay * 2, 15000);
+    setTimeout(connect, delay); delay = Math.min(delay * 2, 15000);
   };
 }
 setInterval(() => {
