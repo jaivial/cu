@@ -92,10 +92,24 @@ fn held_tabs() -> &'static Mutex<std::collections::HashMap<String, u64>> {
 /// Whether a person holds this tab in the live viewer. The route table asks
 /// this before it lets an automatic action through.
 pub fn taken(tab: &Tab) -> bool {
-    held_tabs()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains_key(&key_of(tab))
+    let held = held_tabs().lock().unwrap_or_else(|e| e.into_inner());
+    if tab.target.is_some() {
+        return held.contains_key(&key_of(tab));
+    }
+    // The agent usually names no tab, while the viewer always names a real
+    // one. Resolve the default tab to the page it is pinned to. When it is
+    // not pinned yet the page is ambiguous, so any held tab on this browser
+    // counts (fail closed).
+    match crate::server::pinned_default_target(tab.cdp_port) {
+        Some(id) => {
+            held.contains_key(&format!("{}:{}", tab.cdp_port, id))
+                || held.contains_key(&key_of(tab))
+        }
+        None => {
+            let prefix = format!("{}:", tab.cdp_port);
+            held.keys().any(|k| k.starts_with(&prefix))
+        }
+    }
 }
 
 /// Give the tab back, if this viewer is the one holding it.
