@@ -66,7 +66,7 @@
   the collect directory (stale hand-off files and orphaned temp files
   alike), never resumed - but note this is hygiene on use, not a guarantee:
   a crashed wait nobody reruns can leave its 0600 file (expired token,
-  dead code) until the next `cu otp` invocation. The The
+  dead code) until the next `cu otp` invocation. The
   hand-off page only reveals its QR block once the image has actually
   loaded - a request without a usable setup QR keeps the code-only
   layout, no broken image. Answers are single-use
