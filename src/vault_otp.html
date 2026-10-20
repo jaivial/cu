@@ -41,6 +41,7 @@
   h1 { font-size: 1.35rem; font-weight: 700; letter-spacing: -.03em; line-height: 1.15; margin: 0 0 .35rem; }
   .sub { color: var(--muted); font-size: .92rem; margin: 0 0 1.4rem; }
   .sub b { color: var(--ink); font-weight: 600; }
+  [hidden] { display: none !important; }
   .qr {
     display: grid; place-items: center; background: var(--white);
     border: 1px solid var(--line); border-radius: 16px;
@@ -129,6 +130,10 @@ const token = new URLSearchParams(location.search).get('t') || '';
 const selfUrl = location.pathname + location.search;
 history.replaceState(null, '', location.pathname);
 let expiresAt = 0, finished = false;
+// QR lifecycle: idle -> loading -> shown | failed. The box only appears
+// once the image has really loaded; a missing or spent seed keeps the
+// code-only layout instead of a broken image.
+let qrState = 'idle';
 
 function end(icon, title, sub) {
   finished = true;
@@ -189,10 +194,15 @@ async function lookup() {
     $('sub').appendChild(reason);
   }
   $('who').textContent = info.requested_by ? `asked by ${info.requested_by}` : '';
-  if (info.kind === 'setup' && info.has_seed && !$('qr').src) {
+  if (info.kind === 'setup' && info.has_seed && qrState === 'idle') {
+    qrState = 'loading';
+    $('qr').onload = () => {
+      qrState = 'shown';
+      $('qr-box').hidden = false;
+      $('title').textContent = 'Scan, then send the code';
+    };
+    $('qr').onerror = () => { qrState = 'failed'; };
     $('qr').src = '/v1/vault/otp/qr?t=' + encodeURIComponent(token);
-    $('qr-box').hidden = false;
-    $('title').textContent = 'Scan, then send the code';
   }
 }
 

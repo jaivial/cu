@@ -66,7 +66,10 @@
   the collect directory (stale hand-off files and orphaned temp files
   alike), never resumed - but note this is hygiene on use, not a guarantee:
   a crashed wait nobody reruns can leave its 0600 file (expired token,
-  dead code) until the next `cu otp` invocation. Answers are single-use
+  dead code) until the next `cu otp` invocation. The The
+  hand-off page only reveals its QR block once the image has actually
+  loaded - a request without a usable setup QR keeps the code-only
+  layout, no broken image. Answers are single-use
   (enforced in the answering UPDATE, not in a check that could race),
   sealed at rest, handed to the polling agent exactly once and deleted in
   the same write; expiry is ten minutes by default (1-15 honoured). Rows a
