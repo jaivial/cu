@@ -23,9 +23,11 @@
     hand-off page. The reply names only the issuer and account it was stored
     for. Capture refuses to guess: the tab must actually be on the claimed
     domain, the QR's issuer must match that host, several different setup
-    QRs on one page are an error, and a credential that already holds a
-    live seed is only replaced with an explicit `--replace` (the reply then
-    says `replaced: true` and names the previous account).
+    QRs on one page are an error, the capture always names its tab
+    explicitly (`--tab`), and a credential that already holds a live seed
+    refuses the overwrite: the refusal names the existing setup so the user
+    can confirm the replacement first, and only then `--replace` applies
+    (the reply says `replaced: true` and names the previous account).
   - The challenge hint on a first-party code page now points here: seed →
     `cu otp code`, no seed → `cu otp request`, live takeover stays the
     fallback.

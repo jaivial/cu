@@ -965,12 +965,24 @@ impl Vault {
             })
             .collect();
         if !existing.is_empty() && !force {
-            return Err(
-                "this credential already holds a live TOTP seed; re-run with force \
-                 (cu otp capture --replace) only after explicitly confirming the \
-                 existing 2FA setup is being replaced"
-                    .into(),
-            );
+            // Name the setup at stake (metadata only, never the seed) so the
+            // caller can put the replacement in front of the user and get
+            // their explicit confirmation; a flag alone is not consent.
+            let account = existing
+                .first()
+                .and_then(|f| crate::server::json_string_value(f, "value"))
+                .and_then(|old_uri| crate::otp::parse(&old_uri).ok())
+                .map(|old| match (old.issuer.is_empty(), old.account.is_empty()) {
+                    (false, false) => format!("{}:{}", old.issuer, old.account),
+                    (false, true) => old.issuer,
+                    _ => old.account,
+                })
+                .unwrap_or_else(|| "an unknown account".into());
+            return Err(format!(
+                "this credential already holds a live TOTP seed for {account}; replacing an \
+                 active 2FA setup needs the user's explicit confirmation - confirm with them, \
+                 then re-run with force (cu otp capture --replace)"
+            ));
         }
         // The account the outgoing seed named, for the caller's report.
         // Metadata only - the seed itself is never returned.

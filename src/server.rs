@@ -5342,13 +5342,17 @@ fn otp_capture(
         return error_json(&e);
     }
     let wanted = form_value(query(path), "tab");
-    let tab = if wanted.is_empty() {
-        Tab::default_for(state.cdp_port)
-    } else {
-        match named_tab(state.cdp_port, &wanted) {
-            Ok(tab) => tab,
-            Err(e) => return error_json(&e),
-        }
+    if wanted.is_empty() {
+        // A seed capture never falls back to whatever tab happens to be
+        // default: the caller names the tab sitting on the service's setup
+        // page, so a seed can only come from a deliberately chosen page.
+        return error_json(
+            "capture needs an explicit --tab naming the tab on the service's setup page",
+        );
+    }
+    let tab = match named_tab(state.cdp_port, &wanted) {
+        Ok(tab) => tab,
+        Err(e) => return error_json(&e),
     };
     let domain = {
         let asked = json_value(body, "domain").unwrap_or_default();

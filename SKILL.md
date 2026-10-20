@@ -72,8 +72,9 @@ Use `cu` when an agent needs a persistent local browser session.
     through a conversation.
 11. Setting up 2FA on a site (a setup QR is on screen): capture it instead of
     photographing it — `cu otp capture --domain example.com` decodes the QR
-    from a tab that must actually be on that domain (it refuses mismatched
-    pages, mismatched issuers and pages with several different setup QRs).
+    from a tab you name explicitly (`--tab T`) and that must actually be on
+    that domain (it refuses mismatched pages, mismatched issuers and pages
+    with several different setup QRs).
     If the credential already has a live seed, capture refuses; only a
     deliberate `--replace` overwrites it, and the reply says so. Never log,
     print or relay the seed or minted codes beyond typing them in.
