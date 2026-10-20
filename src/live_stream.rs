@@ -21,6 +21,11 @@
 //!   revoke.
 //! - The viewer only watches until it sends `take`. Input from a viewer that
 //!   has not taken control is ignored.
+//! - `take` is exclusive: while a person holds a tab, the daemon refuses the
+//!   agent's automatic actions on it with a 409 (see [`taken`]; reads stay
+//!   allowed). Control ends on `release`, when the socket closes for any
+//!   reason, or when the session is revoked, so it cannot get stuck. A
+//!   command the agent had already sent when `take` arrived may still finish.
 //! - The viewer may have `FRAME_WINDOW` frames in flight. Past that, only the
 //!   newest frame is kept and sent once an ack frees a slot: a slow viewer
 //!   skips frames instead of building a queue.
@@ -70,6 +75,35 @@ fn viewers() -> &'static Mutex<std::collections::HashMap<String, u64>> {
     static VIEWERS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, u64>>> =
         std::sync::OnceLock::new();
     VIEWERS.get_or_init(Default::default)
+}
+
+/// The key of a tab in the viewer and control tables.
+fn key_of(tab: &Tab) -> String {
+    format!("{}:{}", tab.cdp_port, tab.target.as_deref().unwrap_or("default"))
+}
+
+/// Tabs a person holds through the viewer, with the viewer that holds each.
+fn held_tabs() -> &'static Mutex<std::collections::HashMap<String, u64>> {
+    static HELD: std::sync::OnceLock<Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    HELD.get_or_init(Default::default)
+}
+
+/// Whether a person holds this tab in the live viewer. The route table asks
+/// this before it lets an automatic action through.
+pub fn taken(tab: &Tab) -> bool {
+    held_tabs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&key_of(tab))
+}
+
+/// Give the tab back, if this viewer is the one holding it.
+fn give_back(shared: &Shared) {
+    let mut held = held_tabs().lock().unwrap_or_else(|e| e.into_inner());
+    if held.get(&shared.tab_key) == Some(&shared.me) {
+        held.remove(&shared.tab_key);
+    }
 }
 
 /// Whether this request asks for the live stream socket.
@@ -159,7 +193,7 @@ pub fn serve(mut stream: TcpStream, head: &str, path: &str, bearer_ok: bool, sta
     let Ok(writer) = stream.try_clone() else { return };
 
     let me = VIEWER.fetch_add(1, Ordering::SeqCst) + 1;
-    let tab_key = format!("{}:{}", tab.cdp_port, tab.target.as_deref().unwrap_or("default"));
+    let tab_key = key_of(&tab);
     viewers().lock().unwrap_or_else(|e| e.into_inner()).insert(tab_key.clone(), me);
     let shared = Arc::new(Shared {
         writer: Mutex::new(writer),
@@ -181,6 +215,8 @@ pub fn serve(mut stream: TcpStream, head: &str, path: &str, bearer_ok: bool, sta
     read_input(&mut stream, &shared, &tab);
     shared.stop.store(true, Ordering::SeqCst);
     let _ = pusher.join();
+    shared.controlling.store(false, Ordering::SeqCst);
+    give_back(&shared);
     {
         let mut all = viewers().lock().unwrap_or_else(|e| e.into_inner());
         if all.get(&shared.tab_key) == Some(&me) {
@@ -365,6 +401,8 @@ fn push_frames(
                 if token.is_some() && !session_alive(data_dir, token) {
                     shared.text("{\"t\":\"error\",\"error\":\"vault session ended\"}");
                     shared.stop.store(true, Ordering::SeqCst);
+                    shared.controlling.store(false, Ordering::SeqCst);
+                    give_back(shared);
                     // Closes the viewer's socket, which ends its reader too.
                     let _ = shared.writer.lock().map(|w| w.shutdown(std::net::Shutdown::Both));
                     break 'connection;
@@ -457,11 +495,18 @@ fn handle_message(msg: &str, shared: &Shared, tab: &Tab, focused: &mut bool) {
         "ack" => shared.acked(),
         "ping" => shared.text("{\"t\":\"pong\"}"),
         "take" => {
+            // Exclusive: from here the daemon refuses the agent's automatic
+            // actions on this tab until the person gives it back.
+            held_tabs()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(shared.tab_key.clone(), shared.me);
             shared.controlling.store(true, Ordering::SeqCst);
             shared.text("{\"t\":\"control\",\"controlling\":true}");
         }
         "release" => {
             shared.controlling.store(false, Ordering::SeqCst);
+            give_back(shared);
             *focused = false;
             let released = crate::challenge::release(tab);
             shared.text(&format!("{{\"t\":\"released\",\"released\":{released}}}"));

@@ -974,6 +974,23 @@ fn route_with(
     } else {
         Tab::default_for(state.cdp_port)
     };
+    // A person holds this tab in the live viewer: no automatic interaction
+    // until they give it back (reads stay allowed).
+    if matches!(
+        (method, path),
+        ("POST", "/v1/navigate")
+            | ("POST", "/v1/act")
+            | ("POST", "/v1/click")
+            | ("POST", "/v1/type")
+            | ("POST", "/v1/upload")
+    ) && crate::live_stream::taken(&tab)
+    {
+        return (
+            "409 Conflict",
+            "application/json",
+            "{\"error\":\"a person has taken control of this tab in the live viewer; automatic actions are paused until they hand it back\"}".into(),
+        );
+    }
     // A person is completing a challenge in this tab: no automatic
     // interaction until a re-check shows it cleared (reads stay allowed, so
     // the agent can still look).
