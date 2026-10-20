@@ -1179,6 +1179,11 @@ fn otp(args: &[String], tab: Option<String>) -> Result<(), String> {
 /// validity - a TOTP code lives about 30 seconds, so the answer is
 /// collected and used immediately.
 fn otp_wait(id: &str, timeout: f64) -> Result<(), String> {
+    // The id builds a file path: mirror the server's i64 check before it
+    // ever touches the filesystem.
+    if id.parse::<i64>().is_err() {
+        return Err("request id must be a number".into());
+    }
     let deadline = Instant::now() + Duration::from_secs_f64(timeout);
     let (collect_token, mut cached_response) = match otp_collect_load(id) {
         Some((token, response)) => (token, response),
@@ -1189,6 +1194,10 @@ fn otp_wait(id: &str, timeout: f64) -> Result<(), String> {
         }
     };
     let header = ("X-Cu-Otp-Collect-Token", collect_token.as_str());
+    // The daemon answers a definitive refusal as a JSON error body (a 400);
+    // a transport cut surfaces as an OS error string. Only the latter is
+    // worth retrying - a refusal is terminal for this collection.
+    let terminal = |e: &str| e.starts_with("{\"error\"");
     let ack = |token: &str| {
         request(
             "POST",
@@ -1222,6 +1231,14 @@ fn otp_wait(id: &str, timeout: f64) -> Result<(), String> {
                     );
                     otp_collect_drop(id);
                     return Ok(());
+                }
+                Err(e) if terminal(&e) => {
+                    return Err(format!(
+                        "the vault refused the ACK (the delivery window has closed): \
+                         the retrieved code was NOT confirmed and stays unprinted; \
+                         its state file is {} - open a new hand-off for a fresh code",
+                        otp_collect_file(id).display(),
+                    ));
                 }
                 Err(_) => {
                     thread::sleep(Duration::from_millis(500));
@@ -1278,6 +1295,13 @@ fn otp_wait(id: &str, timeout: f64) -> Result<(), String> {
                             otp_collect_drop(id);
                             return Ok(());
                         }
+                        Err(e) if terminal(&e) => {
+                            return Err(
+                                "the hand-off closed and the vault refuses this collect token; \
+                                 the cached code stays unprinted - open a new hand-off"
+                                    .into(),
+                            );
+                        }
                         Err(_) => {
                             thread::sleep(Duration::from_millis(500));
                             continue;
@@ -1305,8 +1329,23 @@ fn otp_collect_file(id: &str) -> PathBuf {
     base.join("otp-collect").join(format!("{id}.json"))
 }
 
+/// A stale state file is never resumed: past the vault's delivery window
+/// (plus margin) the code is dead anyway, so the file is deleted instead
+/// of keeping a secret on disk indefinitely.
+const OTP_COLLECT_STATE_TTL_SECS: u64 = 10 * 60;
+
 fn otp_collect_load(id: &str) -> Option<(String, Option<String>)> {
-    let body = fs::read_to_string(otp_collect_file(id)).ok()?;
+    let path = otp_collect_file(id);
+    let body = fs::read_to_string(&path).ok()?;
+    let saved_at = server::json_number(&body, "saved_at").unwrap_or(0.0) as i64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    if now - saved_at > OTP_COLLECT_STATE_TTL_SECS as i64 {
+        let _ = fs::remove_file(&path);
+        return None;
+    }
     let token = server::json_string_value(&body, "collect_token")?;
     let response = server::json_string_value(&body, "response");
     Some((token, response))
@@ -1321,30 +1360,47 @@ fn otp_collect_save(id: &str, token: &str, response: Option<&str>) -> Result<(),
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
     }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let response_field = match response {
         Some(r) => format!("\"response\":{}", server::json_string(r)),
         None => "\"response\":null".into(),
     };
-    {
+    let body = format!(
+        "{{\"collect_token\":{},\"saved_at\":{now},{response_field}}}",
+        server::json_string(token)
+    );
+    // Atomic and symlink-safe: a fresh 0600 temp file (create_new, so an
+    // existing one is never followed or truncated) renamed over the target
+    // - the rename replaces whatever was there, symlink included, and the
+    // final file always carries the creation-mode permissions.
+    let tmp = dir.join(format!(
+        ".{id}.tmp-{}-{}",
+        std::process::id(),
+        now,
+    ));
+    let written = (|| -> Result<(), String> {
         let mut opts = fs::OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
+        opts.create_new(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut file = opts.open(&path).map_err(|e| e.to_string())?;
-        write!(
-            file,
-            "{{\"collect_token\":{},{response_field}}}",
-            server::json_string(token)
-        )
-        .map_err(|e| e.to_string())?;
+        let mut file = opts.open(&tmp).map_err(|e| e.to_string())?;
+        file.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.to_string());
     }
     Ok(())
 }
@@ -1354,12 +1410,14 @@ fn otp_collect_drop(id: &str) {
 }
 
 /// A collect token from the OS CSPRNG - never time- or pid-derived.
+/// (`fs::read` on /dev/urandom would read an infinite device forever;
+/// open it and read exactly the bytes needed.)
 fn otp_collect_token() -> Result<String, String> {
-    let bytes = fs::read("/dev/urandom").map_err(|e| format!("CSPRNG unavailable: {e}"))?;
-    if bytes.len() < 24 {
-        return Err("CSPRNG short read".into());
-    }
-    Ok(bytes[..24].iter().map(|b| format!("{b:02x}")).collect())
+    let mut bytes = [0u8; 24];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .map_err(|e| format!("CSPRNG unavailable: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// `cu vault`: the credential and session store, from the CLI.

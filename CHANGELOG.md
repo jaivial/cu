@@ -58,9 +58,12 @@
   it as a header, never in the URL; a crashed or killed `cu otp wait` is
   resumed by running it again, and transport errors retry inside the
   budget instead of killing the process. The ACK is idempotent, so a lost
-  ACK reply is safe to retry. The five-minute collection window is the
-  vault's delivery retention, not the code's validity - a TOTP code lives
-  about thirty seconds and is used immediately. Answers are single-use
+  ACK reply is safe to retry; a definitive refusal (the window closed,
+  the token is not the owner's) ends the wait instead of retrying forever.
+  The five-minute collection window is the vault's delivery retention, not
+  the code's validity - a TOTP code lives about thirty seconds and is used
+  immediately; state files older than ten minutes are deleted on sight,
+  never resumed. Answers are single-use
   (enforced in the answering UPDATE, not in a check that could race),
   sealed at rest, handed to the polling agent exactly once and deleted in
   the same write; expiry is ten minutes by default (1-15 honoured). Rows a
