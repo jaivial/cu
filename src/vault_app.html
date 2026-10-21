@@ -489,8 +489,12 @@ let otpRequests = [];
 
 async function loadOtp() {
   const reply = await fetch('/v1/vault/otp/requests');
-  if (reply.status === 401) return;
-  otpRequests = (await reply.json()).requests;
+  // Same rule as loadRequests(): a session that is no longer signed in has to
+  // leave the page, not leave a stale list behind.
+  if (reply.status === 401) { location.href = '/vault'; return; }
+  const body = await reply.json().catch(() => null);
+  if (!body || !Array.isArray(body.requests)) return;
+  otpRequests = body.requests;
   const pending = otpRequests.filter(r => r.status === 'pending');
   const badge = $('code-badge');
   badge.hidden = pending.length === 0;
@@ -498,13 +502,30 @@ async function loadOtp() {
   renderOtp();
 }
 
+// The pills read the way the rest of this UI reads; the raw status column
+// stays in the data, not on the screen.
+const OTP_STATE_TEXT = {
+  pending: 'waiting',
+  answered: 'answered',
+  collected: 'picked up',
+  cancelled: 'cancelled',
+  expired: 'expired',
+};
+
 function renderOtp() {
   $('codes-empty').hidden = otpRequests.length > 0;
   $('code-rows').innerHTML = otpRequests.map(r => {
-    const pill = r.status === 'pending' ? '<span class="pill warn">waiting</span>'
-      : (r.status === 'answered' || r.status === 'collected') ? '<span class="pill ok">answered</span>'
-      : `<span class="pill">${esc(r.status)}</span>`;
+    const tone = r.status === 'pending' ? ' warn'
+      : (r.status === 'answered' || r.status === 'collected') ? ' ok' : '';
+    // Own property only: a status named like something on Object.prototype
+    // must fall through to esc(), never print a function into the pill.
+    const label = Object.prototype.hasOwnProperty.call(OTP_STATE_TEXT, r.status)
+      ? OTP_STATE_TEXT[r.status] : esc(r.status);
+    const pill = `<span class="pill${tone}">${label}</span>`;
     const when = new Date(r.created_at * 1000).toLocaleString();
+    const cancel = r.status === 'pending'
+      ? `<div class="how"><button type="button" class="danger" data-cancel="${esc(r.id)}">Cancel</button></div>`
+      : '';
     return `
     <div class="req">
       <span class="num">${r.id}</span>
@@ -512,26 +533,41 @@ function renderOtp() {
         <div class="what">${esc(r.domain)} ${pill}</div>
         <div class="why">${esc(r.kind)}${r.reason ? ' · ' + esc(r.reason) : ''}${r.requested_by ? ' · ' + esc(r.requested_by) : ''} · ${when}</div>
       </div>
-      ${r.status === 'pending' ? `<div class="how"><button class="danger" onclick="cancelOtp(${r.id})">Cancel</button></div>` : ''}
+      ${cancel}
     </div>`;
   }).join('');
+  // No id is ever interpolated into markup: the handler is bound here, on the
+  // element itself, and the id has to parse as a number before it is used.
+  $('code-rows').querySelectorAll('[data-cancel]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const id = Number(btn.dataset.cancel);
+      if (Number.isInteger(id)) cancelOtp(id);
+    });
+  });
 }
 
 async function cancelOtp(id) {
   const reply = await fetch(`/v1/vault/otp/requests/${id}`, { method: 'DELETE' });
-  if (!reply.ok) { toast((await reply.json()).error || 'Could not cancel'); return; }
-  toast('Cancelled'); loadOtp();
+  // A non-JSON answer must read as a message, not as a rejected promise.
+  const body = await reply.json().catch(() => null);
+  if (!reply.ok) { toast((body && body.error) || 'Could not cancel'); return; }
+  toast('Cancelled'); poll(loadOtp)();
 }
 
 $('codes').onclick = () => { renderOtp(); $('codes-dialog').showModal(); };
 $('codes-close').onclick = () => $('codes-dialog').close();
 
-load();
-loadRequests();
-loadOtp();
+// Caught everywhere they are scheduled: a daemon that is restarting must not
+// leave an unhandled rejection behind every ten seconds, and the first paint
+// has to survive the same hiccup as the polls.
+const poll = (fn) => () => { fn().catch(() => {}); };
+
+poll(load)();
+poll(loadRequests)();
+poll(loadOtp)();
 // A request that arrives while the vault is open should show up on its own.
-setInterval(loadRequests, 10000);
-setInterval(loadOtp, 10000);
+setInterval(poll(loadRequests), 10000);
+setInterval(poll(loadOtp), 10000);
 </script>
 </body>
 </html>
