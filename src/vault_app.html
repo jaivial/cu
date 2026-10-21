@@ -98,6 +98,11 @@
     padding: .55rem 1.1rem; border-radius: 100px; display: none; font-weight: 600; font-size: .88rem;
   }
   .muted { color: var(--muted); }
+  /* Freshness of the two polled lists: a poll that fails has to say so, or
+     the list behind it reads as current when it is not. */
+  .poll-status { font-size: .8rem; color: var(--muted); margin: .1rem 0 .5rem; min-height: 1rem; }
+  .poll-status:empty { display: none; }
+  .poll-status.stale { color: var(--danger); font-weight: 600; }
   .mode { display: flex; gap: .4rem; margin: .8rem 0 .2rem; }
   .mode button.on { background: var(--ink); border-color: var(--ink); color: var(--white); }
   .hint { font-size: .8rem; color: var(--muted); margin: .3rem 0 0; }
@@ -209,6 +214,7 @@
   <p class="muted" style="margin-top:0;font-size:.88rem">An agent asked for a credential. Approving hands that
   credential (with its values) to whoever holds the daemon's API token; denying — or doing
   nothing for 15 minutes — hands over nothing.</p>
+  <p class="poll-status" id="requests-status" role="status" aria-live="polite"></p>
   <div id="request-rows"></div>
   <p class="muted" id="requests-empty" hidden>No pending requests.</p>
   <div class="row btns" style="margin-top:.8rem"><button id="requests-close">Close</button></div>
@@ -219,6 +225,7 @@
   <p class="muted" style="margin-top:0;font-size:.88rem">An agent waiting on a code opens a hand-off and sends
   you its link. Pending ones can still be answered from the link; the rest are history.
   Codes are wiped once the agent picks them up.</p>
+  <p class="poll-status" id="codes-status" role="status" aria-live="polite"></p>
   <div id="code-rows"></div>
   <p class="muted" id="codes-empty" hidden>No hand-offs yet.</p>
   <div class="row btns" style="margin-top:.8rem"><button id="codes-close">Close</button></div>
@@ -432,12 +439,15 @@ let pendingRequests = [];
 
 async function loadRequests() {
   const reply = await fetch('/v1/vault/requests?status=pending');
-  if (reply.status === 401) { location.href = '/vault'; return; }
-  pendingRequests = (await reply.json()).requests;
+  if (reply.status === 401) { location.href = '/vault'; return false; }
+  const body = await reply.json().catch(() => null);
+  if (!body || !Array.isArray(body.requests)) return false;
+  pendingRequests = body.requests;
   const badge = $('req-badge');
   badge.hidden = pendingRequests.length === 0;
   badge.textContent = pendingRequests.length;
   renderRequests();
+  return true;
 }
 
 function credentialOptions(domain) {
@@ -478,7 +488,7 @@ async function decide(id, approve) {
   });
   if (!reply.ok) { toast((await reply.json()).error || 'Could not decide'); return; }
   toast(approve ? 'Approved — the agent can pick the credential up' : 'Denied');
-  loadRequests();
+  poll(loadRequests, $('requests-status'))();
 }
 
 $('requests').onclick = () => { renderRequests(); $('requests-dialog').showModal(); };
@@ -491,15 +501,16 @@ async function loadOtp() {
   const reply = await fetch('/v1/vault/otp/requests');
   // Same rule as loadRequests(): a session that is no longer signed in has to
   // leave the page, not leave a stale list behind.
-  if (reply.status === 401) { location.href = '/vault'; return; }
+  if (reply.status === 401) { location.href = '/vault'; return false; }
   const body = await reply.json().catch(() => null);
-  if (!body || !Array.isArray(body.requests)) return;
+  if (!body || !Array.isArray(body.requests)) return false;
   otpRequests = body.requests;
   const pending = otpRequests.filter(r => r.status === 'pending');
   const badge = $('code-badge');
   badge.hidden = pending.length === 0;
   badge.textContent = pending.length;
   renderOtp();
+  return true;
 }
 
 // The pills read the way the rest of this UI reads; the raw status column
@@ -512,9 +523,20 @@ const OTP_STATE_TEXT = {
   expired: 'expired',
 };
 
+// An id is either a safe integer or nothing at all: this page shows it to
+// the person and uses it as the handle the cancel button acts on, so a value
+// that does not parse is dropped instead of printed.
+function asId(value) {
+  const n = typeof value === 'number'
+    ? value
+    : (/^-?\d+$/.test(String(value == null ? '' : value)) ? Number(value) : NaN);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
 function renderOtp() {
   $('codes-empty').hidden = otpRequests.length > 0;
   $('code-rows').innerHTML = otpRequests.map(r => {
+    const id = asId(r.id);
     const tone = r.status === 'pending' ? ' warn'
       : (r.status === 'answered' || r.status === 'collected') ? ' ok' : '';
     // Own property only: a status named like something on Object.prototype
@@ -523,12 +545,12 @@ function renderOtp() {
       ? OTP_STATE_TEXT[r.status] : esc(r.status);
     const pill = `<span class="pill${tone}">${label}</span>`;
     const when = new Date(r.created_at * 1000).toLocaleString();
-    const cancel = r.status === 'pending'
-      ? `<div class="how"><button type="button" class="danger" data-cancel="${esc(r.id)}">Cancel</button></div>`
+    const cancel = id !== null && r.status === 'pending'
+      ? `<div class="how"><button type="button" class="danger" data-cancel="${id}">Cancel</button></div>`
       : '';
     return `
     <div class="req">
-      <span class="num">${r.id}</span>
+      <span class="num">${id === null ? '' : id}</span>
       <div>
         <div class="what">${esc(r.domain)} ${pill}</div>
         <div class="why">${esc(r.kind)}${r.reason ? ' · ' + esc(r.reason) : ''}${r.requested_by ? ' · ' + esc(r.requested_by) : ''} · ${when}</div>
@@ -537,11 +559,11 @@ function renderOtp() {
     </div>`;
   }).join('');
   // No id is ever interpolated into markup: the handler is bound here, on the
-  // element itself, and the id has to parse as a number before it is used.
+  // element itself, and the id has to pass asId() before it is used.
   $('code-rows').querySelectorAll('[data-cancel]').forEach((btn) => {
     btn.addEventListener('click', () => {
-      const id = Number(btn.dataset.cancel);
-      if (Number.isInteger(id)) cancelOtp(id);
+      const id = asId(btn.dataset.cancel);
+      if (id !== null) cancelOtp(id);
     });
   });
 }
@@ -551,23 +573,42 @@ async function cancelOtp(id) {
   // A non-JSON answer must read as a message, not as a rejected promise.
   const body = await reply.json().catch(() => null);
   if (!reply.ok) { toast((body && body.error) || 'Could not cancel'); return; }
-  toast('Cancelled'); poll(loadOtp)();
+  toast('Cancelled'); poll(loadOtp, $('codes-status'))();
 }
 
 $('codes').onclick = () => { renderOtp(); $('codes-dialog').showModal(); };
 $('codes-close').onclick = () => $('codes-dialog').close();
 
+// Freshness of a polled list, on screen: a real refresh says when it
+// happened, and a poll that fails says the list behind it is stale instead
+// of leaving an old snapshot looking current.
+function markFresh(el) {
+  el.classList.remove('stale');
+  el.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+}
+function markStale(el) {
+  el.classList.add('stale');
+  el.textContent = "Couldn't refresh — showing the list as it last was.";
+}
+
 // Caught everywhere they are scheduled: a daemon that is restarting must not
-// leave an unhandled rejection behind every ten seconds, and the first paint
-// has to survive the same hiccup as the polls.
-const poll = (fn) => () => { fn().catch(() => {}); };
+// leave an unhandled rejection behind every ten seconds, and every failure
+// has to reach the status line of the list it left behind.
+const poll = (fn, status) => async () => {
+  try {
+    const ok = await fn();
+    if (status) (ok === false ? markStale : markFresh)(status);
+  } catch (e) {
+    if (status) markStale(status);
+  }
+};
 
 poll(load)();
-poll(loadRequests)();
-poll(loadOtp)();
+poll(loadRequests, $('requests-status'))();
+poll(loadOtp, $('codes-status'))();
 // A request that arrives while the vault is open should show up on its own.
-setInterval(poll(loadRequests), 10000);
-setInterval(poll(loadOtp), 10000);
+setInterval(poll(loadRequests, $('requests-status')), 10000);
+setInterval(poll(loadOtp, $('codes-status')), 10000);
 </script>
 </body>
 </html>
