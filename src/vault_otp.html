@@ -49,6 +49,24 @@
   }
   .qr img { width: 240px; height: 240px; display: block; }
   .qr-note { font-size: .85rem; color: var(--muted); text-align: center; margin: .6rem 0 0; }
+  /* The QR did not load: say it out loud and offer another try. The seed is
+     never spelled out as text -- only the image the daemon serves -- so the
+     way to enrol is a retry, not a line of copy. */
+  .qr-fallback {
+    display: flex; gap: .6rem; align-items: center; flex-wrap: wrap;
+    background: var(--lilac); border-radius: 12px; padding: .55rem .8rem;
+    margin: 0 0 1.2rem; font-size: .85rem; color: var(--ink);
+  }
+  .qr-fallback p { margin: 0; flex: 1 1 12rem; }
+  .qr-fallback button {
+    width: auto; min-height: 34px; padding: .3rem .9rem;
+    background: transparent; color: var(--blue); border-color: var(--blue);
+    font-size: .85rem; font-weight: 700;
+  }
+  .qr-fallback button:hover { background: var(--blue); color: #fff; }
+  /* Loading and connection state, above everything the card shows. */
+  .status { color: var(--muted); font-size: .9rem; margin: 0 0 1.1rem; }
+  .status:empty { display: none; margin: 0; }
   label { display: block; font-size: .85rem; font-weight: 600; color: var(--muted); margin: 0 0 .35rem; }
   input {
     width: 100%; min-height: 48px; padding: .7rem .9rem;
@@ -89,6 +107,7 @@
 <body>
 <main class="card">
   <p class="brand">cu<span>·</span>vault</p>
+  <p class="status" id="status" role="status" aria-live="polite">Opening this hand-off…</p>
 
   <div id="ask" hidden>
     <h1 id="title">One-time code</h1>
@@ -99,6 +118,11 @@
         <p class="qr-note">Scan with your authenticator app to add this account.</p>
       </div>
     </div>
+    <div id="qr-fallback" class="qr-fallback" hidden>
+      <p>The QR did not load, so there is nothing to scan yet. Try again —
+         and if it keeps failing, ask the agent for a fresh hand-off.</p>
+      <button type="button" id="qr-retry">Try again</button>
+    </div>
     <form id="form" novalidate>
       <div class="field">
         <label for="code">Code from your authenticator</label>
@@ -106,7 +130,7 @@
                autocapitalize="off" autocorrect="off" spellcheck="false"
                placeholder="123456" maxlength="64" autofocus>
       </div>
-      <p class="error" id="error" role="alert"></p>
+      <p class="error" id="error" role="alert" aria-live="polite"></p>
       <button type="submit" id="submit">Send to the agent</button>
     </form>
     <div class="meta">
@@ -130,13 +154,12 @@ const token = new URLSearchParams(location.search).get('t') || '';
 const selfUrl = location.pathname + location.search;
 history.replaceState(null, '', location.pathname);
 let expiresAt = 0, finished = false;
-// QR lifecycle: idle -> loading -> shown | failed. The box only appears
-// once the image has really loaded; a missing or spent seed keeps the
-// code-only layout instead of a broken image.
+// idle -> loading -> shown | failed (see startQr).
 let qrState = 'idle';
 
 function end(icon, title, sub) {
   finished = true;
+  $('status').textContent = '';
   $('ask').hidden = true;
   $('end').hidden = false;
   $('end-icon').textContent = icon;
@@ -144,7 +167,16 @@ function end(icon, title, sub) {
   $('end-sub').textContent = sub;
 }
 
+// A dead connection is never swallowed: the line above the card says so and
+// the poll keeps going, so a blip reads as a blip instead of an empty page.
+function netDown() { $('status').textContent = "Can't reach the vault — retrying…"; }
+function netUp() { $('status').textContent = ''; }
+
 function tick() {
+  // Until the first lookup answers, the real expiry is unknown: guessing
+  // "expired" from the initial 0 would end a perfectly live hand-off after
+  // one second and nothing could bring the page back.
+  if (!expiresAt) return;
   const left = Math.max(0, Math.round(expiresAt - Date.now() / 1000));
   const m = Math.floor(left / 60), s = left % 60;
   $('ttl').textContent = left > 0 ? `expires in ${m}:${String(s).padStart(2, '0')}` : 'expired';
@@ -153,12 +185,38 @@ function tick() {
   }
 }
 
+// QR lifecycle: idle -> loading -> shown | failed. The box only appears once
+// the image has really loaded; a failure says so and can be retried, so the
+// person is never left staring at an empty frame with no way forward.
+function startQr() {
+  qrState = 'loading';
+  $('qr-fallback').hidden = true;
+  $('qr').onload = () => {
+    qrState = 'shown';
+    $('qr-box').hidden = false;
+    $('title').textContent = 'Scan, then send the code';
+  };
+  $('qr').onerror = () => {
+    qrState = 'failed';
+    $('qr-box').hidden = true;
+    $('qr-fallback').hidden = false;
+  };
+  // Drop the old source first so the same URL really refetches on retry.
+  $('qr').removeAttribute('src');
+  $('qr').src = '/v1/vault/otp/qr?t=' + encodeURIComponent(token);
+}
+
+$('qr-retry').addEventListener('click', startQr);
+
 async function lookup() {
   if (finished) return;
   let reply;
   try {
     reply = await fetch('/v1/vault/otp/lookup?t=' + encodeURIComponent(token));
-  } catch (e) { return; }
+  } catch (e) {
+    netDown();
+    return;
+  }
   if (reply.status === 401) {
     location.replace('/vault?next=' + encodeURIComponent(selfUrl));
     return;
@@ -167,7 +225,13 @@ async function lookup() {
     end('✕', 'Unknown or spent link', 'This hand-off does not exist any more. Ask the agent for a fresh link.');
     return;
   }
-  const info = await reply.json();
+  // A 500 or a non-JSON body must not strand the page on a rejected promise.
+  const info = await reply.json().catch(() => null);
+  if (!info || typeof info !== 'object') {
+    netDown();
+    return;
+  }
+  netUp();
   if (info.status === 'expired') {
     end('⌛', 'Expired', 'This link ran out of time. The agent has to ask again.');
     return;
@@ -194,16 +258,7 @@ async function lookup() {
     $('sub').appendChild(reason);
   }
   $('who').textContent = info.requested_by ? `asked by ${info.requested_by}` : '';
-  if (info.kind === 'setup' && info.has_seed && qrState === 'idle') {
-    qrState = 'loading';
-    $('qr').onload = () => {
-      qrState = 'shown';
-      $('qr-box').hidden = false;
-      $('title').textContent = 'Scan, then send the code';
-    };
-    $('qr').onerror = () => { qrState = 'failed'; };
-    $('qr').src = '/v1/vault/otp/qr?t=' + encodeURIComponent(token);
-  }
+  if (info.kind === 'setup' && info.has_seed && qrState === 'idle') startQr();
 }
 
 $('form').addEventListener('submit', async (e) => {
