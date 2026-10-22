@@ -169,7 +169,12 @@ function end(icon, title, sub) {
 
 // A dead connection is never swallowed: the line above the card says so and
 // the poll keeps going, so a blip reads as a blip instead of an empty page.
-function netDown() { $('status').textContent = "Can't reach the vault — retrying…"; }
+// `detail` carries the daemon's own words when it answered with an error.
+function netDown(detail) {
+  $('status').textContent = detail
+    ? `The vault answered: ${detail} — retrying…`
+    : "Can't reach the vault — retrying…";
+}
 function netUp() { $('status').textContent = ''; }
 
 function tick() {
@@ -229,6 +234,13 @@ async function lookup() {
   const info = await reply.json().catch(() => null);
   if (!info || typeof info !== 'object') {
     netDown();
+    return;
+  }
+  // The daemon's own error body is an answer, not a hand-off state: without
+  // this check it falls through to the pending branch below, paints an empty
+  // domain and ends the page on a false expiry a second later.
+  if (!reply.ok || info.error) {
+    netDown(typeof info.error === 'string' ? info.error.slice(0, 160) : '');
     return;
   }
   netUp();

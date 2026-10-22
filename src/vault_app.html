@@ -416,13 +416,26 @@ function toggleValue(i, secret) {
     ? window._revealValues[i].value : '••••••••';
 }
 
+// Rows and the Forget button read from the same list: the index in the button
+// is only ever meaningful against this array, which is rebuilt with the rows.
+let sessionList = [];
+
 async function loadSessions() {
   const body = await (await fetch('/v1/vault/sessions')).json();
-  $('session-rows').innerHTML = body.sessions.map(s => `
+  sessionList = body.sessions;
+  $('session-rows').innerHTML = sessionList.map((s, i) => `
     <tr><td style="padding:.4rem .4rem .4rem 0">${esc(s.domain)}</td>
     <td class="muted" style="font-size:.85rem">${new Date(s.updated_at * 1000).toLocaleString()}</td>
-    <td style="text-align:right"><button class="danger" onclick="forget('${esc(s.domain)}')">Forget</button></td></tr>`).join('')
+    <td style="text-align:right"><button class="danger" data-forget="${i}">Forget</button></td></tr>`).join('')
     || '<tr><td colspan="3" class="muted">No saved sessions.</td></tr>';
+  // The domain never rides in an attribute: the row names its own index and
+  // the handler reads the value back from this list.
+  $('session-rows').querySelectorAll('[data-forget]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const s = sessionList[Number(btn.dataset.forget)];
+      if (s && typeof s.domain === 'string') forget(s.domain);
+    });
+  });
   $('sessions-dialog').showModal();
 }
 async function forget(domain) {
@@ -518,6 +531,7 @@ async function loadOtp() {
 const OTP_STATE_TEXT = {
   pending: 'waiting',
   answered: 'answered',
+  collecting: 'picking up',
   collected: 'picked up',
   cancelled: 'cancelled',
   expired: 'expired',
