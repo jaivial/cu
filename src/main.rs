@@ -225,6 +225,7 @@ fn main() {
         // The global `--tab` lifter has already taken a `--tab ID` out of
         // the arguments; the vault session save wants it.
         Some("vault") => vault(&args[1..], tab.clone()),
+        Some("otp") => otp(&args[1..], tab.clone()),
         _ => {
             print_help();
             Ok(())
@@ -277,7 +278,7 @@ fn wait_for_handoff(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<
 
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release|wait [--timeout S]]\n  cu handoff [wait [--timeout S]]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]\n          levels: debug|verbose log info trace warn error exception csp network, all, LEVEL+\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release|wait [--timeout S]]\n  cu handoff [wait [--timeout S]]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]\n          levels: debug|verbose log info trace warn error exception csp network, all, LEVEL+\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n  cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup]\n          [--wait] [--timeout S]\n  cu otp wait ID [--timeout S] | cancel ID | list\n  cu otp capture --tab T [--domain D] [--request ID] [--credential ID] [--replace]\n  cu otp code DOMAIN | --credential ID\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
     );
 }
 
@@ -417,10 +418,20 @@ fn login_url() -> String {
 /// retried, so a plain `cu ...` works on a fresh boot without anyone having
 /// run `cu daemon` by hand.
 fn request(method: &str, path: &str, body: Option<&str>) -> Result<String, String> {
+    request_x(method, path, body, None)
+}
+
+/// `request` plus one extra header line (see `request_config_x`).
+fn request_x(
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    header: Option<(&str, &str)>,
+) -> Result<String, String> {
     if let Some(data) = env::var_os("CU_DATA_DIR") {
         let config = fs::read_to_string(PathBuf::from(&data).join("server.json"))
             .map_err(|_| "server not running (start it with `cu start`)")?;
-        return request_config(&config, method, path, body);
+        return request_config_x(&config, method, path, body, header);
     }
     let daemon_config = daemon_dir().join("server.json");
     let legacy_config = PathBuf::from(".cu").join("server.json");
@@ -429,7 +440,7 @@ fn request(method: &str, path: &str, body: Option<&str>) -> Result<String, Strin
             && let Some((port, _)) = endpoint(&config)
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
         {
-            return request_config(&config, method, path, body);
+            return request_config_x(&config, method, path, body, header);
         }
     }
     ensure_daemon()?;
@@ -439,7 +450,7 @@ fn request(method: &str, path: &str, body: Option<&str>) -> Result<String, Strin
     for _ in 0..2 {
         let config = fs::read_to_string(&daemon_config)
             .map_err(|_| "the daemon did not come up (see ~/.cu/daemon/daemon.log)")?;
-        match request_config(&config, method, path, body) {
+        match request_config_x(&config, method, path, body, header) {
             Ok(reply) => return Ok(reply),
             Err(_) => thread::sleep(Duration::from_millis(300)),
         }
@@ -455,11 +466,14 @@ fn endpoint(config: &str) -> Option<(u16, String)> {
 }
 
 /// One request against a server described by its `server.json` contents.
-fn request_config(
+/// One daemon request with an optional extra header line (the OTP collect
+/// token, which must not travel in the URL query).
+fn request_config_x(
     config: &str,
     method: &str,
     path: &str,
     body: Option<&str>,
+    header: Option<(&str, &str)>,
 ) -> Result<String, String> {
     let port = server::json_value(config, "port").ok_or("invalid server state")?;
     let token = server::json_value(config, "token").ok_or("invalid server state")?;
@@ -469,7 +483,11 @@ fn request_config(
     ))
     .map_err(|e| e.to_string())?;
     let body = body.unwrap_or("");
-    write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).map_err(|e| e.to_string())?;
+    let extra = match header {
+        Some((name, value)) => format!("{name}: {value}\r\n"),
+        None => String::new(),
+    };
+    write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\n\r\n{body}", body.len()).map_err(|e| e.to_string())?;
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
@@ -880,7 +898,9 @@ fn daemon(args: &[String]) -> Result<(), String> {
     let mut policy = BrowserPolicy::resolve(mode)?;
     // `CU_HEADLESS=0` opts the daemon into a windowed browser on a virtual
     // display (`CU_DISPLAY`): closer to a real browser, fewer bot checks.
-    let windowed = std::env::var("CU_HEADLESS").map(|v| v.trim() == "0").unwrap_or(false);
+    let windowed = std::env::var("CU_HEADLESS")
+        .map(|v| v.trim() == "0")
+        .unwrap_or(false);
     if !(windowed && policy.display.is_some() && !policy.headless) {
         policy.headless = true;
         policy.display = None;
@@ -957,6 +977,490 @@ fn free_port_from(from: u16) -> u16 {
         }
     }
     from
+}
+
+/// `cu otp`: one-time codes — hand-offs a person answers from the phone,
+/// setup-QR capture, and codes minted from a stored seed.
+fn otp(args: &[String], tab: Option<String>) -> Result<(), String> {
+    let usage = "usage: cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup] [--wait] [--timeout S] | wait ID [--timeout S] | cancel ID | list | capture --tab T [--domain D] [--request ID] [--credential ID] [--replace] | code DOMAIN | code --credential ID";
+    let action = args.first().ok_or(usage)?;
+    match action.as_str() {
+        "request" => {
+            let domain = args
+                .get(1)
+                .filter(|a| !a.starts_with("--"))
+                .ok_or("usage: cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup] [--wait] [--timeout S]")?;
+            let mut reason = String::new();
+            let mut from = String::new();
+            let mut kind = "code".to_string();
+            let mut wait = false;
+            let mut timeout = 600.0f64;
+            let mut rest = &args[2..];
+            while let [flag, value, tail @ ..] = rest {
+                match flag.as_str() {
+                    "--reason" => {
+                        reason = value.clone();
+                        rest = tail;
+                    }
+                    "--from" => {
+                        from = value.clone();
+                        rest = tail;
+                    }
+                    "--kind" => {
+                        kind = value.clone();
+                        rest = tail;
+                    }
+                    "--timeout" => {
+                        timeout = value.parse().map_err(|_| "--timeout takes seconds")?;
+                        rest = tail;
+                    }
+                    _ => break,
+                }
+            }
+            if rest.first().map(String::as_str) == Some("--wait") {
+                wait = true;
+            }
+            let created = request(
+                "POST",
+                "/v1/vault/otp/requests",
+                Some(&format!(
+                    "{{\"domain\":{},\"reason\":{},\"kind\":{},\"requested_by\":{}}}",
+                    server::json_string(domain),
+                    server::json_string(&reason),
+                    server::json_string(&kind),
+                    server::json_string(&from),
+                )),
+            )?;
+            println!("{created}");
+            if wait {
+                let id = server::json_string_value(&created, "id")
+                .or_else(|| server::json_number(&created, "id").map(|n| (n as i64).to_string()))
+                .ok_or("no id in reply")?;
+                otp_wait(&id, timeout)?;
+            }
+            Ok(())
+        }
+        "wait" => {
+            let id = args
+                .get(1)
+                .filter(|a| !a.starts_with("--"))
+                .ok_or("usage: cu otp wait ID [--timeout S]")?;
+            let mut timeout = 600.0f64;
+            let mut rest = &args[2..];
+            while let [flag, value, tail @ ..] = rest {
+                if flag.as_str() == "--timeout" {
+                    timeout = value.parse().map_err(|_| "--timeout takes seconds")?;
+                    rest = tail;
+                } else {
+                    break;
+                }
+            }
+            otp_wait(id, timeout)
+        }
+        "cancel" => {
+            let id = args.get(1).ok_or("usage: cu otp cancel ID")?;
+            request(
+                "DELETE",
+                &format!("/v1/vault/otp/requests/{id}"),
+                Some("{}"),
+            )
+            .map(|s| println!("{s}"))
+        }
+        "list" => request("GET", "/v1/vault/otp/requests", None).map(|s| println!("{s}")),
+        "capture" => {
+            // Replacing a credential's live TOTP seed needs this explicit
+            // flag - the operator's confirmation, never an inference.
+            let force = args.iter().any(|a| a == "--replace");
+            let cleaned: Vec<String> = args[1..]
+                .iter()
+                .filter(|a| a.as_str() != "--replace")
+                .cloned()
+                .collect();
+            let mut domain = String::new();
+            let mut request_id = String::new();
+            let mut credential_id = String::new();
+            let mut rest = &cleaned[..];
+            while let [flag, value, tail @ ..] = rest {
+                match flag.as_str() {
+                    "--domain" => {
+                        domain = value.clone();
+                        rest = tail;
+                    }
+                    "--request" => {
+                        request_id = value.clone();
+                        rest = tail;
+                    }
+                    "--credential" => {
+                        credential_id = value.clone();
+                        rest = tail;
+                    }
+                    _ => return Err(format!("unknown option {flag}")),
+                }
+            }
+            if request_id.is_empty() && domain.is_empty() {
+                return Err("cu otp capture needs --domain D or --request ID".into());
+            }
+            if tab.is_none() {
+                return Err(
+                    "cu otp capture needs --tab T naming the tab on the service's setup page"
+                        .into(),
+                );
+            }
+            let path = if request_id.is_empty() {
+                "/v1/vault/otp/capture".to_string()
+            } else {
+                format!("/v1/vault/otp/requests/{request_id}/capture")
+            };
+            let path = match &tab {
+                Some(id) => format!("{path}?tab={id}"),
+                None => path,
+            };
+            let mut fields = Vec::new();
+            if force {
+                fields.push("\"force\":true".to_string());
+            }
+            if !domain.is_empty() {
+                fields.push(format!("\"domain\":{}", server::json_string(&domain)));
+            }
+            if !credential_id.is_empty() {
+                fields.push(format!(
+                    "\"credential_id\":{}",
+                    server::json_string(&credential_id)
+                ));
+            }
+            let body = format!("{{{}}}", fields.join(","));
+            // The reply names the issuer and account the seed was stored
+            // for; the seed itself never leaves the vault.
+            request("POST", &path, Some(&body)).map(|s| println!("{s}"))
+        }
+        "code" => {
+            let domain = args.get(1).filter(|a| !a.starts_with("--"));
+            let mut credential_id = String::new();
+            let mut rest = if domain.is_some() {
+                &args[2..]
+            } else {
+                &args[1..]
+            };
+            while let [flag, value, tail @ ..] = rest {
+                if flag.as_str() == "--credential" {
+                    credential_id = value.clone();
+                    rest = tail;
+                } else {
+                    return Err(format!("unknown option {flag}"));
+                }
+            }
+            let body = if !credential_id.is_empty() {
+                format!(
+                    "{{\"credential_id\":{}}}",
+                    server::json_string(&credential_id)
+                )
+            } else if let Some(domain) = domain {
+                format!("{{\"domain\":{}}}", server::json_string(domain))
+            } else {
+                return Err("usage: cu otp code DOMAIN | code --credential ID".into());
+            };
+            request("POST", "/v1/vault/otp/code", Some(&body)).map(|s| println!("{s}"))
+        }
+        _ => Err(usage.into()),
+    }
+}
+
+/// Park on a hand-off until the person answers, it expires or the local
+/// budget runs out; the server-side wait caps each poll, so loop it.
+///
+/// Collection survives this process: the collect token comes from the OS
+/// CSPRNG and lives - with the retrieved code, once it lands - in a 0600
+/// file next to the daemon's data until the ACK is confirmed or the
+/// hand-off ends. A crashed or killed wait is resumed by running
+/// `cu otp wait ID` again: same token, same code, never a second owner.
+/// The code is printed only after the vault confirmed the ACK (the ACK is
+/// idempotent, so a lost ACK reply is just retried). The five-minute
+/// collection window is the vault's delivery retention, NOT the code's
+/// validity - a TOTP code lives about 30 seconds, so the answer is
+/// collected and used immediately.
+fn otp_wait(id: &str, timeout: f64) -> Result<(), String> {
+    // The id builds a file path: mirror the server's i64 check before it
+    // ever touches the filesystem.
+    if id.parse::<i64>().is_err() {
+        return Err("request id must be a number".into());
+    }
+    let deadline = Instant::now() + Duration::from_secs_f64(timeout);
+    let (collect_token, mut cached_response) = match otp_collect_load(id) {
+        Some((token, response)) => (token, response),
+        None => {
+            let token = otp_collect_token()?;
+            otp_collect_save(id, &token, None)?;
+            (token, None)
+        }
+    };
+    let header = ("X-Cu-Otp-Collect-Token", collect_token.as_str());
+    // The daemon answers a definitive refusal as a JSON error body (a 400);
+    // a transport cut surfaces as an OS error string. Only the latter is
+    // worth retrying - a refusal is terminal for this collection.
+    let terminal = |e: &str| e.starts_with("{\"error\"");
+    let ack = |token: &str| {
+        request(
+            "POST",
+            &format!("/v1/vault/otp/requests/{id}/ack"),
+            Some(&format!(
+                "{{\"collect_token\":{}}}",
+                server::json_string(token)
+            )),
+        )
+    };
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(match &cached_response {
+                Some(_) => format!(
+                    "the code was retrieved but its ACK never confirmed before the local budget \
+                     ran out; it stays saved at {} - rerun `cu otp wait {id}` to confirm and print it",
+                    otp_collect_file(id).display(),
+                ),
+                None => format!("no answer after {timeout:.0}s; giving up"),
+            });
+        }
+        // Holding the code already? Confirm the ACK and only then print.
+        if let Some(response) = &cached_response {
+            match ack(&collect_token) {
+                Ok(_) => {
+                    println!(
+                        "{{\"id\":{},\"status\":\"collected\",\"response\":{}}}",
+                        server::json_string(id),
+                        server::json_string(response),
+                    );
+                    otp_collect_drop(id);
+                    return Ok(());
+                }
+                Err(e) if terminal(&e) => {
+                    return Err(format!(
+                        "the vault refused the ACK (the delivery window has closed): \
+                         the retrieved code was NOT confirmed and stays unprinted; \
+                         its state file is {} - open a new hand-off for a fresh code",
+                        otp_collect_file(id).display(),
+                    ));
+                }
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+            }
+        }
+        // Transport errors (the claim reply lost on the wire included)
+        // never kill the process: the token survives in the state file and
+        // in memory, so every failure here is a bounded retry, not `?`.
+        let body = match request_x(
+            "GET",
+            &format!("/v1/vault/otp/requests/{id}?wait={}", left.as_secs().max(1)),
+            None,
+            Some(header),
+        ) {
+            Ok(body) => body,
+            Err(_) => {
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        };
+        match server::json_string_value(&body, "status").as_deref() {
+            Some("pending") => continue,
+            Some("collecting") => match server::json_string_value(&body, "response") {
+                Some(response) => {
+                    // Persist BEFORE the first ACK attempt: whatever happens
+                    // to this process now, the code stays recoverable until
+                    // the vault's delivery window closes.
+                    otp_collect_save(id, &collect_token, Some(&response))?;
+                    cached_response = Some(response);
+                }
+                None => {
+                    return Err(
+                        "this hand-off is being collected elsewhere (or its delivery window \
+                         closed); if an earlier run of yours was collecting it, its state file \
+                         is gone - wait for the vault's window to close and open a new hand-off"
+                            .into(),
+                    );
+                }
+            },
+            Some("collected") => {
+                // Our ACK may have landed while its reply was lost: confirm
+                // idempotently; only a token match prints the cached code.
+                if cached_response.is_some() {
+                    match ack(&collect_token) {
+                        Ok(_) => {
+                            let response = cached_response.unwrap_or_default();
+                            println!(
+                                "{{\"id\":{},\"status\":\"collected\",\"response\":{}}}",
+                                server::json_string(id),
+                                server::json_string(&response),
+                            );
+                            otp_collect_drop(id);
+                            return Ok(());
+                        }
+                        Err(e) if terminal(&e) => {
+                            return Err(
+                                "the hand-off closed and the vault refuses this collect token; \
+                                 the cached code stays unprinted - open a new hand-off"
+                                    .into(),
+                            );
+                        }
+                        Err(_) => {
+                            thread::sleep(Duration::from_millis(500));
+                            continue;
+                        }
+                    }
+                }
+                otp_collect_drop(id);
+                return Ok(());
+            }
+            Some(other) => {
+                otp_collect_drop(id);
+                return Err(format!("hand-off ended as {other}"));
+            }
+            None => return Err("unexpected reply from the daemon".into()),
+        }
+    }
+}
+
+/// The 0600 state file an in-flight collection resumes from, one per
+/// hand-off, in a 0700 directory next to the daemon's data.
+fn otp_collect_file(id: &str) -> PathBuf {
+    let base = env::var_os("CU_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(daemon_dir);
+    base.join("otp-collect").join(format!("{id}.json"))
+}
+
+/// A stale state file is never resumed: past the vault's delivery window
+/// (plus margin) the code is dead anyway, so the file is deleted instead
+/// of keeping a secret on disk indefinitely.
+const OTP_COLLECT_STATE_TTL_SECS: u64 = 10 * 60;
+
+/// Confined housekeeping of the collect directory: hand-off state past the
+/// TTL and orphaned temp files from interrupted saves are removed. This
+/// runs when a wait touches the directory - it is best-effort hygiene on
+/// use, NOT a guarantee that nothing outlives the delivery window: a
+/// crashed wait nobody reruns leaves its 0600 file (an expired token, a
+/// dead code) until the next `cu otp` invocation.
+fn otp_collect_sweep(dir: &std::path::Path) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".json") {
+            let stale = fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|body| server::json_number(&body, "saved_at"))
+                .map(|at| now - at as i64 > OTP_COLLECT_STATE_TTL_SECS as i64)
+                .unwrap_or(false);
+            if stale {
+                let _ = fs::remove_file(entry.path());
+            }
+        } else if name.starts_with('.') && name.contains(".tmp-") {
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| now - d.as_secs() as i64 > OTP_COLLECT_STATE_TTL_SECS as i64)
+                .unwrap_or(false);
+            if stale {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+fn otp_collect_load(id: &str) -> Option<(String, Option<String>)> {
+    let path = otp_collect_file(id);
+    if let Some(dir) = path.parent() {
+        otp_collect_sweep(dir);
+    }
+    let body = fs::read_to_string(&path).ok()?;
+    let saved_at = server::json_number(&body, "saved_at").unwrap_or(0.0) as i64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    if now - saved_at > OTP_COLLECT_STATE_TTL_SECS as i64 {
+        let _ = fs::remove_file(&path);
+        return None;
+    }
+    let token = server::json_string_value(&body, "collect_token")?;
+    let response = server::json_string_value(&body, "response");
+    Some((token, response))
+}
+
+fn otp_collect_save(id: &str, token: &str, response: Option<&str>) -> Result<(), String> {
+    let path = otp_collect_file(id);
+    let dir = path.parent().ok_or("no collect directory")?;
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let response_field = match response {
+        Some(r) => format!("\"response\":{}", server::json_string(r)),
+        None => "\"response\":null".into(),
+    };
+    let body = format!(
+        "{{\"collect_token\":{},\"saved_at\":{now},{response_field}}}",
+        server::json_string(token)
+    );
+    // Atomic and symlink-safe: a fresh 0600 temp file (create_new, so an
+    // existing one is never followed or truncated) renamed over the target
+    // - the rename replaces whatever was there, symlink included, and the
+    // final file always carries the creation-mode permissions.
+    let tmp = dir.join(format!(
+        ".{id}.tmp-{}-{}",
+        std::process::id(),
+        now,
+    ));
+    let written = (|| -> Result<(), String> {
+        let mut opts = fs::OpenOptions::new();
+        opts.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp).map_err(|e| e.to_string())?;
+        file.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    Ok(())
+}
+
+fn otp_collect_drop(id: &str) {
+    let _ = fs::remove_file(otp_collect_file(id));
+}
+
+/// A collect token from the OS CSPRNG - never time- or pid-derived.
+/// (`fs::read` on /dev/urandom would read an infinite device forever;
+/// open it and read exactly the bytes needed.)
+fn otp_collect_token() -> Result<String, String> {
+    let mut bytes = [0u8; 24];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .map_err(|e| format!("CSPRNG unavailable: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// `cu vault`: the credential and session store, from the CLI.
@@ -1181,7 +1685,8 @@ mod tests {
 /// `cu console`: the page's console output, filtered by level.
 fn console_cmd(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), String> {
     let usage = "usage: cu console [--level L[,L]|warn+|all] [--grep TEXT] [--limit N] [--since N] [--clear] [--json]";
-    let (mut level, mut grep, mut limit, mut since) = (String::new(), String::new(), String::new(), String::new());
+    let (mut level, mut grep, mut limit, mut since) =
+        (String::new(), String::new(), String::new(), String::new());
     let (mut clear, mut json) = (false, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -1198,12 +1703,20 @@ fn console_cmd(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), S
     let enc = |s: &str| {
         s.bytes()
             .map(|b| match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b',' => (b as char).to_string(),
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b',' => {
+                    (b as char).to_string()
+                }
                 _ => format!("%{b:02X}"),
             })
             .collect::<String>()
     };
-    let mut q = format!("level={}&grep={}&limit={}&since={}", enc(&level), enc(&grep), enc(&limit), enc(&since));
+    let mut q = format!(
+        "level={}&grep={}&limit={}&since={}",
+        enc(&level),
+        enc(&grep),
+        enc(&limit),
+        enc(&since)
+    );
     if clear {
         q.push_str("&clear=1");
     }

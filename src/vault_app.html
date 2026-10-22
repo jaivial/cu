@@ -5,103 +5,168 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cu vault — credentials</title>
 <style>
-  :root { color-scheme: dark; }
+  :root {
+    --paper: #f5f6fa; --white: #fff; --ink: #20242f; --muted: #636774;
+    --blue: #3649ed; --blue-dark: #293ac8; --lilac: #e2def9; --mint: #deebe4;
+    --line: #dfe1e9; --danger: #c0352b;
+  }
+
+  /* Bizvaretto is a light identity; people whose system is dark keep a
+     tuned dark scheme instead of a blinding page. */
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #171a23; --white: #20242f; --ink: #e9ebf3; --muted: #9aa1b5;
+      --blue: #6a78ff; --blue-dark: #8b96ff; --lilac: #2a2745; --mint: #1f2d27;
+      --line: #323748; --danger: #ff8080;
+    }
+  }
+  @font-face {
+    font-family: 'Manrope';
+    src: url('/vault/manrope.ttf') format('truetype');
+    font-weight: 200 800; font-display: swap;
+  }
   * { box-sizing: border-box; }
-  body { font: 15px/1.5 system-ui, sans-serif; background: #0f1115; color: #e6e6e6; margin: 0; }
-  header { display: flex; gap: 1rem; align-items: center; padding: 0.8rem 1.2rem;
-           background: #171a21; border-bottom: 1px solid #2a2f3a; position: sticky; top: 0; }
-  header h1 { font-size: 1.05rem; margin: 0; flex: 0 0 auto; }
-  #search { flex: 1; max-width: 26rem; padding: 0.45rem 0.7rem; border-radius: 8px;
-            border: 1px solid #2a2f3a; background: #0f1115; color: inherit; }
-  main { max-width: 60rem; margin: 1.2rem auto; padding: 0 1rem; }
-  button { padding: 0.4rem 0.8rem; border-radius: 8px; border: 1px solid #2a2f3a;
-           background: #232936; color: inherit; cursor: pointer; font-size: 0.9rem; }
-  button.primary { background: #3b82f6; border-color: #3b82f6; color: white; }
-  button.danger { border-color: #7f1d1d; color: #f87171; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid #232936; }
-  th { color: #8b93a7; font-weight: 500; font-size: 0.85rem; }
-  td.actions { white-space: nowrap; text-align: right; }
-  dialog { background: #171a21; color: inherit; border: 1px solid #2a2f3a;
-           border-radius: 12px; width: min(34rem, 94vw); padding: 1.4rem; }
-  dialog::backdrop { background: rgba(0,0,0,0.6); }
-  label { display: block; font-size: 0.85rem; color: #8b93a7; margin: 0.7rem 0 0.2rem; }
-  /* 16px exactly, like the login page: below that iOS Safari zooms the
-     viewport on focus and never zooms back. */
-  input, textarea, select { width: 100%; padding: 0.45rem 0.6rem; border-radius: 8px;
-           border: 1px solid #2a2f3a; background: #0f1115; color: inherit;
-           font-size: max(16px, 1em); }
+  body {
+    font: 15px/1.5 'Manrope', system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--paper); color: var(--ink); margin: 0;
+  }
+  header {
+    display: flex; gap: .6rem; align-items: center; padding: .8rem 1.2rem;
+    background: var(--white); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 3;
+  }
+  header h1 { font-size: 1.05rem; font-weight: 800; letter-spacing: -.02em; margin: 0; flex: 0 0 auto; }
+  header h1 span { color: var(--blue); }
+  #search {
+    flex: 1; max-width: 24rem; padding: .5rem 1rem; border-radius: 100px;
+    border: 1px solid var(--line); background: var(--paper); color: inherit;
+    font-family: inherit; font-size: max(16px, 1em); min-height: 42px;
+  }
+  main { max-width: 56rem; margin: 1.4rem auto; padding: 0 1rem; }
+  button {
+    padding: .45rem 1rem; border-radius: 100px; border: 1px solid var(--line);
+    background: var(--white); color: var(--ink); cursor: pointer;
+    font-size: .88rem; font-family: inherit; font-weight: 600;
+    transition: background .15s ease, border-color .15s ease;
+  }
+  button:hover { border-color: var(--muted); }
+  button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  button.primary:hover { background: var(--blue-dark); border-color: var(--blue-dark); }
+  button.danger { color: var(--danger); }
+  button.danger:hover { border-color: var(--danger); }
+  .badge {
+    background: var(--blue); color: #fff; border-radius: 100px;
+    padding: 0 .5rem; font-size: .78rem; font-weight: 700; margin-left: .3rem;
+  }
+  /* Credentials: cards, one per login, calm and scannable. */
+  .cred {
+    background: var(--white); border: 1px solid var(--line); border-radius: 16px;
+    padding: .9rem 1.1rem; margin-bottom: .7rem;
+    display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1.2fr) auto;
+    gap: .3rem 1rem; align-items: center;
+  }
+  .cred .dom { font-weight: 700; letter-spacing: -.01em; overflow: hidden; text-overflow: ellipsis; }
+  .cred .lab, .cred .fld, .cred .nts { color: var(--muted); font-size: .88rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cred .actions { display: flex; gap: .4rem; }
+  .cred .actions button { padding: .35rem .8rem; font-size: .82rem; }
+  .empty { color: var(--muted); text-align: center; margin: 3rem 0; }
+  dialog {
+    background: var(--white); color: inherit; border: 1px solid var(--line);
+    border-radius: 20px; width: min(34rem, 94vw); padding: 1.5rem;
+    box-shadow: 0 24px 64px rgba(32, 36, 47, .18);
+  }
+  dialog::backdrop { background: rgba(32, 36, 47, .3); }
+  dialog h2 { font-size: 1.25rem; font-weight: 700; letter-spacing: -.02em; margin: 0 0 .4rem; }
+  label { display: block; font-size: .85rem; font-weight: 600; color: var(--muted); margin: .8rem 0 .25rem; }
+  input, textarea, select {
+    width: 100%; padding: .55rem .8rem; border-radius: 12px;
+    border: 1px solid var(--line); background: var(--white); color: inherit;
+    font-size: max(16px, 1em); font-family: inherit;
+  }
   input:focus-visible, button:focus-visible, select:focus-visible, textarea:focus-visible {
-    outline: 2px solid #3b82f6; outline-offset: 2px; }
+    outline: 2px solid var(--blue); outline-offset: 2px;
+  }
   textarea { font-family: ui-monospace, monospace; min-height: 4rem; }
-  .field-row { display: grid; grid-template-columns: 1fr 1.4fr 7rem auto auto; gap: 0.4rem;
-               align-items: center; margin-bottom: 0.4rem; }
-  .field-row .mini { width: auto; padding: 0.35rem 0.5rem; }
-  .row { display: flex; gap: 0.6rem; }
+  .field-row { display: grid; grid-template-columns: 1fr 1.4fr 7rem auto auto; gap: .4rem;
+               align-items: center; margin-bottom: .4rem; }
+  .field-row .mini { width: auto; padding: .3rem .7rem; font-size: .8rem; }
+  .row { display: flex; gap: .6rem; }
   .row > * { flex: 1; }
-  .secret-value { font-family: ui-monospace, monospace; }
-  .toast { position: fixed; bottom: 1rem; right: 1rem; background: #166534; color: #dcfce7;
-           padding: 0.5rem 0.9rem; border-radius: 8px; display: none; }
-  .muted { color: #8b93a7; }
-  .mode { display: flex; gap: 0.4rem; margin: 0.7rem 0 0.2rem; }
-  .mode button.on { background: #3b82f6; border-color: #3b82f6; color: #fff; }
-  .hint { font-size: 0.8rem; color: #8b93a7; margin: 0.3rem 0 0; }
+  .secret-value { font-family: ui-monospace, monospace; letter-spacing: .1em; }
+  .toast {
+    position: fixed; bottom: 1rem; right: 1rem; background: var(--ink); color: var(--paper);
+    padding: .55rem 1.1rem; border-radius: 100px; display: none; font-weight: 600; font-size: .88rem;
+  }
+  .muted { color: var(--muted); }
+  /* Freshness of the two polled lists: a poll that fails has to say so, or
+     the list behind it reads as current when it is not. */
+  .poll-status { font-size: .8rem; color: var(--muted); margin: .1rem 0 .5rem; min-height: 1rem; }
+  .poll-status:empty { display: none; }
+  .poll-status.stale { color: var(--danger); font-weight: 600; }
+  .mode { display: flex; gap: .4rem; margin: .8rem 0 .2rem; }
+  .mode button.on { background: var(--ink); border-color: var(--ink); color: var(--white); }
+  .hint { font-size: .8rem; color: var(--muted); margin: .3rem 0 0; }
   #f-lines { min-height: 7rem; }
   #f-fields { min-height: 8rem; }
-  .preview { font-size: 0.85rem; color: #8b93a7; margin: 0.3rem 0 0; word-break: break-word; }
+  .preview { font-size: .85rem; color: var(--muted); margin: .3rem 0 0; word-break: break-word; }
+  .req { display: grid; grid-template-columns: 2.2rem minmax(0,1fr); gap: .2rem .8rem;
+         padding: .7rem 0; border-bottom: 1px solid var(--line); align-items: start; }
+  .req:last-child { border-bottom: 0; }
+  .req .num { color: var(--muted); font-size: .85rem; padding-top: .1rem; }
+  .req .what { font-weight: 600; }
+  .req .why { color: var(--muted); font-size: .85rem; }
+  .req .how { grid-column: 2; display: flex; gap: .5rem; margin-top: .4rem; align-items: center; flex-wrap: wrap; }
+  .req .how select { width: auto; flex: 1; min-width: 10rem; min-height: 40px; }
+  .pill {
+    display: inline-block; border-radius: 100px; padding: .1rem .65rem;
+    font-size: .76rem; font-weight: 700; background: var(--lilac); color: var(--ink);
+  }
+  .pill.ok { background: var(--mint); }
+  .pill.warn { background: #f6e3df; color: var(--danger); }
   @media (max-width: 640px) {
     body { font-size: 16px; }
-    header { flex-wrap: wrap; gap: 0.5rem; padding: 0.6rem 0.8rem; }
+    header { flex-wrap: wrap; gap: .5rem; padding: .6rem .8rem; }
     header h1 { flex: 1 1 auto; }
-    #search { order: 5; flex: 1 1 100%; max-width: none; min-height: 48px; font-size: 16px; }
-    header button { min-height: 44px; padding: 0.5rem 0.8rem; font-size: 0.95rem; }
-    #new { order: 1; }
-    main { margin: 0.8rem auto; padding: 0 0.7rem; }
-    table, thead, tbody, tr, td { display: block; width: 100%; }
-    thead { display: none; }
-    tr.cred { background: #171a21; border: 1px solid #2a2f3a; border-radius: 12px;
-              padding: 0.7rem 0.8rem; margin-bottom: 0.7rem; }
-    tr.cred td { border: 0; padding: 0.15rem 0; }
-    tr.cred td.dom { font-weight: 600; font-size: 1.05rem; }
-    td.actions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem;
-                 margin-top: 0.5rem; text-align: center; }
-    td.actions button { min-height: 48px; width: 100%; }
-    input, textarea, select { min-height: 48px; padding: 0.65rem 0.75rem; }
+    #search { order: 5; flex: 1 1 100%; max-width: none; min-height: 48px; }
+    header button { min-height: 44px; }
+    main { margin: .9rem auto; padding: 0 .7rem; }
+    .cred { grid-template-columns: 1fr; gap: .1rem; padding: .9rem 1rem; }
+    .cred .actions { display: grid; grid-template-columns: repeat(3, 1fr); gap: .5rem; margin-top: .5rem; }
+    .cred .actions button { min-height: 44px; width: 100%; }
+    input, textarea, select { min-height: 48px; padding: .65rem .8rem; }
     textarea { min-height: 7rem; }
     dialog { width: 100vw; max-width: 100vw; height: 100dvh; max-height: 100dvh; margin: 0;
              border-radius: 0; border: 0; padding: 1rem; overflow-y: auto; }
-    dialog .row { flex-direction: column; gap: 0.6rem; }
+    dialog .row { flex-direction: column; gap: .6rem; }
     dialog .row.btns { flex-direction: column-reverse; }
     dialog .row > div { width: 100%; }
     dialog button { min-height: 48px; width: 100%; font-size: 1rem; }
-    #editor .row.btns { position: sticky; bottom: 0; background: #171a21;
-                                padding: 0.6rem 0 env(safe-area-inset-bottom); }
+    #editor .row.btns { position: sticky; bottom: 0; background: var(--white);
+                        padding: .6rem 0 env(safe-area-inset-bottom); }
     .field-row { grid-template-columns: 1fr 1fr; }
     .field-row .muted:nth-child(3) { display: none; }
     .field-row .mini { min-height: 44px; }
-    .toast { left: 0.7rem; right: 0.7rem; bottom: 1rem; text-align: center; }
+    .toast { left: .7rem; right: .7rem; bottom: 1rem; text-align: center; }
   }
 </style>
 </head>
 <body>
 <header>
-  <h1>cu vault</h1>
+  <h1>cu<span>·</span>vault</h1>
   <input id="search" placeholder="Search domain, label, notes…">
-  <button class="primary" id="new">New credential</button>
-  <button id="requests">Requests <span id="req-badge" hidden style="background:#7f1d1d;color:#fecaca;border-radius:8px;padding:0 0.4rem;font-size:0.8rem"></span></button>
+  <button class="primary" id="new">New</button>
+  <button id="codes">Codes <span class="badge" id="code-badge" hidden></span></button>
+  <button id="requests">Requests <span class="badge" id="req-badge" hidden></span></button>
   <button id="sessions">Sessions</button>
   <button id="logout">Log out</button>
 </header>
 <main>
-  <table>
-    <thead><tr><th>Domain</th><th>Label</th><th>Fields</th><th>Notes</th><th></th></tr></thead>
-    <tbody id="rows"></tbody>
-  </table>
-  <p class="muted" id="empty" hidden>No credentials yet.</p>
+  <div id="rows"></div>
+  <p class="empty" id="empty" hidden>No credentials yet.</p>
 </main>
 
 <dialog id="editor">
-  <h2 id="editor-title" style="margin-top:0">New credential</h2>
+  <h2 id="editor-title">New credential</h2>
   <div class="row">
     <div><label>Domain</label><input id="f-domain" placeholder="example.com"></div>
     <div><label>Label</label><input id="f-label" placeholder="main login"></div>
@@ -110,7 +175,7 @@
   <div id="box-lines">
     <label>Fields, one per line as name: value</label>
     <textarea id="f-lines" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" placeholder="user: you@example.com&#10;password: ••••••••"></textarea>
-    <p class="hint">password, pass, clave, contraseña, token, key, secret, code, pin and cookie lines are stored as secret.</p>
+    <p class="hint">password, pass, clave, contraseña, token, key, secret, code, pin, otp and cookie lines are stored as secret.</p>
     <p class="preview" id="preview"></p>
   </div>
   <div id="box-json" hidden>
@@ -119,8 +184,8 @@
   </div>
   <label>Notes</label>
   <textarea id="f-notes" style="min-height:2.5rem"></textarea>
-  <p class="error" id="editor-error" style="color:#f87171"></p>
-  <div class="row btns" style="margin-top:0.8rem">
+  <p class="error" id="editor-error" style="color:var(--danger)"></p>
+  <div class="row btns" style="margin-top:.8rem">
     <button id="cancel">Cancel</button>
     <button class="primary" id="save">Save</button>
   </div>
@@ -129,27 +194,41 @@
 <dialog id="reveal">
   <h2 id="reveal-title" style="margin-top:0"></h2>
   <div id="reveal-fields"></div>
-  <p class="muted">Copied values clear from the clipboard after 30 s (best effort).</p>
-  <div class="row btns" style="margin-top:0.8rem">
+  <p class="muted" style="font-size:.85rem">Copied values clear from the clipboard after 30 s (best effort).</p>
+  <div class="row btns" style="margin-top:.8rem">
     <button id="reveal-close">Close</button>
   </div>
 </dialog>
 
 <dialog id="sessions-dialog">
-  <h2 style="margin-top:0">Saved sessions</h2>
-  <table><thead><tr><th>Domain</th><th>Updated</th><th></th></tr></thead><tbody id="session-rows"></tbody></table>
-  <div class="row btns" style="margin-top:0.8rem"><button id="sessions-close">Close</button></div>
+  <h2>Saved sessions</h2>
+  <table style="width:100%;border-collapse:collapse">
+    <thead><tr><th style="text-align:left;color:var(--muted);font-size:.85rem">Domain</th><th style="text-align:left;color:var(--muted);font-size:.85rem">Updated</th><th></th></tr></thead>
+    <tbody id="session-rows"></tbody>
+  </table>
+  <div class="row btns" style="margin-top:.8rem"><button id="sessions-close">Close</button></div>
 </dialog>
 
 <dialog id="requests-dialog">
-  <h2 style="margin-top:0">Agent secret requests</h2>
-  <p class="muted" style="margin-top:0">An agent asked for a credential. Approving hands that
+  <h2>Agent secret requests</h2>
+  <p class="muted" style="margin-top:0;font-size:.88rem">An agent asked for a credential. Approving hands that
   credential (with its values) to whoever holds the daemon's API token; denying — or doing
   nothing for 15 minutes — hands over nothing.</p>
-  <table><thead><tr><th>#</th><th>Domain</th><th>Reason</th><th>Asked by</th><th>Credential</th><th></th></tr></thead>
-  <tbody id="request-rows"></tbody></table>
+  <p class="poll-status" id="requests-status" role="status" aria-live="polite"></p>
+  <div id="request-rows"></div>
   <p class="muted" id="requests-empty" hidden>No pending requests.</p>
-  <div class="row btns" style="margin-top:0.8rem"><button id="requests-close">Close</button></div>
+  <div class="row btns" style="margin-top:.8rem"><button id="requests-close">Close</button></div>
+</dialog>
+
+<dialog id="codes-dialog">
+  <h2>One-time code hand-offs</h2>
+  <p class="muted" style="margin-top:0;font-size:.88rem">An agent waiting on a code opens a hand-off and sends
+  you its link. Pending ones can still be answered from the link; the rest are history.
+  Codes are wiped once the agent picks them up.</p>
+  <p class="poll-status" id="codes-status" role="status" aria-live="polite"></p>
+  <div id="code-rows"></div>
+  <p class="muted" id="codes-empty" hidden>No hand-offs yet.</p>
+  <div class="row btns" style="margin-top:.8rem"><button id="codes-close">Close</button></div>
 </dialog>
 
 <div class="toast" id="toast"></div>
@@ -177,17 +256,16 @@ function render() {
     !needle || [c.domain, c.label, c.notes].some(v => (v || '').toLowerCase().includes(needle)));
   $('empty').hidden = rows.length > 0;
   $('rows').innerHTML = rows.map(c => `
-    <tr class="cred">
-      <td class="dom">${esc(c.domain)}</td>
-      <td>${esc(c.label)}</td>
-      <td class="muted">${esc(c.fields || '')}</td>
-      <td class="muted">${esc((c.notes || '').slice(0, 60))}</td>
-      <td class="actions">
+    <div class="cred">
+      <div class="dom">${esc(c.domain)}</div>
+      <div class="lab">${esc(c.label)}</div>
+      <div class="fld">${esc(c.fields || '')}</div>
+      <div class="actions">
         <button onclick="reveal(${c.id})">Reveal</button>
         <button onclick="edit(${c.id})">Edit</button>
         <button class="danger" onclick="remove(${c.id})">Delete</button>
-      </td>
-    </tr>`).join('');
+      </div>
+    </div>`).join('');
 }
 
 function esc(value) {
@@ -338,12 +416,26 @@ function toggleValue(i, secret) {
     ? window._revealValues[i].value : '••••••••';
 }
 
+// Rows and the Forget button read from the same list: the index in the button
+// is only ever meaningful against this array, which is rebuilt with the rows.
+let sessionList = [];
+
 async function loadSessions() {
   const body = await (await fetch('/v1/vault/sessions')).json();
-  $('session-rows').innerHTML = body.sessions.map(s => `
-    <tr><td>${esc(s.domain)}</td><td class="muted">${new Date(s.updated_at * 1000).toLocaleString()}</td>
-    <td class="actions"><button class="danger" onclick="forget('${esc(s.domain)}')">Forget</button></td></tr>`).join('')
+  sessionList = body.sessions;
+  $('session-rows').innerHTML = sessionList.map((s, i) => `
+    <tr><td style="padding:.4rem .4rem .4rem 0">${esc(s.domain)}</td>
+    <td class="muted" style="font-size:.85rem">${new Date(s.updated_at * 1000).toLocaleString()}</td>
+    <td style="text-align:right"><button class="danger" data-forget="${i}">Forget</button></td></tr>`).join('')
     || '<tr><td colspan="3" class="muted">No saved sessions.</td></tr>';
+  // The domain never rides in an attribute: the row names its own index and
+  // the handler reads the value back from this list.
+  $('session-rows').querySelectorAll('[data-forget]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const s = sessionList[Number(btn.dataset.forget)];
+      if (s && typeof s.domain === 'string') forget(s.domain);
+    });
+  });
   $('sessions-dialog').showModal();
 }
 async function forget(domain) {
@@ -360,17 +452,18 @@ let pendingRequests = [];
 
 async function loadRequests() {
   const reply = await fetch('/v1/vault/requests?status=pending');
-  if (reply.status === 401) { location.href = '/vault'; return; }
-  pendingRequests = (await reply.json()).requests;
+  if (reply.status === 401) { location.href = '/vault'; return false; }
+  const body = await reply.json().catch(() => null);
+  if (!body || !Array.isArray(body.requests)) return false;
+  pendingRequests = body.requests;
   const badge = $('req-badge');
   badge.hidden = pendingRequests.length === 0;
   badge.textContent = pendingRequests.length;
   renderRequests();
+  return true;
 }
 
 function credentialOptions(domain) {
-  // Credentials covering the requested domain (exact or parent), newest first
-  // — the API already matched them the same way.
   const matching = creds.filter(c =>
     domain.endsWith(c.domain) || c.domain.endsWith(domain));
   return matching.length ? matching : creds;
@@ -383,17 +476,18 @@ function renderRequests() {
       .map(c => `<option value="${c.id}">${esc(c.domain)} / ${esc(c.label)}</option>`)
       .join('');
     return `
-    <tr>
-      <td class="muted">${r.id}</td>
-      <td>${esc(r.domain)}</td>
-      <td class="muted">${esc((r.reason || '').slice(0, 60))}</td>
-      <td class="muted">${esc(r.requested_by || '—')}</td>
-      <td><select id="cred-for-${r.id}">${options}</select></td>
-      <td class="actions">
+    <div class="req">
+      <span class="num">${r.id}</span>
+      <div>
+        <div class="what">${esc(r.domain)}</div>
+        <div class="why">${esc(r.reason || '')} ${r.requested_by ? '· ' + esc(r.requested_by) : ''}</div>
+      </div>
+      <div class="how">
+        <select id="cred-for-${r.id}">${options}</select>
         <button class="primary" onclick="decide(${r.id}, true)">Approve</button>
         <button class="danger" onclick="decide(${r.id}, false)">Deny</button>
-      </td>
-    </tr>`;
+      </div>
+    </div>`;
   }).join('');
 }
 
@@ -407,16 +501,128 @@ async function decide(id, approve) {
   });
   if (!reply.ok) { toast((await reply.json()).error || 'Could not decide'); return; }
   toast(approve ? 'Approved — the agent can pick the credential up' : 'Denied');
-  loadRequests();
+  poll(loadRequests, $('requests-status'))();
 }
 
 $('requests').onclick = () => { renderRequests(); $('requests-dialog').showModal(); };
 $('requests-close').onclick = () => $('requests-dialog').close();
 
-load();
-loadRequests();
+// ---- one-time code hand-offs ----
+let otpRequests = [];
+
+async function loadOtp() {
+  const reply = await fetch('/v1/vault/otp/requests');
+  // Same rule as loadRequests(): a session that is no longer signed in has to
+  // leave the page, not leave a stale list behind.
+  if (reply.status === 401) { location.href = '/vault'; return false; }
+  const body = await reply.json().catch(() => null);
+  if (!body || !Array.isArray(body.requests)) return false;
+  otpRequests = body.requests;
+  const pending = otpRequests.filter(r => r.status === 'pending');
+  const badge = $('code-badge');
+  badge.hidden = pending.length === 0;
+  badge.textContent = pending.length;
+  renderOtp();
+  return true;
+}
+
+// The pills read the way the rest of this UI reads; the raw status column
+// stays in the data, not on the screen.
+const OTP_STATE_TEXT = {
+  pending: 'waiting',
+  answered: 'answered',
+  collecting: 'picking up',
+  collected: 'picked up',
+  cancelled: 'cancelled',
+  expired: 'expired',
+};
+
+// An id is either a safe integer or nothing at all: this page shows it to
+// the person and uses it as the handle the cancel button acts on, so a value
+// that does not parse is dropped instead of printed.
+function asId(value) {
+  const n = typeof value === 'number'
+    ? value
+    : (/^-?\d+$/.test(String(value == null ? '' : value)) ? Number(value) : NaN);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+function renderOtp() {
+  $('codes-empty').hidden = otpRequests.length > 0;
+  $('code-rows').innerHTML = otpRequests.map(r => {
+    const id = asId(r.id);
+    const tone = r.status === 'pending' ? ' warn'
+      : (r.status === 'answered' || r.status === 'collected') ? ' ok' : '';
+    // Own property only: a status named like something on Object.prototype
+    // must fall through to esc(), never print a function into the pill.
+    const label = Object.prototype.hasOwnProperty.call(OTP_STATE_TEXT, r.status)
+      ? OTP_STATE_TEXT[r.status] : esc(r.status);
+    const pill = `<span class="pill${tone}">${label}</span>`;
+    const when = new Date(r.created_at * 1000).toLocaleString();
+    const cancel = id !== null && r.status === 'pending'
+      ? `<div class="how"><button type="button" class="danger" data-cancel="${id}">Cancel</button></div>`
+      : '';
+    return `
+    <div class="req">
+      <span class="num">${id === null ? '' : id}</span>
+      <div>
+        <div class="what">${esc(r.domain)} ${pill}</div>
+        <div class="why">${esc(r.kind)}${r.reason ? ' · ' + esc(r.reason) : ''}${r.requested_by ? ' · ' + esc(r.requested_by) : ''} · ${when}</div>
+      </div>
+      ${cancel}
+    </div>`;
+  }).join('');
+  // No id is ever interpolated into markup: the handler is bound here, on the
+  // element itself, and the id has to pass asId() before it is used.
+  $('code-rows').querySelectorAll('[data-cancel]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const id = asId(btn.dataset.cancel);
+      if (id !== null) cancelOtp(id);
+    });
+  });
+}
+
+async function cancelOtp(id) {
+  const reply = await fetch(`/v1/vault/otp/requests/${id}`, { method: 'DELETE' });
+  // A non-JSON answer must read as a message, not as a rejected promise.
+  const body = await reply.json().catch(() => null);
+  if (!reply.ok) { toast((body && body.error) || 'Could not cancel'); return; }
+  toast('Cancelled'); poll(loadOtp, $('codes-status'))();
+}
+
+$('codes').onclick = () => { renderOtp(); $('codes-dialog').showModal(); };
+$('codes-close').onclick = () => $('codes-dialog').close();
+
+// Freshness of a polled list, on screen: a real refresh says when it
+// happened, and a poll that fails says the list behind it is stale instead
+// of leaving an old snapshot looking current.
+function markFresh(el) {
+  el.classList.remove('stale');
+  el.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+}
+function markStale(el) {
+  el.classList.add('stale');
+  el.textContent = "Couldn't refresh — showing the list as it last was.";
+}
+
+// Caught everywhere they are scheduled: a daemon that is restarting must not
+// leave an unhandled rejection behind every ten seconds, and every failure
+// has to reach the status line of the list it left behind.
+const poll = (fn, status) => async () => {
+  try {
+    const ok = await fn();
+    if (status) (ok === false ? markStale : markFresh)(status);
+  } catch (e) {
+    if (status) markStale(status);
+  }
+};
+
+poll(load)();
+poll(loadRequests, $('requests-status'))();
+poll(loadOtp, $('codes-status'))();
 // A request that arrives while the vault is open should show up on its own.
-setInterval(loadRequests, 10000);
+setInterval(poll(loadRequests, $('requests-status')), 10000);
+setInterval(poll(loadOtp, $('codes-status')), 10000);
 </script>
 </body>
 </html>

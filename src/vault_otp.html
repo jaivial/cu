@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>cu vault — one-time code</title>
+<style>
+  :root {
+    --paper: #f5f6fa; --white: #fff; --ink: #20242f; --muted: #636774;
+    --blue: #3649ed; --blue-dark: #293ac8; --lilac: #e2def9; --mint: #deebe4;
+    --line: #dfe1e9; --danger: #c0352b;
+  }
+
+  /* Bizvaretto is a light identity; people whose system is dark keep a
+     tuned dark scheme instead of a blinding page. */
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #171a23; --white: #20242f; --ink: #e9ebf3; --muted: #9aa1b5;
+      --blue: #6a78ff; --blue-dark: #8b96ff; --lilac: #2a2745; --mint: #1f2d27;
+      --line: #323748; --danger: #ff8080;
+    }
+  }
+  @font-face {
+    font-family: 'Manrope';
+    src: url('/vault/manrope.ttf') format('truetype');
+    font-weight: 200 800; font-display: swap;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font: 16px/1.5 'Manrope', system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--paper); color: var(--ink); margin: 0;
+    display: grid; place-items: center; min-height: 100dvh; padding: 1.5rem 1rem;
+  }
+  .card {
+    background: var(--white); border: 1px solid var(--line); border-radius: 20px;
+    padding: 2rem 1.75rem 1.75rem; width: min(26rem, 100%);
+    box-shadow: 0 1px 2px rgba(32,36,47,.04), 0 12px 32px rgba(32,36,47,.06);
+  }
+  .brand { font-weight: 800; font-size: 1.05rem; letter-spacing: -.02em; margin: 0 0 1.2rem; }
+  .brand span { color: var(--blue); }
+  h1 { font-size: 1.35rem; font-weight: 700; letter-spacing: -.03em; line-height: 1.15; margin: 0 0 .35rem; }
+  .sub { color: var(--muted); font-size: .92rem; margin: 0 0 1.4rem; }
+  .sub b { color: var(--ink); font-weight: 600; }
+  [hidden] { display: none !important; }
+  .qr {
+    display: grid; place-items: center; background: var(--white);
+    border: 1px solid var(--line); border-radius: 16px;
+    padding: 1rem; margin: 0 0 1.2rem;
+  }
+  .qr img { width: 240px; height: 240px; display: block; }
+  .qr-note { font-size: .85rem; color: var(--muted); text-align: center; margin: .6rem 0 0; }
+  /* The QR did not load: say it out loud and offer another try. The seed is
+     never spelled out as text -- only the image the daemon serves -- so the
+     way to enrol is a retry, not a line of copy. */
+  .qr-fallback {
+    display: flex; gap: .6rem; align-items: center; flex-wrap: wrap;
+    background: var(--lilac); border-radius: 12px; padding: .55rem .8rem;
+    margin: 0 0 1.2rem; font-size: .85rem; color: var(--ink);
+  }
+  .qr-fallback p { margin: 0; flex: 1 1 12rem; }
+  .qr-fallback button {
+    width: auto; min-height: 34px; padding: .3rem .9rem;
+    background: transparent; color: var(--blue); border-color: var(--blue);
+    font-size: .85rem; font-weight: 700;
+  }
+  .qr-fallback button:hover { background: var(--blue); color: #fff; }
+  /* Loading and connection state, above everything the card shows. */
+  .status { color: var(--muted); font-size: .9rem; margin: 0 0 1.1rem; }
+  .status:empty { display: none; margin: 0; }
+  label { display: block; font-size: .85rem; font-weight: 600; color: var(--muted); margin: 0 0 .35rem; }
+  input {
+    width: 100%; min-height: 48px; padding: .7rem .9rem;
+    border-radius: 12px; border: 1px solid var(--line); background: var(--white);
+    color: inherit; font-family: inherit; font-size: max(16px, 1em);
+    letter-spacing: .25em; text-align: center; font-weight: 600;
+  }
+  input:focus-visible, button:focus-visible {
+    outline: 2px solid var(--blue); outline-offset: 2px;
+  }
+  .field { margin-bottom: 1rem; }
+  button {
+    width: 100%; min-height: 48px; padding: .7rem 1.2rem;
+    border-radius: 100px; border: 1px solid var(--blue); background: var(--blue);
+    color: #fff; font-size: 1rem; font-family: inherit; font-weight: 700;
+    letter-spacing: -.01em; cursor: pointer;
+    transition: background .18s ease, border-color .18s ease;
+  }
+  button:hover { background: var(--blue-dark); border-color: var(--blue-dark); }
+  button[disabled] { opacity: .55; cursor: progress; }
+  .error { color: var(--danger); font-size: .88rem; min-height: 1.2rem; margin: 0 0 .5rem; }
+  .error:empty { min-height: 0; }
+  .meta {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: .82rem; color: var(--muted); margin-top: 1.2rem;
+  }
+  .pill {
+    display: inline-block; background: var(--lilac); color: var(--ink);
+    border-radius: 100px; padding: .15rem .7rem; font-weight: 600; font-size: .78rem;
+  }
+  .done { text-align: center; padding: 1rem 0 .4rem; }
+  .done .mark {
+    width: 56px; height: 56px; border-radius: 50%; background: var(--mint);
+    display: grid; place-items: center; margin: 0 auto 1rem; font-size: 1.6rem;
+  }
+</style>
+</head>
+<body>
+<main class="card">
+  <p class="brand">cu<span>·</span>vault</p>
+  <p class="status" id="status" role="status" aria-live="polite">Opening this hand-off…</p>
+
+  <div id="ask" hidden>
+    <h1 id="title">One-time code</h1>
+    <p class="sub" id="sub"></p>
+    <div id="qr-box" class="qr" hidden>
+      <div>
+        <img id="qr" alt="Setup QR for your authenticator app">
+        <p class="qr-note">Scan with your authenticator app to add this account.</p>
+      </div>
+    </div>
+    <div id="qr-fallback" class="qr-fallback" hidden>
+      <p>The QR did not load, so there is nothing to scan yet. Try again —
+         and if it keeps failing, ask the agent for a fresh hand-off.</p>
+      <button type="button" id="qr-retry">Try again</button>
+    </div>
+    <form id="form" novalidate>
+      <div class="field">
+        <label for="code">Code from your authenticator</label>
+        <input id="code" inputmode="numeric" autocomplete="one-time-code"
+               autocapitalize="off" autocorrect="off" spellcheck="false"
+               placeholder="123456" maxlength="64" autofocus>
+      </div>
+      <p class="error" id="error" role="alert" aria-live="polite"></p>
+      <button type="submit" id="submit">Send to the agent</button>
+    </form>
+    <div class="meta">
+      <span id="who"></span>
+      <span class="pill" id="ttl"></span>
+    </div>
+  </div>
+
+  <div id="end" class="done" hidden>
+    <div class="mark" id="end-icon">✓</div>
+    <h1 id="end-title">Done</h1>
+    <p class="sub" id="end-sub"></p>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const token = new URLSearchParams(location.search).get('t') || '';
+// The one-time token leaves the address bar now: no browser history, no
+// referrer, no shoulder-surfed URL keeps it.
+const selfUrl = location.pathname + location.search;
+history.replaceState(null, '', location.pathname);
+let expiresAt = 0, finished = false;
+// idle -> loading -> shown | failed (see startQr).
+let qrState = 'idle';
+
+function end(icon, title, sub) {
+  finished = true;
+  $('status').textContent = '';
+  $('ask').hidden = true;
+  $('end').hidden = false;
+  $('end-icon').textContent = icon;
+  $('end-title').textContent = title;
+  $('end-sub').textContent = sub;
+}
+
+// A dead connection is never swallowed: the line above the card says so and
+// the poll keeps going, so a blip reads as a blip instead of an empty page.
+// `detail` carries the daemon's own words when it answered with an error.
+function netDown(detail) {
+  $('status').textContent = detail
+    ? `The vault answered: ${detail} — retrying…`
+    : "Can't reach the vault — retrying…";
+}
+function netUp() { $('status').textContent = ''; }
+
+function tick() {
+  // Until the first lookup answers, the real expiry is unknown: guessing
+  // "expired" from the initial 0 would end a perfectly live hand-off after
+  // one second and nothing could bring the page back.
+  if (!expiresAt) return;
+  const left = Math.max(0, Math.round(expiresAt - Date.now() / 1000));
+  const m = Math.floor(left / 60), s = left % 60;
+  $('ttl').textContent = left > 0 ? `expires in ${m}:${String(s).padStart(2, '0')}` : 'expired';
+  if (left === 0 && !finished) {
+    end('⌛', 'Expired', 'This link ran out of time. The agent has to ask again.');
+  }
+}
+
+// QR lifecycle: idle -> loading -> shown | failed. The box only appears once
+// the image has really loaded; a failure says so and can be retried, so the
+// person is never left staring at an empty frame with no way forward.
+function startQr() {
+  qrState = 'loading';
+  $('qr-fallback').hidden = true;
+  $('qr').onload = () => {
+    qrState = 'shown';
+    $('qr-box').hidden = false;
+    $('title').textContent = 'Scan, then send the code';
+  };
+  $('qr').onerror = () => {
+    qrState = 'failed';
+    $('qr-box').hidden = true;
+    $('qr-fallback').hidden = false;
+  };
+  // Drop the old source first so the same URL really refetches on retry.
+  $('qr').removeAttribute('src');
+  $('qr').src = '/v1/vault/otp/qr?t=' + encodeURIComponent(token);
+}
+
+$('qr-retry').addEventListener('click', startQr);
+
+async function lookup() {
+  if (finished) return;
+  let reply;
+  try {
+    reply = await fetch('/v1/vault/otp/lookup?t=' + encodeURIComponent(token));
+  } catch (e) {
+    netDown();
+    return;
+  }
+  if (reply.status === 401) {
+    location.replace('/vault?next=' + encodeURIComponent(selfUrl));
+    return;
+  }
+  if (reply.status === 404) {
+    end('✕', 'Unknown or spent link', 'This hand-off does not exist any more. Ask the agent for a fresh link.');
+    return;
+  }
+  // A 500 or a non-JSON body must not strand the page on a rejected promise.
+  const info = await reply.json().catch(() => null);
+  if (!info || typeof info !== 'object') {
+    netDown();
+    return;
+  }
+  // The daemon's own error body is an answer, not a hand-off state: without
+  // this check it falls through to the pending branch below, paints an empty
+  // domain and ends the page on a false expiry a second later.
+  if (!reply.ok || info.error) {
+    netDown(typeof info.error === 'string' ? info.error.slice(0, 160) : '');
+    return;
+  }
+  netUp();
+  if (info.status === 'expired') {
+    end('⌛', 'Expired', 'This link ran out of time. The agent has to ask again.');
+    return;
+  }
+  if (info.status === 'answered' || info.status === 'collected') {
+    end('✓', 'Done', 'The agent has the code. You can close this page.');
+    return;
+  }
+  if (info.status === 'cancelled') {
+    end('✕', 'Cancelled', 'The agent took another path. You can close this page.');
+    return;
+  }
+  // Pending: fill the page in.
+  expiresAt = Date.now() / 1000 + (info.expires_in || 0);
+  $('ask').hidden = false;
+  $('sub').innerHTML = info.kind === 'setup'
+    ? `Setting up two-factor sign-in for <b></b>.`
+    : `<b></b> is asking for a one-time code.`;
+  $('sub').querySelector('b').textContent = info.domain;
+  if (info.reason) {
+    const reason = document.createElement('div');
+    reason.textContent = info.reason;
+    reason.style.marginTop = '.2rem';
+    $('sub').appendChild(reason);
+  }
+  $('who').textContent = info.requested_by ? `asked by ${info.requested_by}` : '';
+  if (info.kind === 'setup' && info.has_seed && qrState === 'idle') startQr();
+}
+
+$('form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const code = $('code').value.trim();
+  if (!code) { $('error').textContent = 'Type the code first.'; return; }
+  $('error').textContent = '';
+  $('submit').disabled = true;
+  try {
+    const reply = await fetch('/v1/vault/otp/answer', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({token, code})
+    });
+    if (reply.ok) {
+      end('✓', 'Done', 'The agent has the code. You can close this page.');
+      return;
+    }
+    const body = await reply.json().catch(() => ({}));
+    $('error').textContent = body.error || 'Could not send the code.';
+    $('submit').disabled = false;
+  } catch (err) {
+    $('error').textContent = 'No connection. Try again.';
+    $('submit').disabled = false;
+  }
+});
+
+if (!token) {
+  end('✕', 'No token', 'This link is missing its token. Ask the agent for the full link.');
+} else {
+  lookup();
+  setInterval(lookup, 5000);
+  setInterval(tick, 1000);
+}
+</script>
+</body>
+</html>

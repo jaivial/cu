@@ -692,6 +692,24 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
         state.public_host.as_deref(),
         state.vault_host.as_deref(),
     );
+    // The vault's bundled typeface (OFL Manrope) is binary: it never
+    // passes through the String response type. Served on page-route terms
+    // (the login page needs it before any session exists).
+    if host_ok && method == "GET" && path == "/vault/manrope.ttf" {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: font/ttf\r\nContent-Length: {}\r\nCache-Control: max-age=86400\r\nConnection: close\r\n\r\n",
+            MANROPE.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(MANROPE);
+        return;
+    }
+    // The live stream is a WebSocket: it takes the connection over instead of
+    // answering one request, and gates itself (vault session or bearer).
+    if host_ok && crate::live_stream::wants(method, path, head) {
+        crate::live_stream::serve(stream, head, path, authorized, &state);
+        return;
+    }
     let mut set_cookie: Option<String> = None;
     let (status, content_type, response) = if !host_ok {
         (
@@ -703,14 +721,27 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
         ("200 OK", "text/html", login_page())
     } else if path == "/login" && method == "POST" {
         ("200 OK", "text/html", login_submit(body, &state))
+    } else if method == "POST" && is_vault_path(path) && is_vault_ui_only(path) && !origin_ok(head)
+    {
+        (
+            "403 Forbidden",
+            "application/json",
+            "{\"error\":\"cross-origin POST refused\"}".into(),
+        )
     } else if is_vault_path(path) && (!authorized || is_vault_ui_only(path)) {
         // The vault UI authenticates with its own cookie (master password
         // behind nginx basic auth); the local CLI keeps using the bearer.
         // Approve/deny are UI-only even for a bearer caller: every agent on
         // this machine holds the same bearer token, so an agent allowed to
         // answer its own secret request would make the approval theatre.
-        let (status, kind, response, cookie) =
-            vault_route(method, path, body, &state, header_value(head, "cookie"));
+        let (status, kind, response, cookie) = vault_route_with(
+            method,
+            path,
+            body,
+            &state,
+            header_value(head, "cookie"),
+            header_value(head, "x-cu-otp-collect-token"),
+        );
         set_cookie = cookie;
         (status, kind, response)
     } else if !authorized {
@@ -720,14 +751,32 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
             "{\"error\":\"missing or invalid bearer token\"}".into(),
         )
     } else {
-        route(method, path, body, &state)
+        route_with(
+            method,
+            path,
+            body,
+            &state,
+            header_value(head, "x-cu-otp-collect-token"),
+        )
     };
     let mut head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n",
         response.len()
     );
     if let Some(cookie) = set_cookie {
         head.push_str(&format!("Set-Cookie: {cookie}\r\n"));
+    }
+    // Only the read-only viewer page may be framed, and only by the one origin
+    // named in CU_LIVE_FRAME_ORIGIN (an exact `https://host`); without it
+    // nothing may frame it. The page with controls, /vault/live2, may never be
+    // framed. Other routes keep their current headers.
+    match path.split('?').next() {
+        Some("/vault/live2/view") => head.push_str(&format!(
+            "Content-Security-Policy: frame-ancestors {}\r\n",
+            crate::live_stream::frame_ancestors()
+        )),
+        Some("/vault/live2") => head.push_str("Content-Security-Policy: frame-ancestors 'none'\r\n"),
+        _ => {}
     }
     head.push_str("\r\n");
     let _ = write!(stream, "{head}{response}");
@@ -776,7 +825,17 @@ fn is_vault_path(path: &str) -> bool {
 /// would reduce the human's approval to a formality. Approving or denying is
 /// for the person in front of the vault UI.
 fn is_vault_ui_only(path: &str) -> bool {
-    path.ends_with("/approve") || path.ends_with("/deny")
+    let path = path.split('?').next().unwrap_or(path);
+    path.ends_with("/approve")
+        || path.ends_with("/deny")
+        // The one-time-code hand-off: looking up, answering or viewing the
+        // setup QR of a request is the person's side, exactly like deciding
+        // a secret request. An agent holds the bearer token; it must not
+        // answer its own hand-off.
+        || matches!(
+            path,
+            "/v1/vault/otp/answer" | "/v1/vault/otp/lookup" | "/v1/vault/otp/qr"
+        )
 }
 
 /// Normalise a public base URL (`https://login.example.com[:port][/]`) and
@@ -828,6 +887,17 @@ pub fn route(
     full_path: &str,
     body: &str,
     state: &AppState,
+) -> (&'static str, &'static str, String) {
+    route_with(method, full_path, body, state, None)
+}
+
+/// `route` plus the OTP collect token header, threaded to the vault API.
+fn route_with(
+    method: &str,
+    full_path: &str,
+    body: &str,
+    state: &AppState,
+    collect_token: Option<&str>,
 ) -> (&'static str, &'static str, String) {
     // A query string selects options (`?format=png`), never a different
     // resource, so the match below is on the path alone.
@@ -916,6 +986,23 @@ pub fn route(
     } else {
         Tab::default_for(state.cdp_port)
     };
+    // A person holds this tab in the live viewer: no automatic interaction
+    // until they give it back (reads stay allowed).
+    if matches!(
+        (method, path),
+        ("POST", "/v1/navigate")
+            | ("POST", "/v1/act")
+            | ("POST", "/v1/click")
+            | ("POST", "/v1/type")
+            | ("POST", "/v1/upload")
+    ) && crate::live_stream::taken(&tab)
+    {
+        return (
+            "409 Conflict",
+            "application/json",
+            "{\"error\":\"a person has taken control of this tab in the live viewer; automatic actions are paused until they hand it back\"}".into(),
+        );
+    }
     // A person is completing a challenge in this tab: no automatic
     // interaction until a re-check shows it cleared (reads stay allowed, so
     // the agent can still look).
@@ -1337,7 +1424,9 @@ pub fn route(
         }
         // Bearer-authorized vault access (the local CLI, an agent). The
         // full path: the vault API reads its own query (`?tab=`, `?query=`).
-        (_, p) if p.starts_with("/v1/vault") => vault_api(method, full_path, body, state),
+        (_, p) if p.starts_with("/v1/vault") => {
+            vault_api(method, full_path, body, state, collect_token)
+        }
         _ => (
             "404 Not Found",
             "application/json",
@@ -4010,6 +4099,39 @@ impl CdpConnection {
         }
     }
 
+    /// The next message, or `Ok(None)` when nothing arrived within `idle`.
+    ///
+    /// The idle wait is a `peek`, which consumes nothing, so a timeout can
+    /// never leave half a frame in the stream. Once the first byte is there
+    /// the whole frame is read with `frame_limit` as the bound; a failure
+    /// after that point is an error, and the connection must be dropped, not
+    /// read again.
+    pub(crate) fn wait_event(
+        &mut self,
+        idle: Duration,
+        frame_limit: Duration,
+    ) -> Result<Option<String>, String> {
+        let _ = self
+            .stream
+            .set_read_timeout(Some(idle.max(Duration::from_millis(1))));
+        let mut one = [0u8; 1];
+        match self.stream.peek(&mut one) {
+            Ok(0) => return Err("Chromium closed the DevTools connection".into()),
+            Ok(_) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+        let _ = self.stream.set_read_timeout(Some(frame_limit));
+        let message = self.next_message(MAX_CDP_MESSAGE);
+        let _ = self.stream.set_read_timeout(Some(CDP_HTTP_TIMEOUT));
+        message.map(Some)
+    }
+
     /// How long the next read may wait: the auth window pumps the stream
     /// directly and bounds each read by the time it has left.
     pub(crate) fn set_read_timeout(&self, timeout: Duration) {
@@ -4618,13 +4740,34 @@ pub fn decode_base64(s: &str) -> Result<Vec<u8>, String> {
 /// (a browser). Page routes answer whatever the cookie says (the pages
 /// themselves decide by fetching data); data routes 401 without a live UI
 /// session. `cookie` is the request's `Cookie:` header value if it had one.
+// The signature the vault-route tests were written against; production
+// goes through `vault_route_with`, which also carries the OTP collect
+// token header.
+#[cfg(test)]
 fn vault_route(
     method: &str,
-    path: &str,
+    full_path: &str,
     body: &str,
     state: &AppState,
     cookie: Option<&str>,
 ) -> (&'static str, &'static str, String, Option<String>) {
+    vault_route_with(method, full_path, body, state, cookie, None)
+}
+
+/// `vault_route` plus the OTP collect token, which arrives as a header -
+/// never in the URL query, where it would land in history and logs.
+fn vault_route_with(
+    method: &str,
+    full_path: &str,
+    body: &str,
+    state: &AppState,
+    cookie: Option<&str>,
+    collect_token: Option<&str>,
+) -> (&'static str, &'static str, String, Option<String>) {
+    // The query selects content (the hand-off page's token, the login
+    // page's `next`), never a different route — so match without it and
+    // hand the whole thing to the API below.
+    let path = full_path.split('?').next().unwrap_or(full_path);
     match (method, path) {
         ("GET", "/vault") => (
             "200 OK",
@@ -4637,6 +4780,25 @@ fn vault_route(
             "200 OK",
             "text/html; charset=utf-8",
             crate::live::PAGE.into(),
+            None,
+        ),
+        ("GET", "/vault/otp") => ("200 OK", "text/html; charset=utf-8", OTP_PAGE.into(), None),
+        // Control page: the one explicit route. If the page cannot be switched to
+        // control mode it is not served at all, never served in the wrong mode.
+        ("GET", "/vault/live2") => match crate::live_stream::control_page() {
+            Some(page) => ("200 OK", "text/html; charset=utf-8", page, None),
+            None => (
+                "500 Internal Server Error",
+                "text/plain; charset=utf-8",
+                "viewer page template is broken".into(),
+                None,
+            ),
+        },
+        // The page as shipped is read-only: the one a frame may show.
+        ("GET", "/vault/live2/view") => (
+            "200 OK",
+            "text/html; charset=utf-8",
+            crate::live_stream::PAGE.into(),
             None,
         ),
         ("POST", "/v1/vault/ui/login") => {
@@ -4813,7 +4975,7 @@ fn vault_route(
             // every authenticated request, so an active session never expires
             // under the person working, and an abandoned one still dies after
             // its whole lifetime of silence.
-            let (status, kind, response) = vault_api(method, path, body, state);
+            let (status, kind, response) = vault_api(method, full_path, body, state, collect_token);
             (
                 status,
                 kind,
@@ -4828,6 +4990,8 @@ fn vault_route(
 }
 
 const LOGIN_PAGE: &str = include_str!("vault_login.html");
+const OTP_PAGE: &str = include_str!("vault_otp.html");
+const MANROPE: &[u8] = include_bytes!("manrope.ttf");
 const APP_PAGE: &str = include_str!("vault_app.html");
 
 /// The `Set-Cookie` value for a vault UI session.
@@ -4863,6 +5027,7 @@ fn vault_api(
     path: &str,
     body: &str,
     state: &AppState,
+    collect_token: Option<&str>,
 ) -> (&'static str, &'static str, String) {
     // The live view of a tab (a person finishing a check an agent must not
     // solve) is a vault route: same session, same gate.
@@ -5116,12 +5281,302 @@ fn vault_api(
                 Err(e) => error_json(&e),
             }
         }
+        // ---- one-time-code hand-offs ----
+        // An agent opens a hand-off when a page asks for a code it cannot
+        // mint (no stored seed) or when enrollment needs the person's own
+        // authenticator. It hands the URL to the person and polls by id.
+        ("POST", "/v1/vault/otp/requests") => {
+            let field = |k: &str| json_value(body, k).unwrap_or_default();
+            let domain = field("domain");
+            if domain.is_empty() {
+                return error_json("domain is required");
+            }
+            let kind = {
+                let k = field("kind");
+                if k.is_empty() { "code".to_string() } else { k }
+            };
+            let ttl = json_value(body, "ttl_secs")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(crate::vault::OTP_REQUEST_TTL_SECS);
+            match vault.create_otp_request(
+                &domain,
+                &field("reason"),
+                &kind,
+                &field("requested_by"),
+                ttl,
+            ) {
+                Ok((id, token, expires_at)) => {
+                    let path = format!("/vault/otp?t={token}");
+                    // The daemon knows the vault's public host when a proxy
+                    // forwards one; only then is a full URL meaningful.
+                    let url = state
+                        .vault_host
+                        .as_deref()
+                        .map(|host| format!(",\"url\":\"https://{host}{path}\""))
+                        .unwrap_or_default();
+                    (
+                        "200 OK",
+                        "application/json",
+                        format!(
+                            "{{\"id\":{id},\"token\":{},\"path\":{}{url},\"expires_at\":{expires_at}}}",
+                            json_string(&token),
+                            json_string(&path),
+                        ),
+                    )
+                }
+                Err(e) => error_json(&e),
+            }
+        }
+        ("GET", "/v1/vault/otp/requests") => match vault.list_otp_requests() {
+            Ok(body) => ("200 OK", "application/json", body),
+            Err(e) => error_json(&e),
+        },
+        // The agent's poll: status only while pending; the moment the row is
+        // answered the response is handed over once and deleted (see
+        // `poll_otp_request`). `?wait=S` parks like `cu challenge wait`.
+        ("GET", p) if p.starts_with("/v1/vault/otp/requests/") => {
+            let tail = &p["/v1/vault/otp/requests/".len()..];
+            let Ok(id) = tail.parse::<i64>() else {
+                return error_json("request id must be a number");
+            };
+            let wait_for = seconds_param(query(path), "wait", 0.0);
+            let deadline = std::time::Instant::now()
+                + Duration::from_secs_f64(wait_for.clamp(0.0, wait_ceiling_s()));
+            loop {
+                match vault.poll_otp_request(id, true, collect_token) {
+                    Ok(Some(body)) => {
+                        let done = json_string_value(&body, "status")
+                            .map(|s| s != "pending")
+                            .unwrap_or(true);
+                        if done || wait_for <= 0.0 || std::time::Instant::now() >= deadline {
+                            return ("200 OK", "application/json", body);
+                        }
+                    }
+                    Ok(None) => return error_json("no such request"),
+                    Err(e) => return error_json(&e),
+                }
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        }
+        ("DELETE", p) if p.starts_with("/v1/vault/otp/requests/") => {
+            let tail = &p["/v1/vault/otp/requests/".len()..];
+            let Ok(id) = tail.parse::<i64>() else {
+                return error_json("request id must be a number");
+            };
+            match vault.cancel_otp_request(id) {
+                Ok(true) => ("200 OK", "application/json", "{\"cancelled\":true}".into()),
+                Ok(false) => error_json("request is not pending any more"),
+                Err(e) => error_json(&e),
+            }
+        }
+        // Capture the setup QR off the page. The decoded URI is a seed: it
+        // is sealed into the credential (and, for a setup hand-off, into the
+        // request so the temporary page can re-render it as a QR). The reply
+        // carries the issuer and account for confirmation, never the URI.
+        ("POST", "/v1/vault/otp/capture") => otp_capture(state, path, body, &vault, None),
+        // The collector's acknowledgement: the code arrived; only now does
+        // the vault wipe it (see `poll_otp_request` for the two-step
+        // hand-over). Without the owning collect token this changes nothing.
+        ("POST", p) if p.starts_with("/v1/vault/otp/requests/") && p.ends_with("/ack") => {
+            let tail = &p["/v1/vault/otp/requests/".len()..p.len() - "/ack".len()];
+            let Ok(id) = tail.parse::<i64>() else {
+                return error_json("request id must be a number");
+            };
+            let token = json_value(body, "collect_token").unwrap_or_default();
+            match vault.ack_otp_request(id, &token) {
+                Ok(true) => ("200 OK", "application/json", "{\"acknowledged\":true}".into()),
+                Ok(false) => error_json("not collecting, or the collect token does not match"),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("POST", p) if p.starts_with("/v1/vault/otp/requests/") && p.ends_with("/capture") => {
+            let tail = &p["/v1/vault/otp/requests/".len()..p.len() - "/capture".len()];
+            let Ok(id) = tail.parse::<i64>() else {
+                return error_json("request id must be a number");
+            };
+            otp_capture(state, path, body, &vault, Some(id))
+        }
+        // The current code from a stored seed — the whole point of capturing
+        // one. `{"domain": "..."}` or `{"credential_id": N}`.
+        ("POST", "/v1/vault/otp/code") => {
+            let credential_id =
+                json_value(body, "credential_id").and_then(|v| v.parse::<i64>().ok());
+            let found = match credential_id {
+                Some(id) => vault
+                    .totp_for_credential(id)
+                    .map(|opt| opt.map(|(code, left)| (id, code, left))),
+                None => {
+                    let domain = json_value(body, "domain").unwrap_or_default();
+                    if domain.is_empty() {
+                        return error_json("domain or credential_id is required");
+                    }
+                    vault.totp_for_domain(&domain)
+                }
+            };
+            match found {
+                Ok(Some((id, code, left))) => (
+                    "200 OK",
+                    "application/json",
+                    format!(
+                        "{{\"credential_id\":{id},\"code\":{},\"seconds_remaining\":{left}}}",
+                        json_string(&code)
+                    ),
+                ),
+                Ok(None) => error_json("no stored TOTP seed covers this"),
+                Err(e) => error_json(&e),
+            }
+        }
+        // The person's side. Reached only with a live UI session: these
+        // paths are UI-only (see `is_vault_ui_only`).
+        ("POST", "/v1/vault/otp/answer") => {
+            let token = json_value(body, "token").unwrap_or_default();
+            let code = json_value(body, "code").unwrap_or_default();
+            match vault.answer_otp_request(&token, &code) {
+                Ok(true) => ("200 OK", "application/json", "{\"answered\":true}".into()),
+                Ok(false) => error_json("this hand-off is spent, expired or unknown"),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("GET", "/v1/vault/otp/lookup") => {
+            let token = form_value(query(path), "t");
+            match vault.otp_request_by_token(&token) {
+                Ok(Some(body)) => ("200 OK", "application/json", body),
+                Ok(None) => (
+                    "404 Not Found",
+                    "application/json",
+                    "{\"error\":\"unknown or expired hand-off\"}".into(),
+                ),
+                Err(e) => error_json(&e),
+            }
+        }
+        ("GET", "/v1/vault/otp/qr") => {
+            let token = form_value(query(path), "t");
+            match vault.otp_request_seed_by_token(&token) {
+                Ok(Some(uri)) => match crate::qr::render_svg(&uri) {
+                    Ok(svg) => ("200 OK", "image/svg+xml", svg),
+                    Err(e) => error_json(&e),
+                },
+                Ok(None) => (
+                    "404 Not Found",
+                    "application/json",
+                    "{\"error\":\"no setup code on this hand-off\"}".into(),
+                ),
+                Err(e) => error_json(&e),
+            }
+        }
         _ => (
             "404 Not Found",
             "application/json",
             "{\"error\":\"not found\"}".into(),
         ),
     }
+}
+
+/// Shared by the two capture routes: decode the page's setup QR, seal the
+/// URI into the credential it belongs to, and (for a setup hand-off) onto
+/// the request, so the temporary page can show the same QR to the person.
+fn otp_capture(
+    state: &AppState,
+    path: &str,
+    body: &str,
+    vault: &crate::vault::Vault,
+    request_id: Option<i64>,
+) -> (&'static str, &'static str, String) {
+    if let Err(e) = wait_until_ready(state) {
+        return error_json(&e);
+    }
+    let wanted = form_value(query(path), "tab");
+    if wanted.is_empty() {
+        // A seed capture never falls back to whatever tab happens to be
+        // default: the caller names the tab sitting on the service's setup
+        // page, so a seed can only come from a deliberately chosen page.
+        return error_json(
+            "capture needs an explicit --tab naming the tab on the service's setup page",
+        );
+    }
+    let tab = match named_tab(state.cdp_port, &wanted) {
+        Ok(tab) => tab,
+        Err(e) => return error_json(&e),
+    };
+    let domain = {
+        let asked = json_value(body, "domain").unwrap_or_default();
+        if !asked.is_empty() {
+            asked
+        } else if let Some(id) = request_id {
+            vault.otp_request_domain(id).unwrap_or_default()
+        } else {
+            String::new()
+        }
+    };
+    if domain.is_empty() {
+        return error_json("domain is required (or capture through a hand-off that names one)");
+    }
+    // Identity before decoding: the page this tab actually shows must belong
+    // to the domain the capture claims. Sealing a seed read off the wrong
+    // site would break a working 2FA setup, so a mismatch refuses instead
+    // of guessing - pass an explicit tab when the default one is elsewhere.
+    let tab_url = tab
+        .command(
+            "Runtime.evaluate",
+            "{\"expression\":\"location.href\",\"returnByValue\":true}",
+        )
+        .ok()
+        .and_then(|reply| evaluated_string(&reply))
+        .unwrap_or_default();
+    let host = url_host(&tab_url);
+    if host.is_empty() {
+        return error_json(
+            "could not read the tab's address; pass an explicit --tab on the service's page",
+        );
+    }
+    if !host_covers(&host, &domain) {
+        return error_json(&format!(
+            "the tab is on {host}, not {domain}; capture on the service's own page (pass --tab to name it)"
+        ));
+    }
+    let uri = match crate::qr::capture_otpauth(&tab) {
+        Ok(uri) => uri,
+        Err(e) => return error_json(&e),
+    };
+    let parsed = match crate::otp::parse(&uri) {
+        Ok(parsed) => parsed,
+        Err(e) => return error_json(&e),
+    };
+    if !issuer_matches_host(&parsed.issuer, &host) {
+        return error_json(&format!(
+            "the QR names issuer {} but the tab is on {host}; refusing to seal a seed that does not match its page",
+            json_string(&parsed.issuer),
+        ));
+    }
+    let credential_id = json_value(body, "credential_id").and_then(|v| v.parse::<i64>().ok());
+    let force = json_value(body, "force").as_deref() == Some("true");
+    let label = if parsed.account.is_empty() {
+        "2FA".to_string()
+    } else {
+        parsed.account.clone()
+    };
+    let (id, replaced) = match vault.put_totp(credential_id, &domain, &label, &uri, force) {
+        Ok(done) => done,
+        Err(e) => return error_json(&e),
+    };
+    if let Some(request) = request_id
+        && let Err(e) = vault.set_otp_request_seed(request, &uri)
+    {
+        return error_json(&e);
+    }
+    let mut reply = format!(
+        "{{\"stored\":true,\"credential_id\":{id},\"issuer\":{},\"account\":{}",
+        json_string(&parsed.issuer),
+        json_string(&parsed.account),
+    );
+    if let Some(previous) = replaced {
+        reply.push_str(&format!(
+            ",\"replaced\":true,\"previous_account\":{}",
+            json_string(&previous)
+        ));
+    }
+    reply.push('}');
+    ("200 OK", "application/json", reply)
 }
 
 fn error_json(error: &str) -> (&'static str, &'static str, String) {
@@ -5145,6 +5600,55 @@ fn filter_cookies(cookies: &[String], domain: &str) -> String {
         })
         .collect();
     format!("[{}]", kept.join(","))
+}
+
+/// `host` is `domain` itself or under it, in either direction of
+/// sub-domain: the page a capture reads must live where the caller claims.
+fn host_covers(host: &str, domain: &str) -> bool {
+    let h = host.trim_start_matches("www.");
+    let d = domain.trim_start_matches("www.");
+    h == d || h.ends_with(&format!(".{d}")) || d.ends_with(&format!(".{h}"))
+}
+
+/// The otpauth issuer should visibly belong to the site showing the QR: a
+/// label of the host contains the issuer (or the other way round). An empty
+/// issuer cannot contradict anything.
+fn issuer_matches_host(issuer: &str, host: &str) -> bool {
+    let norm = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let issuer = norm(issuer);
+    if issuer.is_empty() {
+        return true;
+    }
+    // Match against the meaningful labels only: the TLD (or a public
+    // suffix piece like `co`) never counts, and containment needs at least
+    // three characters on both sides so `co`/`app` cannot vouch for a seed.
+    let labels: Vec<&str> = host.split('.').collect();
+    let meaningful = &labels[..labels.len().saturating_sub(1)];
+    meaningful.iter().any(|label| {
+        let label = norm(label);
+        !label.is_empty()
+            && (label == issuer
+                || (label.len() >= 3
+                    && issuer.len() >= 3
+                    && (label.contains(&issuer) || issuer.contains(&label))))
+    })
+}
+
+/// A UI-only POST that carries an Origin header must name this host. The
+/// SameSite=Lax cookie keeps cross-site posts from authenticating; this
+/// refuses the ones a lax client still sends.
+fn origin_ok(head: &str) -> bool {
+    let Some(origin) = header_value(head, "origin") else {
+        return true;
+    };
+    let host = header_value(head, "host").unwrap_or("");
+    let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
+    url_host(origin) == host
 }
 
 /// `.example.com` / `example.com` cover `app.example.com` and itself.

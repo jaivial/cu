@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>cu live stream</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.4 system-ui, sans-serif; background: #0f1115; color: #e6e6e6;
+         min-height: 100dvh; display: flex; flex-direction: column; }
+  header { display: flex; gap: .5rem; align-items: center; padding: .5rem .6rem; background: #171a21;
+           border-bottom: 1px solid #2a2f3a; position: sticky; top: 0; z-index: 2; }
+  header h1 { font-size: .9rem; margin: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  button, select, input { font-size: 16px; min-height: 46px; border-radius: 10px; border: 1px solid #2a2f3a;
+           background: #232936; color: inherit; padding: 0 .9rem; }
+  button.primary { background: #3b82f6; border-color: #3b82f6; color: #fff; }
+  button.done { background: #166534; border-color: #166534; color: #fff; }
+  #stage { flex: 1; padding: .5rem; overflow: auto; }
+  #view { width: 100%; display: block; border-radius: 8px; border: 1px solid #2a2f3a; background: #000;
+          touch-action: none; user-select: none; outline: none; }
+  #view:focus { border-color: #3b82f6; }
+  #bar { position: sticky; bottom: 0; background: #171a21; border-top: 1px solid #2a2f3a;
+         padding: .5rem .6rem calc(.5rem + env(safe-area-inset-bottom)); display: grid; gap: .5rem; }
+  #bar .row { display: flex; gap: .5rem; }
+  #bar .row > * { flex: 1; }
+  #text { flex: 3; min-width: 0; }
+  #status { font-size: .8rem; color: #8b93a7; padding: 0 .2rem; word-break: break-all; }
+  /* Read-only mode (served at /vault/live2/view): no controls at all, the picture fits the frame. */
+  body[data-mode=view] #bar, body[data-mode=view] header a { display: none; }
+  body[data-mode=view] header { position: static; padding: .25rem .4rem; }
+  body[data-mode=view] header h1 { display: none; }
+  body[data-mode=view] header select { min-height: 32px; font-size: 14px; flex: 1; max-width: none !important; }
+  body[data-mode=view] #stage { padding: .25rem; display: flex; align-items: center; justify-content: center; overflow: hidden; min-height: 0; }
+  body[data-mode=view] #view { width: auto; height: auto; max-width: 100%; max-height: calc(100dvh - 4.2rem); }
+  body[data-mode=view] #status { position: fixed; left: 0; right: 0; bottom: 0; background: #171a21; padding: .15rem .4rem; font-size: .7rem; }
+</style>
+</head>
+<body data-mode="view">
+<header>
+  <h1 id="title">cu live stream</h1>
+  <select id="tabs" aria-label="Tab" style="max-width:6rem;padding:0 .4rem"></select>
+  <a href="/vault/app" style="color:#8b93a7">Vault</a>
+</header>
+<div id="status">Connecting…</div>
+<div id="stage"><canvas id="view" tabindex="0" width="16" height="9"></canvas></div>
+<div id="bar">
+  <div class="row">
+    <input id="text" placeholder="Type here, then Send" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false">
+    <button id="send" class="primary">Send</button>
+  </div>
+  <button id="take" class="primary">Take control</button>
+  <button id="release" class="done">I'm done, hand back to the agent</button>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const viewOnly = document.body.dataset.mode !== 'control';
+const cv = $('view'), ctx = cv.getContext('2d');
+let ended = false, ws = null, tab = '', held = false, controlling = false, closedByUs = false, delay = 1000;
+let frames = 0, bytes = 0, shown = 0, lastTick = performance.now(), fps = 0, kbps = 0, size = '';
+
+
+// Signed out or expired. Top level: go to the login page. Inside a frame the
+// login page cannot be framed, so show a link that opens it in its own tab
+// and never navigate the frame.
+function signedOut() {
+  if (ended) return;
+  ended = true;
+  closedByUs = true;
+  if (window.top === window.self) { location.href = '/vault'; return; }
+  // Framed: the sandbox blocks popups, so a link here would do nothing. The
+  // parent panel owns the login link, outside the frame.
+  $('status').textContent = 'Session ended. Use "Open login" in the panel, then reopen it.';
+}
+
+async function loadTabs() {
+  if (ended) return;
+  try {
+    const r = await fetch('/v1/vault/live/tabs');
+    if (r.status === 401) { signedOut(); return; }
+    const tabs = ((await r.json()).tabs || []).filter(t => !t.url.startsWith('chrome'));
+    // A blank tab never repaints, so it shows 0 fps: prefer a tab with a page in it.
+    const withPage = tabs.filter(t => t.url !== 'about:blank');
+    if (withPage.length) { tabs.length = 0; tabs.push(...withPage); }
+    // Page titles and URLs come from sites the agent visited: text only, never markup.
+    const sel = $('tabs');
+    sel.replaceChildren(...tabs.map(t => new Option((t.title || t.url).slice(0, 28), t.id)));
+    if (!tab && tabs.length) tab = (tabs.find(t => t.default) || tabs[0]).id;
+    $('tabs').value = tab;
+  } catch (e) {}
+}
+function status(extra) {
+  const mode = !ws || ws.readyState !== 1 ? 'Offline. '
+    : controlling ? (held ? 'You have control; the agent is paused. ' : 'You have control; the agent may still be acting. ')
+    : 'Watching only. ';
+  $('status').textContent = mode
+    + fps.toFixed(0) + ' fps, ' + kbps.toFixed(0) + ' kB/s ' + size + (extra ? ' ' + extra : '');
+}
+function send(o) {
+  if (!ws || ws.readyState !== 1) return;
+  // Input only goes out once the person has taken control.
+  if (['mouse', 'wheel', 'key', 'text'].includes(o.t) && !controlling) return;
+  ws.send(JSON.stringify(o));
+}
+
+function connect() {
+  if (ended) return;
+  closedByUs = false;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/v1/vault/live/stream' + '?' + (viewOnly ? 'mode=view&' : '') + (tab ? 'tab=' + encodeURIComponent(tab) : ''));
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { delay = 1000; controlling = false; status(); };
+  ws.onmessage = async (ev) => {
+    if (typeof ev.data === 'string') {
+      const m = JSON.parse(ev.data);
+      if (m.t === 'control') { if ('held' in m) held = !!m.held; if ('controlling' in m) controlling = !!m.controlling; status(); }
+      else if (m.t === 'denied') { controlling = false; status(m.readonly ? 'Read-only view.' : 'Press Take control first.'); }
+      else if (m.t === 'reopening') status('Reconnecting to the browser…');
+      else if (m.t === 'error') status(m.error);
+      return;
+    }
+    const v = new DataView(ev.data);
+    if (v.getUint8(0) !== 1) return;
+    const w = v.getUint16(5), h = v.getUint16(7);
+    frames++; bytes += ev.data.byteLength;
+    try {
+      const bmp = await createImageBitmap(new Blob([ev.data.slice(9)], { type: 'image/jpeg' }));
+      if (cv.width !== bmp.width || cv.height !== bmp.height) { cv.width = bmp.width; cv.height = bmp.height; }
+      ctx.drawImage(bmp, 0, 0);
+      size = bmp.width + 'x' + bmp.height + ' (page ' + w + 'x' + h + ')';
+      bmp.close();
+      shown++;
+    } catch (e) {}
+    // Tell the server the frame is drawn so it can send the next one.
+    send({ t: 'ack', seq: v.getUint32(1) });
+  };
+  ws.onclose = async () => {
+    controlling = false;
+    if (closedByUs) return;
+    // A refused upgrade shows up as a plain close. Ask the API why before retrying:
+    // a logged-out or expired session goes to the login page, never into a retry loop.
+    try {
+      const r = await fetch('/v1/vault/live/tabs');
+      if (r.status === 401) { signedOut(); return; }
+      if (r.status === 403 || r.status === 421) { status('Refused by the server.'); return; }
+    } catch (e) {}
+    status('Reconnecting…');
+    setTimeout(connect, delay); delay = Math.min(delay * 2, 15000);
+  };
+}
+setInterval(() => {
+  const now = performance.now(), s = (now - lastTick) / 1000;
+  fps = shown / s; kbps = bytes / 1024 / s; shown = 0; frames = 0; bytes = 0; lastTick = now;
+  send({ t: 'ping' }); status();
+}, 2000);
+
+$('tabs').onchange = () => { tab = $('tabs').value; closedByUs = true; if (ws) ws.close(); connect(); };
+
+// Position as a fraction of the picture, so the page size never matters.
+function pos(ev) {
+  const r = cv.getBoundingClientRect();
+  return { x: (ev.clientX - r.left) / r.width, y: (ev.clientY - r.top) / r.height };
+}
+const mods = (ev) => (ev.altKey ? 1 : 0) | (ev.ctrlKey ? 2 : 0) | (ev.metaKey ? 4 : 0) | (ev.shiftKey ? 8 : 0);
+const btn = (ev) => ev.button === 2 ? 'right' : ev.button === 1 ? 'middle' : 'left';
+let touch = null, moveQueued = null;
+cv.addEventListener('contextmenu', e => e.preventDefault());
+cv.addEventListener('pointerdown', ev => {
+  cv.focus(); cv.setPointerCapture(ev.pointerId);
+  if (ev.pointerType === 'touch') { touch = { ...pos(ev), px: ev.clientX, py: ev.clientY, t: Date.now(), scrolled: false }; return; }
+  send({ t: 'mouse', a: 'down', b: btn(ev), ...pos(ev), mod: mods(ev) });
+});
+cv.addEventListener('pointermove', ev => {
+  if (ev.pointerType === 'touch') {
+    if (!touch) return;
+    const dx = ev.clientX - touch.px, dy = ev.clientY - touch.py;
+    if (touch.scrolled || Math.hypot(dx, dy) > 10) {
+      touch.scrolled = true;
+      send({ t: 'wheel', ...touch, dx: -dx, dy: -dy });
+      touch.px = ev.clientX; touch.py = ev.clientY;
+    }
+    return;
+  }
+  // Movement is sent at most once per animation frame: the newest position wins.
+  const queued = moveQueued !== null;
+  moveQueued = { t: 'mouse', a: 'move', b: ev.buttons ? 'left' : 'none', ...pos(ev), mod: mods(ev) };
+  if (!queued) requestAnimationFrame(() => { if (moveQueued) send(moveQueued); moveQueued = null; });
+});
+cv.addEventListener('pointerup', ev => {
+  if (ev.pointerType === 'touch') {
+    if (touch && !touch.scrolled) {
+      send({ t: 'mouse', a: 'move', b: 'none', x: touch.x, y: touch.y });
+      send({ t: 'mouse', a: 'down', b: 'left', x: touch.x, y: touch.y });
+      send({ t: 'mouse', a: 'up', b: 'left', x: touch.x, y: touch.y });
+    }
+    touch = null; return;
+  }
+  send({ t: 'mouse', a: 'up', b: btn(ev), ...pos(ev), mod: mods(ev) });
+});
+cv.addEventListener('wheel', ev => {
+  ev.preventDefault();
+  send({ t: 'wheel', ...pos(ev), dx: ev.deltaX, dy: ev.deltaY, mod: mods(ev) });
+}, { passive: false });
+// Desktop keyboard: every key goes to the page while the picture has focus.
+for (const type of ['keydown', 'keyup']) cv.addEventListener(type, ev => {
+  ev.preventDefault();
+  send({ t: 'key', a: type === 'keydown' ? 'down' : 'up', key: ev.key, code: ev.code, vk: ev.keyCode,
+         text: ev.key.length === 1 ? ev.key : (ev.key === 'Enter' ? '\r' : ''), mod: mods(ev) });
+});
+// Phone keyboard and paste: whole strings.
+$('send').onclick = () => { const t = $('text').value; if (t) { send({ t: 'text', text: t }); $('text').value = ''; } };
+$('take').onclick = () => { send({ t: 'take' }); cv.focus(); };
+$('release').onclick = () => { send({ t: 'release' }); controlling = false; status(); };
+loadTabs().then(connect);
+setInterval(loadTabs, 15000);
+</script>
+</body>
+</html>

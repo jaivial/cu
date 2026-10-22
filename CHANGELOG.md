@@ -1,5 +1,84 @@
 # Changelog
 
+## [1.4.0] - 2026-10-20
+
+### Added
+
+- **One-time codes without a takeover: `cu otp`.** A 2FA page no longer means
+  handing the whole browser to a person.
+  - `cu otp code DOMAIN` (or `--credential ID`) mints the current TOTP code
+    from a seed the vault holds — RFC 6238 over SHA-1/256/512, 4-8 digits,
+    any period, parsed from the full `otpauth://` URI or a bare base32 key.
+  - `cu otp request DOMAIN [--kind code|setup] [--wait]` opens a hand-off
+    and prints a short `/vault/otp?t=…` link: a temporary page, one token
+    per request, where the person types the code (or, for setup, scans the
+    same QR the agent captured). The agent's `--wait` parks until the answer
+    lands, the link expires, or the budget runs out — the navigation resumes
+    by itself, no polling loop.
+  - `cu otp capture --domain D` reads the setup QR off the page itself:
+    square QR-looking elements first (attribute text mentioning qr/otp/2fa
+    ranks highest), the full viewport as fallback, decoded in pure Rust
+    (`rqrr`). The URI is sealed into the domain's credential as a secret
+    `totp` field and is never returned, logged or rendered outside the
+    hand-off page. The reply names only the issuer and account it was stored
+    for. Capture refuses to guess: the tab must actually be on the claimed
+    domain, the QR's issuer must match that host, several different setup
+    QRs on one page are an error, the capture always names its tab
+    explicitly (`--tab`), and a credential that already holds a live seed
+    refuses the overwrite: the refusal names the existing setup so the user
+    can confirm the replacement first, and only then `--replace` applies
+    (the reply says `replaced: true` and names the previous account).
+  - The challenge hint on a first-party code page now points here: seed →
+    `cu otp code`, no seed → `cu otp request`, live takeover stays the
+    fallback.
+- **The vault UI wears the Bizvaretto identity.** Light, clean and minimal:
+  Manrope (bundled, OFL, served at `/vault/manrope.ttf`), the studio's paper
+  and ink palette, pill buttons, calm cards — login, app, live view and the
+  new hand-off page share the language. The login honours `?next=` so a
+  hand-off link returns to its page after unlocking.
+- **The vault shows code hand-offs.** A Codes view lists them (waiting,
+  answered, expired, cancelled) and can cancel a pending one; the badge
+  counts pending hand-offs like it counts secret requests.
+
+### Security
+
+- Hand-off tokens are 192 bits of randomness; only their SHA-256 is stored,
+  so a database read cannot mint answer links. The hand-off page strips its
+  token from the address bar on load and every reply carries
+  `Referrer-Policy: no-referrer`; UI-only POSTs carrying an Origin header
+  from another host get 403. Collecting an answer is a two-step hand-over:
+  the first collect claims the row and hands the code over with a one-owner
+  collect token; only that token can re-fetch the code after a cut
+  connection or acknowledge it, and the stored value is wiped on the ACK -
+  or by the reaper when the five-minute collection window closes, never
+  re-exposed, never delivered to a second collector (at-most-once to one
+  owner with bounded redelivery, not exactly-once). The CLI generates its
+  own collect token from the OS CSPRNG, keeps it - and the retrieved code,
+  once it lands - in a 0600 state file next to the daemon's data, and sends
+  it as a header, never in the URL; a crashed or killed `cu otp wait` is
+  resumed by running it again, and transport errors retry inside the
+  budget instead of killing the process. The ACK is idempotent, so a lost
+  ACK reply is safe to retry; a definitive refusal (the window closed,
+  the token is not the owner's) ends the wait instead of retrying forever.
+  The five-minute collection window is the vault's delivery retention, not
+  the code's validity - a TOTP code lives about thirty seconds and is used
+  immediately. State past ten minutes is deleted when a wait next touches
+  the collect directory (stale hand-off files and orphaned temp files
+  alike), never resumed - but note this is hygiene on use, not a guarantee:
+  a crashed wait nobody reruns can leave its 0600 file (expired token,
+  dead code) until the next `cu otp` invocation. The
+  hand-off page only reveals its QR block once the image has actually
+  loaded - a request without a usable setup QR keeps the code-only
+  layout, no broken image. Answers are single-use
+  (enforced in the answering UPDATE, not in a check that could race),
+  sealed at rest, handed to the polling agent exactly once and deleted in
+  the same write; expiry is ten minutes by default (1-15 honoured). Rows a
+  day past usefulness are reaped; metadata alone stays as the audit trail.
+- Answering, looking up or viewing the setup QR of a hand-off is UI-only —
+  the bearer token every local agent holds cannot answer its own request,
+  exactly as with secret-request approvals. The temporary page also requires
+  the vault's UI session, so a forwarded link is not a key by itself.
+
 ## [1.3.0] - 2026-10-19
 
 ### Added

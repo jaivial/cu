@@ -6,114 +6,103 @@
 <title>cu vault</title>
 <style>
   :root {
-    color-scheme: light dark;
-    --bg: #f4f5f8;
-    --card: #ffffff;
-    --line: #dfe3ea;
-    --field: #ffffff;
-    --text: #14161a;
-    --muted: #5b6472;
-    --accent: #2563eb;
-    --accent-text: #ffffff;
-    --danger: #b42318;
-    --ring: rgba(37, 99, 235, .35);
+    --paper: #f5f6fa; --white: #fff; --ink: #20242f; --muted: #636774;
+    --blue: #3649ed; --blue-dark: #293ac8; --lilac: #e2def9; --mint: #deebe4;
+    --line: #dfe1e9; --danger: #c0352b;
   }
+
+  /* Bizvaretto is a light identity; people whose system is dark keep a
+     tuned dark scheme instead of a blinding page. */
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #0f1115;
-      --card: #171a21;
-      --line: #2a2f3a;
-      --field: #0f1115;
-      --text: #e6e8ec;
-      --muted: #98a1b2;
-      --accent: #3b82f6;
-      --accent-text: #ffffff;
-      --danger: #f87171;
-      --ring: rgba(59, 130, 246, .45);
+      --paper: #171a23; --white: #20242f; --ink: #e9ebf3; --muted: #9aa1b5;
+      --blue: #6a78ff; --blue-dark: #8b96ff; --lilac: #2a2745; --mint: #1f2d27;
+      --line: #323748; --danger: #ff8080;
     }
+  }
+  @font-face {
+    font-family: 'Manrope';
+    src: url('/vault/manrope.ttf') format('truetype');
+    font-weight: 200 800; font-display: swap;
   }
   * { box-sizing: border-box; }
   body {
-    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
-    background: var(--bg); color: var(--text);
-    display: grid; place-items: center; min-height: 100vh; margin: 0;
+    font: 16px/1.5 'Manrope', system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--paper); color: var(--ink);
+    display: grid; place-items: center; min-height: 100dvh; margin: 0;
     padding: 1.5rem 1rem;
   }
   .card {
-    background: var(--card);
+    background: var(--white);
     border: 1px solid var(--line);
-    border-radius: 16px;
-    padding: 2rem 1.75rem 1.5rem;
+    border-radius: 20px;
+    padding: 2.2rem 1.9rem 1.8rem;
     width: min(25rem, 100%);
-    box-shadow: 0 1px 2px rgba(0, 0, 0, .04), 0 8px 28px rgba(0, 0, 0, .06);
+    box-shadow: 0 1px 2px rgba(32, 36, 47, .04), 0 12px 32px rgba(32, 36, 47, .06);
   }
-  h1 { font-size: 1.25rem; line-height: 1.3; margin: 0 0 .3rem; letter-spacing: -.01em; }
-  .sub { color: var(--muted); font-size: .9rem; margin: 0 0 1.4rem; }
+  .brand { font-weight: 800; font-size: 1.05rem; letter-spacing: -.02em; margin: 0 0 1.4rem; }
+  .brand span { color: var(--blue); }
+  h1 { font-size: 1.4rem; font-weight: 700; line-height: 1.15; margin: 0 0 .35rem; letter-spacing: -.03em; }
+  .sub { color: var(--muted); font-size: .92rem; margin: 0 0 1.5rem; }
 
-  label { display: block; font-size: .85rem; font-weight: 500; color: var(--muted); margin: 0 0 .35rem; }
+  label { display: block; font-size: .85rem; font-weight: 600; color: var(--muted); margin: 0 0 .35rem; }
 
   /* 16px exactly: below that, iOS Safari zooms the viewport the moment the
-     field takes focus and never zooms back. `max(16px, 1em)` is the rule the
-     rest of the project's UI already follows (mini-tui web/src/app.css). */
+     field takes focus and never zooms back. */
   input[type="password"] {
     width: 100%;
-    min-height: 44px;
-    padding: .7rem .8rem;
-    border-radius: 10px;
+    min-height: 48px;
+    padding: .7rem .9rem;
+    border-radius: 12px;
     border: 1px solid var(--line);
-    background: var(--field);
+    background: var(--white);
     color: inherit;
     font-size: max(16px, 1em);
     font-family: inherit;
   }
-  input::placeholder { color: var(--muted); opacity: .8; }
+  input::placeholder { color: var(--muted); opacity: .7; }
   input:focus-visible, button:focus-visible, .remember input:focus-visible {
-    outline: 2px solid var(--accent);
+    outline: 2px solid var(--blue);
     outline-offset: 2px;
-    box-shadow: 0 0 0 5px var(--ring);
   }
   .field { margin-bottom: 1rem; }
 
   .remember {
     display: flex; align-items: flex-start; gap: .6rem;
-    min-height: 44px; margin: -.2rem 0 1.1rem;
-    color: var(--text); font-size: .92rem; cursor: pointer;
+    min-height: 44px; margin: -.1rem 0 1.2rem;
+    color: var(--ink); font-size: .92rem; cursor: pointer;
     user-select: none;
   }
-  /* The label wraps to two lines on a phone, so the box sits on the first
-     one rather than floating down the middle of the pair. */
-  .remember input { width: 20px; height: 20px; accent-color: var(--accent); margin: .1rem 0 0; flex: 0 0 auto; }
+  .remember input { width: 20px; height: 20px; accent-color: var(--blue); margin: .1rem 0 0; flex: 0 0 auto; }
   .remember span { line-height: 1.35; }
   .remember .note { color: var(--muted); }
 
   button {
-    width: 100%; min-height: 44px;
-    padding: .7rem 1rem;
-    border-radius: 10px;
-    border: 1px solid var(--accent);
-    background: var(--accent);
-    color: var(--accent-text);
-    font-size: 1rem; font-family: inherit; font-weight: 500;
+    width: 100%; min-height: 48px;
+    padding: .7rem 1.2rem;
+    border-radius: 100px;
+    border: 1px solid var(--blue);
+    background: var(--blue);
+    color: #fff;
+    font-size: 1rem; font-family: inherit; font-weight: 700;
+    letter-spacing: -.01em;
     cursor: pointer;
+    transition: background .18s ease, border-color .18s ease;
   }
-  button:hover { filter: brightness(1.08); }
-  button[disabled] { opacity: .6; cursor: progress; }
+  button:hover { background: var(--blue-dark); border-color: var(--blue-dark); }
+  button[disabled] { opacity: .55; cursor: progress; }
 
-  .error {
-    color: var(--danger);
-    min-height: 1.25rem;
-    margin: 0 0 .5rem;
-    font-size: .9rem;
-  }
+  .error { color: var(--danger); min-height: 1.25rem; margin: 0 0 .5rem; font-size: .9rem; }
   .error:empty { min-height: 0; margin-bottom: 0; }
-  .hint { color: var(--muted); font-size: .85rem; margin: 1.1rem 0 0; }
+  .hint { color: var(--muted); font-size: .85rem; margin: 1.2rem 0 0; }
   .hint:empty { display: none; }
 </style>
 </head>
 <body>
 <main class="card">
-  <h1 id="title">cu vault</h1>
-  <p class="sub" id="sub">Unlock with the vault master password.</p>
+  <p class="brand">cu<span>·</span>vault</p>
+  <h1 id="title">Unlock the vault</h1>
+  <p class="sub" id="sub">Your master password opens it.</p>
   <p class="error" id="error" role="alert" aria-live="polite"></p>
   <form id="form" novalidate>
     <div class="field">
@@ -138,6 +127,13 @@ const $ = (id) => document.getElementById(id);
 const error = $('error');
 let firstRun = false;
 
+// Where to go after unlocking: a hand-off link brought the person here.
+// Only same-origin vault paths are honoured, never an off-site URL.
+function nextTarget() {
+  const next = new URLSearchParams(location.search).get('next') || '';
+  return next.startsWith('/vault/') ? next : '/vault/app';
+}
+
 function fail(text) {
   error.textContent = text;
   $('password').focus();
@@ -148,13 +144,13 @@ function fail(text) {
 // cannot read.
 fetch('/v1/vault/ui/session')
   .then(r => r.json())
-  .then(s => { if (s && s.authenticated) location.replace('/vault/app'); })
+  .then(s => { if (s && s.authenticated) location.replace(nextTarget()); })
   .catch(() => {});
 
 fetch('/v1/vault/ui/state').then(r => r.json()).then(s => {
   if (!s.has_password) {
     firstRun = true;
-    $('title').textContent = 'cu vault — first run';
+    $('title').textContent = 'Choose a master password';
     $('sub').textContent = 'No master password yet: the first one you type here becomes it.';
     $('confirm-field').hidden = false;
     $('confirm').required = true;
@@ -186,7 +182,7 @@ $('form').addEventListener('submit', async (e) => {
       // stores the session itself.
       body: JSON.stringify({password, remember: $('remember').checked})
     });
-    if (reply.ok) { location.href = '/vault/app'; return; }
+    if (reply.ok) { location.href = nextTarget(); return; }
     if (reply.status === 429) {
       error.textContent = 'Too many attempts — wait five minutes.';
       button.disabled = false;

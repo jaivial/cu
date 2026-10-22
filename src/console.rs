@@ -21,7 +21,15 @@ use std::sync::{Mutex, OnceLock};
 
 /// Levels, in the order `warn+` expands from.
 pub const LEVELS: &[&str] = &[
-    "debug", "log", "info", "trace", "warn", "error", "exception", "csp", "network",
+    "debug",
+    "log",
+    "info",
+    "trace",
+    "warn",
+    "error",
+    "exception",
+    "csp",
+    "network",
 ];
 
 /// `--level` as the list of levels it names. `all` and empty mean every
@@ -33,7 +41,11 @@ pub fn expand_levels(spec: &str) -> Result<Vec<String>, String> {
         if part.is_empty() || part == "all" {
             return Ok(Vec::new());
         }
-        let part = if part == "verbose" { "debug".to_string() } else { part };
+        let part = if part == "verbose" {
+            "debug".to_string()
+        } else {
+            part
+        };
         if let Some(base) = part.strip_suffix('+') {
             let base = if base == "verbose" { "debug" } else { base };
             let Some(at) = LEVELS.iter().position(|l| *l == base) else {
@@ -209,7 +221,10 @@ pub fn ensure(tab: &Tab) {
         // agent enabled (`Page.enable` is not `Runtime.enable`: nothing in
         // the page can see it).
         let _ = connection.call("Page.enable", "{}");
-        if connection.call("Page.addScriptToEvaluateOnNewDocument", &params).is_err() {
+        if connection
+            .call("Page.addScriptToEvaluateOnNewDocument", &params)
+            .is_err()
+        {
             let _ = tx.send(false);
             return;
         }
@@ -223,10 +238,19 @@ pub fn ensure(tab: &Tab) {
                 break;
             }
         }
-        registered().lock().unwrap_or_else(|e| e.into_inner()).remove(&owner);
+        registered()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&owner);
     });
-    if !rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or(false) {
-        registered().lock().unwrap_or_else(|e| e.into_inner()).remove(&tab);
+    if !rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap_or(false)
+    {
+        registered()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&tab);
     }
 }
 
@@ -250,7 +274,11 @@ pub fn read(
     ensure(tab);
     let lv = format!(
         "[{}]",
-        levels.iter().map(|l| json_string(l)).collect::<Vec<_>>().join(",")
+        levels
+            .iter()
+            .map(|l| json_string(l))
+            .collect::<Vec<_>>()
+            .join(",")
     );
     let expr = format!(
         "(function(){{var K=Symbol.for('cu.console');var fresh=false;if(!window[K]){{{install}fresh=true;}}\
@@ -265,7 +293,10 @@ pub fn read(
             "JSON.stringify(o)"
         },
     );
-    let params = format!("{{\"expression\":{},\"returnByValue\":true}}", json_string(&expr));
+    let params = format!(
+        "{{\"expression\":{},\"returnByValue\":true}}",
+        json_string(&expr)
+    );
     match tab.command("Runtime.evaluate", &params) {
         Ok(reply) => match crate::server::evaluated_string(&reply) {
             Some(v) if text => ("200 OK", "text/plain; charset=utf-8", v),

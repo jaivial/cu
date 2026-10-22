@@ -60,5 +60,44 @@ Use `cu` when an agent needs a persistent local browser session.
    point at each other. Marks live in the daemon per tab until `cu marks
    clear`; field values are never recorded.
 9. Save the session with `cu session save NAME`, and restore it later with `cu session load NAME`. A saved session keeps the login.
+10. A one-time-code (2FA) page is not a full takeover any more. If the vault
+    holds a seed for the site, mint the code yourself:
+    `cu otp code example.com` (or `--credential ID`) and type it in. If not,
+    `cu otp request example.com --reason "GitHub login" --wait` prints a
+    short link — send the user that link, nothing else; the page asks their
+    master password if their vault session is out, then takes the code, and
+    your `--wait` returns the moment they send it. Cancel with
+    `cu otp cancel ID` if you take another path. Never ask the user to paste
+    a code into chat: the link exists so codes (and seeds) never pass
+    through a conversation.
+11. Setting up 2FA on a site (a setup QR is on screen): capture it instead of
+    photographing it — `cu otp capture --domain example.com` decodes the QR
+    from a tab you name explicitly (`--tab T`) and that must actually be on
+    that domain (it refuses mismatched pages, mismatched issuers and pages
+    with several different setup QRs).
+    If the credential already has a live seed, capture refuses; only a
+    deliberate `--replace` overwrites it, and the reply says so. Never log,
+    print or relay the seed or minted codes beyond typing them in.
+    Collection is acknowledged: `cu otp wait` confirms receipt to the vault
+    before the code is printed, and the vault wipes it on that ACK. The
+    wait keeps its collect token (and a retrieved code) in a 0600 state
+    file (atomically written, symlink-safe), so a crashed or killed wait is
+    genuinely resumed by running `cu otp wait ID` again while the vault's
+    delivery window (five minutes - retention, not code validity; a TOTP
+    code lives ~30 seconds) is open. State past ten minutes is deleted
+    when a wait next touches the directory, never resumed, and a definitive
+    vault refusal ends the wait instead of retrying forever. A crashed wait
+    nobody reruns can leave its 0600 file behind (an expired token, a dead
+    code) until the next `cu otp` run - same-UID, loopback-only hygiene,
+    not a guaranteed cleanup. Never move the token or the code out of that
+    file by hand.
+    seals the seed into the domain's credential as a secret `totp` field and
+    answers with only the issuer and account it stored. From then on
+    `cu otp code` mints the codes, including the enrollment confirmation one.
+    If the user wants the same seed on their phone, capture with
+    `--request ID` from a `cu otp request --kind setup` and send them the
+    link: its page shows the QR to scan. A captured seed is a permanent
+    secret: never print it, screenshot it into a report, or paste it
+    anywhere — the capture reply never carries it, keep it that way.
 
 The bearer token is stored in `.cu/server.json`; keep that file private. The server binds to loopback only.

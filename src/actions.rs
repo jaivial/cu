@@ -192,7 +192,9 @@ pub fn parse_action(object: &str) -> Result<Action, String> {
                 dx: num("dx").unwrap_or(0.0),
                 dy: num("dy").unwrap_or(0.0),
                 scale: num("scale").unwrap_or(1.5),
-                ms: json_value(object, "ms").and_then(|v| v.parse().ok()).unwrap_or(0),
+                ms: json_value(object, "ms")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0),
             }
         }
         "emulate" => {
@@ -200,7 +202,11 @@ pub fn parse_action(object: &str) -> Result<Action, String> {
             if !["mobile", "tablet", "desktop", "custom"].contains(&mode.as_str()) {
                 return Err("emulate \"mode\" must be mobile, tablet, desktop or custom".into());
             }
-            let n = |k: &str, d: u32| json_value(object, k).and_then(|v| v.parse().ok()).unwrap_or(d);
+            let n = |k: &str, d: u32| {
+                json_value(object, k)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(d)
+            };
             Action::Emulate {
                 mode,
                 width: n("width", 390),
@@ -720,11 +726,17 @@ impl Page {
                 let (method, params) = match gesture.as_str() {
                     "tap" => (
                         "Input.synthesizeTapGesture",
-                        format!("{{\"x\":{x:.1},\"y\":{y:.1},\"duration\":{},{source}}}", (*ms).max(30)),
+                        format!(
+                            "{{\"x\":{x:.1},\"y\":{y:.1},\"duration\":{},{source}}}",
+                            (*ms).max(30)
+                        ),
                     ),
                     "longpress" => (
                         "Input.synthesizeTapGesture",
-                        format!("{{\"x\":{x:.1},\"y\":{y:.1},\"duration\":{},{source}}}", (*ms).max(800)),
+                        format!(
+                            "{{\"x\":{x:.1},\"y\":{y:.1},\"duration\":{},{source}}}",
+                            (*ms).max(800)
+                        ),
                     ),
                     "swipe" => (
                         "Input.synthesizeScrollGesture",
@@ -735,7 +747,9 @@ impl Page {
                     ),
                     _ => (
                         "Input.synthesizePinchGesture",
-                        format!("{{\"x\":{x:.1},\"y\":{y:.1},\"scaleFactor\":{scale:.3},\"relativeSpeed\":400,{source}}}"),
+                        format!(
+                            "{{\"x\":{x:.1},\"y\":{y:.1},\"scaleFactor\":{scale:.3},\"relativeSpeed\":400,{source}}}"
+                        ),
                     ),
                 };
                 self.input(method, &params, &mut watch)?;
@@ -772,7 +786,11 @@ impl Page {
         to: Option<&str>,
     ) -> Result<(), String> {
         if let Some(t) = to {
-            let y = if t == "top" { "0" } else { "document.documentElement.scrollHeight" };
+            let y = if t == "top" {
+                "0"
+            } else {
+                "document.documentElement.scrollHeight"
+            };
             self.conn().call(
                 "Runtime.evaluate",
                 &format!("{{\"expression\":\"window.scrollTo({{top:{y},behavior:'instant'}})\",\"returnByValue\":true}}"),
@@ -792,7 +810,10 @@ impl Page {
                 )?;
                 let t = json_string_value(&v, "value").unwrap_or_default();
                 let mut p = t.split(',').filter_map(|x| x.parse::<f64>().ok());
-                (p.next().unwrap_or(800.0) / 2.0, p.next().unwrap_or(600.0) / 2.0)
+                (
+                    p.next().unwrap_or(800.0) / 2.0,
+                    p.next().unwrap_or(600.0) / 2.0,
+                )
             }
         };
         self.input(
@@ -809,8 +830,10 @@ impl Page {
 
     fn emulate(&mut self, mode: &str, width: u32, height: u32) -> Result<(), String> {
         if mode == "desktop" {
-            self.conn().call("Emulation.clearDeviceMetricsOverride", "{}")?;
-            self.conn().call("Emulation.setTouchEmulationEnabled", "{\"enabled\":false}")?;
+            self.conn()
+                .call("Emulation.clearDeviceMetricsOverride", "{}")?;
+            self.conn()
+                .call("Emulation.setTouchEmulationEnabled", "{\"enabled\":false}")?;
             return Ok(());
         }
         let (w, h, mobile) = match mode {
@@ -820,7 +843,9 @@ impl Page {
         };
         self.conn().call(
             "Emulation.setDeviceMetricsOverride",
-            &format!("{{\"width\":{w},\"height\":{h},\"deviceScaleFactor\":2,\"mobile\":{mobile}}}"),
+            &format!(
+                "{{\"width\":{w},\"height\":{h},\"deviceScaleFactor\":2,\"mobile\":{mobile}}}"
+            ),
         )?;
         self.conn().call(
             "Emulation.setTouchEmulationEnabled",
