@@ -25,6 +25,9 @@ PORT = next(
 CLOSED_MARKER = os.environ.get("FAKE_CHROMIUM_CLOSED")
 # Input commands received, in order; served at /input-log for the tests.
 INPUT_LOG = []
+# Every DevTools command received, in order; served at /command-log, so a
+# test can see how many round trips a tool took.
+COMMANDS = []
 # The viewport the page is emulated at, as `Emulation.setDeviceMetricsOverride`
 # last set it: (width, height, deviceScaleFactor), or None when the browser's
 # own window size applies. Like Chromium, `clearDeviceMetricsOverride` puts it
@@ -84,6 +87,12 @@ DENY_TEXT = (
 )
 # Execution context id of the iframe's isolated world.
 CHILD_CONTEXT = 7
+# The document generation: a navigation replaces the document, and with it
+# every execution context. A context id from the previous generation is
+# refused, like Chromium refuses one that names a world that is gone.
+GENERATION = [0]
+# (frame id, generation) -> execution context id.
+CONTEXTS = {}
 FAKE_SNAPSHOT = json.dumps(
     {
         "url": "https://example.test/",
@@ -148,6 +157,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_discovery()
         elif self.path == "/input-log":
             self.send_json(INPUT_LOG)
+        elif self.path == "/command-log":
+            self.send_json(COMMANDS)
         elif self.path == "/download-behaviour":
             self.send_json(DOWNLOAD_BEHAVIOUR)
         elif self.path == "/viewport":
@@ -254,6 +265,7 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 break
             method = message.get("method", "")
+            COMMANDS.append(method)
             reply = self.result_for(method, message.get("params"))
             reply["id"] = message.get("id", 1)
             self.reply(reply)
@@ -337,6 +349,8 @@ class Handler(BaseHTTPRequestHandler):
             # has to work with.
             DENY_ON["on"] = url.startswith("deny://")
             FRAMES_ON["on"] = "frames" in url
+            # A new document: the worlds of the old one are gone.
+            GENERATION[0] += 1
             # cf:// is an interstitial that clears by itself after a few
             # probes; cfhold:// is the same page that never clears.
             INTERSTITIAL["kind"] = (
@@ -398,11 +412,20 @@ class Handler(BaseHTTPRequestHandler):
                 }
             return {"result": {"frameTree": {"frame": {"id": "MAINFRAME", "url": "about:blank"}}}}
         if method == "Page.createIsolatedWorld":
-            # One isolated world per frame, like Chromium: cu reads the main
-            # document in its own isolated world too, so "has a contextId"
-            # does not mean "is the iframe" -- the id says which frame it is.
+            # One isolated world per frame per document, like Chromium: cu
+            # reads the main document in its own isolated world too, so "has a
+            # contextId" does not mean "is the iframe" -- the id says which
+            # frame it is. A navigation replaces the document, and with it the
+            # worlds: the ids of the previous generation are refused.
             frame = (params or {}).get("frameId")
-            return {"result": {"executionContextId": CHILD_CONTEXT if frame == "CHILD1" else 5}}
+            key = (frame, GENERATION[0])
+            if key not in CONTEXTS:
+                CONTEXTS[key] = (
+                    CHILD_CONTEXT + 100 * GENERATION[0]
+                    if frame == "CHILD1"
+                    else 5 + 100 * GENERATION[0]
+                )
+            return {"result": {"executionContextId": CONTEXTS[key]}}
         if method == "DOM.getFrameOwner":
             return {"result": {"backendNodeId": 42}}
         if method == "DOM.resolveNode":
@@ -432,6 +455,16 @@ class Handler(BaseHTTPRequestHandler):
             return {"result": {}}
         if method == "Runtime.evaluate":
             expr = (params or {}).get("expression", "")
+            context = (params or {}).get("contextId")
+            if context is not None and context not in CONTEXTS.values():
+                # The world is gone: the document behind it was replaced.
+                return {
+                    "id": 1,
+                    "error": {
+                        "code": -32000,
+                        "message": "Cannot find context with specified id",
+                    },
+                }
             if "challenge" in expr and "location.href" in expr and INTERSTITIAL["kind"]:
                 INTERSTITIAL["probes"] += 1
                 holding = INTERSTITIAL["kind"] == "hold" or INTERSTITIAL[
@@ -459,12 +492,12 @@ class Handler(BaseHTTPRequestHandler):
                     separators=(",", ":"),
                 )
                 return {"id": 1, "result": {"result": {"type": "string", "value": value}}}
-            if "cuAgentSnapshot" in expr:
+            if "__cuSnapshot" in expr:
                 # The walk: in an iframe's isolated world it shows the frame,
                 # in the main world the page itself. (The walk embeds the
                 # registry, which mentions elementFromPoint, so this must be
                 # checked before the click-point branch below.)
-                if (params or {}).get("contextId") == CHILD_CONTEXT:
+                if (params or {}).get("contextId") == CHILD_CONTEXT + 100 * GENERATION[0]:
                     value = CHILD_SNAPSHOT
                 else:
                     value = FAKE_SNAPSHOT
@@ -475,7 +508,7 @@ class Handler(BaseHTTPRequestHandler):
             if "innerText" in expr:
                 # In an iframe's isolated world the words are the frame's, so a
                 # test can tell the two documents apart.
-                if (params or {}).get("contextId") == CHILD_CONTEXT:
+                if (params or {}).get("contextId") == CHILD_CONTEXT + 100 * GENERATION[0]:
                     words = CHILD_WORDS
                 else:
                     words = "the quick brown fox jumps over the lazy dog"
@@ -512,6 +545,14 @@ class Handler(BaseHTTPRequestHandler):
                 return {"result": {"result": {"type": "string", "value": value}}}
             if "__cu.focus(" in expr or "__cu.select(" in expr:
                 return {"result": {"result": {"type": "string", "value": "{}"}}}
+            if "innerWidth" in expr and "innerHeight" in expr and "devicePixelRatio" not in expr:
+                # The measure step of a capture: the viewport in CSS pixels.
+                w, h, _ = EMULATED[0] or [WINDOW[0], WINDOW[1], 1]
+                value = json.dumps(
+                    {"x": 0, "y": 0, "w": 100, "h": 20, "vw": w, "vh": h},
+                    separators=(",", ":"),
+                )
+                return {"result": {"result": {"type": "string", "value": value}}}
             if "devicePixelRatio" in expr and "innerWidth" in expr:
                 # The viewport probe: an emulated tab reports the emulated
                 # metrics, an un-emulated one the window's.

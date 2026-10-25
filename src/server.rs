@@ -11,6 +11,7 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::pagecache;
 use crate::policy::BrowserPolicy;
 
 #[derive(Clone)]
@@ -656,6 +657,7 @@ fn read_request(stream: &mut TcpStream) -> Result<String, String> {
 /// answered with a 400 instead of dropping the connection, so the client gets
 /// a diagnostic rather than a silent failure.
 pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
+    let span = crate::server::trace_start();
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let request = match read_request(&mut stream) {
         Ok(request) => request,
@@ -711,6 +713,7 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
         return;
     }
     let mut set_cookie: Option<String> = None;
+    let route_span = crate::server::trace_start();
     let (status, content_type, response) = if !host_ok {
         (
             "421 Misdirected Request",
@@ -759,6 +762,7 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
             header_value(head, "x-cu-otp-collect-token"),
         )
     };
+    crate::server::trace("http.route.total", route_span);
     let mut head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n",
         response.len()
@@ -775,11 +779,14 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
             "Content-Security-Policy: frame-ancestors {}\r\n",
             crate::live_stream::frame_ancestors()
         )),
-        Some("/vault/live2") => head.push_str("Content-Security-Policy: frame-ancestors 'none'\r\n"),
+        Some("/vault/live2") => {
+            head.push_str("Content-Security-Policy: frame-ancestors 'none'\r\n")
+        }
         _ => {}
     }
     head.push_str("\r\n");
     let _ = write!(stream, "{head}{response}");
+    crate::server::trace("http.handle.total", span);
 }
 
 /// Whether a request's `Host` header is one this daemon answers.
@@ -1045,7 +1052,8 @@ fn route_with(
             let assessment = match crate::challenge::gate(&tab) {
                 Some(held) => held,
                 None => {
-                    let fresh = crate::challenge::assess(|m, p| tab.command(m, p), Duration::ZERO);
+                    let fresh =
+                        crate::challenge::assess(&tab, |m, p| tab.command(m, p), Duration::ZERO);
                     crate::challenge::record(&tab, &fresh);
                     fresh
                 }
@@ -1213,7 +1221,8 @@ fn route_with(
         // read, each one named, capped in the page so a huge document cannot
         // flood the socket.
         ("GET", "/v1/text") => {
-            let (status, kind, body) = text_response(|method, params| tab.command(method, params));
+            let (status, kind, body) =
+                text_response(&tab, |method, params| tab.command(method, params));
             (status, kind, with_oopif_text(&tab, body))
         }
         // Pure file listing: works whether or not the browser is up, because
@@ -1546,6 +1555,7 @@ fn navigate_scheduled(
         |r: crate::scheduler::Refused| ("429 Too Many Requests", "application/json", r.json());
     let retries = crate::scheduler::budget().retries;
     let mut attempt = 0;
+    let span = crate::server::trace_start();
     loop {
         let permit = match crate::scheduler::acquire(url) {
             Ok(permit) => permit,
@@ -1583,6 +1593,7 @@ fn navigate_scheduled(
             let http_level = crate::scheduler::http_level_failure(&error);
             let assessment = (http_level && crate::challenge::enabled()).then(|| {
                 let assessment = crate::challenge::assess_response(
+                    tab,
                     |m, p| tab.command(m, p),
                     crate::challenge::wait_budget(),
                     document.as_ref(),
@@ -1640,12 +1651,19 @@ fn navigate_scheduled(
         // Do not hand back a half-loaded page, but never hang on a stream
         // that stays open for ever. Whether the wait ended on a ready page or
         // on the budget says `settled`.
+        // The document behind the page is a new one: every world cu
+        // remembered for this tab died with it, and the frame list is stale.
+        pagecache::forget_tab(tab);
+        pagecache::forget_frames(tab);
+        crate::server::trace("navigate.before_settle", span);
         let (waited, settled) = wait_for_page_on(tab, SETTLE_MAX);
+        crate::server::trace("navigate.after_settle", span);
         // A page that loaded is not necessarily the page asked for: say what
         // it is, and never call a defence page (or an undecided one) a plain
         // success.
         let assessment = crate::challenge::enabled().then(|| {
             let assessment = crate::challenge::assess_response(
+                tab,
                 |m, p| tab.command(m, p),
                 crate::challenge::wait_budget(),
                 document.as_ref(),
@@ -1653,6 +1671,7 @@ fn navigate_scheduled(
             crate::challenge::record(tab, &assessment);
             assessment
         });
+        crate::server::trace("navigate.after_assess", span);
         let status = document.as_ref().map(|d| d.status).unwrap_or(0);
         let state = assessment
             .as_ref()
@@ -1733,7 +1752,9 @@ fn navigate_observed(
     url: &str,
     auth: Option<(String, String)>,
 ) -> Result<(String, Option<crate::scheduler::DocumentResponse>, bool), String> {
+    let span = crate::server::trace_start();
     let mut connection = checkout(tab)?;
+    crate::server::trace("navigate.after_checkout", span);
     // Small buffers: the bodies are never fetched, only headers are needed.
     let enabled = connection
         .call(
@@ -1748,6 +1769,7 @@ fn navigate_observed(
             )
         });
     let auth_on = auth.is_some() && enabled.is_ok();
+    crate::server::trace("navigate.after_network_enable", span);
     if auth_on {
         // This navigation arms `Fetch` itself, so the tab's background
         // responder has to let go first: two sessions intercepting the same
@@ -1782,27 +1804,26 @@ fn navigate_observed(
     // read a reply, so the stream keeps flowing and no event is lost.
     let answer = |text: &str, connection: &mut CdpConnection, auth_handled: &mut bool| {
         if let Some(rid) = auth_required_id(text) {
-            connection.send(
+            let _unused = connection.send(
                 "Fetch.continueWithAuth",
                 &continue_with_auth_params(&rid, &auth),
             );
             *auth_handled = true;
         } else if let Some(rid) = paused_request_id(text) {
-            connection.send(
+            let _unused = connection.send(
                 "Fetch.continueRequest",
                 &format!("{{\"requestId\":{}}}", json_string(&rid)),
             );
         }
     };
     let (reply, auth_handled) = if !auth_on {
-        (
-            connection.call_observed(
-                "Page.navigate",
-                &format!("{{\"url\":{}}}", json_string(url)),
-                &mut see,
-            ),
-            false,
-        )
+        let r = connection.call_observed(
+            "Page.navigate",
+            &format!("{{\"url\":{}}}", json_string(url)),
+            &mut see,
+        );
+        crate::server::trace("navigate.after_page_navigate", span);
+        (r, false)
     } else {
         // With interception armed, the challenge must be answered while the
         // navigation is in flight: Chrome does not deliver the
@@ -1811,7 +1832,7 @@ fn navigate_observed(
         // EAGAIN). The navigation is sent unread instead, and this loop
         // takes everything the stream offers — its reply as well as the
         // interception events, each answered as it is read.
-        connection.send(
+        let _unused = connection.send(
             "Page.navigate",
             &format!("{{\"url\":{}}}", json_string(url)),
         );
@@ -1924,9 +1945,25 @@ fn navigate_observed(
         )
     };
     if reply.is_ok() && enabled.is_ok() {
-        // The response event can trail the reply by a hair; one round trip
-        // drains what is already queued.
-        let _ = connection.call_observed("Network.disable", "{}", &mut see);
+        // The document's response can trail the navigation's reply by a
+        // hair; one round trip drains what is already queued. The round trip
+        // asks for the frame tree, not `Network.disable`: the browser answers
+        // the disable only after the navigation has committed *and* the
+        // network stack has gone quiet, which was most of a navigation's
+        // time. The frame tree is the browser's own answer, so it comes back
+        // as soon as the new document has committed -- and it is the frame
+        // list cu remembers.
+        let tree = connection.call_observed("Page.getFrameTree", "{}", &mut see);
+        if let Ok(tree) = tree {
+            let frames = flatten_frame_tree(&tree);
+            if !frames.is_empty() {
+                pagecache::remember_frames(tab, frames);
+            }
+        }
+        crate::server::trace("navigate.after_drain", span);
+        // Stopping the network events is fire-and-forget: the browser does
+        // it when it is ready, and nothing waits for the answer.
+        let _unused = connection.send("Network.disable", "{}");
         checkin(tab, connection);
     }
     let reply = reply?;
@@ -2230,24 +2267,33 @@ fn unreadable_frame(url: &str) -> String {
 /// a `- frame: <url>` line, so the words never claim to be the page's own.
 /// A frame that cannot be read is named, not fatal: the answer an agent wants
 /// is the prose, and half of it beats an error.
-fn text_response<F>(mut cmd: F) -> (&'static str, &'static str, String)
+fn text_response<F>(tab: &Tab, mut cmd: F) -> (&'static str, &'static str, String)
 where
     F: FnMut(&str, &str) -> Result<String, String>,
 {
     // The main document first: it is the frame an action lands on, and a page
-    // that fails here is a page that cannot be read at all.
-    let tree = cmd("Page.getFrameTree", "{}");
-    let tree = match tree {
-        Ok(tree) => tree,
-        Err(e) => {
-            return (
-                "502 Bad Gateway",
-                "application/json",
-                format!("{{\"error\":{}}}", json_string(&e)),
-            );
+    // that fails here is a page that cannot be read at all. The frame list is
+    // the one the last snapshot read, when there is one: the browser answers
+    // the same question until the page navigates.
+    let mut frames = match pagecache::page_frames(tab) {
+        Some(frames) if !frames.is_empty() => frames,
+        _ => {
+            let tree = cmd("Page.getFrameTree", "{}");
+            let tree = match tree {
+                Ok(tree) => tree,
+                Err(e) => {
+                    return (
+                        "502 Bad Gateway",
+                        "application/json",
+                        format!("{{\"error\":{}}}", json_string(&e)),
+                    );
+                }
+            };
+            let frames = flatten_frame_tree(&tree);
+            pagecache::remember_frames(tab, frames.clone());
+            frames
         }
     };
-    let mut frames = flatten_frame_tree(&tree);
     if frames.is_empty() {
         frames.push(Frame {
             id: String::new(),
@@ -2269,7 +2315,7 @@ where
         let context = if frame.id.is_empty() {
             String::new()
         } else {
-            match crate::execution::context_fragment(&mut cmd, world, &frame.id) {
+            match cached_context_fragment(tab, &frame.id, world, &mut cmd) {
                 Ok(fragment) => fragment,
                 // The frame went away between the tree walk and here.
                 Err(_) => {
@@ -2284,21 +2330,49 @@ where
             json_string(READ_TEXT_JS),
             context
         );
-        let value = match cmd("Runtime.evaluate", &params) {
-            Ok(reply) => evaluated_string(&reply),
-            Err(_) => None,
-        };
-        let Some(value) = value else {
-            if index == 0 {
-                return (
-                    "502 Bad Gateway",
-                    "application/json",
-                    "{\"error\":\"page did not return its text\"}".into(),
-                );
+        // The world belongs to the document: when the document was replaced
+        // the remembered one is gone, and the browser says so. The world is
+        // then made again, and the text is read in the new document.
+        let mut value = None;
+        for attempt in 0..2 {
+            value = match cmd("Runtime.evaluate", &params) {
+                Ok(reply) => evaluated_string(&reply),
+                Err(_) => None,
+            };
+            if value.is_some() {
+                break;
             }
-            text.push('\n');
-            text.push_str(&unreadable_frame(&frame.url));
-            continue;
+            if attempt == 0 && !frame.id.is_empty() {
+                pagecache::forget(tab, &frame.id);
+                let Ok(fresh) = cached_context_fragment(tab, &frame.id, world, &mut cmd) else {
+                    break;
+                };
+                let params = format!(
+                    "{{\"expression\":{},{}\"returnByValue\":true}}",
+                    json_string(READ_TEXT_JS),
+                    fresh
+                );
+                value = match cmd("Runtime.evaluate", &params) {
+                    Ok(reply) => evaluated_string(&reply),
+                    Err(_) => None,
+                };
+                break;
+            }
+        }
+        let value = match value {
+            Some(value) => value,
+            None => {
+                if index == 0 {
+                    return (
+                        "502 Bad Gateway",
+                        "application/json",
+                        "{\"error\":\"page did not return its text\"}".into(),
+                    );
+                }
+                text.push('\n');
+                text.push_str(&unreadable_frame(&frame.url));
+                continue;
+            }
         };
         let (full, n) = (
             json_string_value(&value, "full").and_then(|f| f.parse::<usize>().ok()),
@@ -2476,6 +2550,27 @@ impl Viewport {
     }
 }
 
+/// The viewport's size in CSS pixels, from the browser itself.
+///
+/// `Page.getLayoutMetrics` answers it without running a script in the page,
+/// which is what a plain capture needs (the old way measured the page in
+/// JavaScript, and the animation frames it waited for were most of the
+/// capture's time).
+fn viewport_size(tab: &Tab) -> Result<(f64, f64), String> {
+    let reply = tab.command("Page.getLayoutMetrics", "{}")?;
+    // `cssVisualViewport` is the part of the page the agent sees; the layout
+    // viewport is the whole document, which can be wider than the window.
+    let visual = json_object(&reply, "cssVisualViewport")
+        .or_else(|| json_object(&reply, "cssLayoutViewport"))
+        .ok_or("the browser did not report the viewport size")?;
+    let width = json_number(visual, "clientWidth").filter(|w| *w > 0.0);
+    let height = json_number(visual, "clientHeight").filter(|h| *h > 0.0);
+    match (width, height) {
+        (Some(width), Some(height)) => Ok((width, height)),
+        _ => Err("the browser did not report the viewport size".into()),
+    }
+}
+
 /// Put the tab back the way it was before this capture.
 ///
 /// Handing the tab to the browser is right when there was nothing to keep --
@@ -2512,11 +2607,20 @@ fn screenshot(tab: &Tab, query: &str) -> (&'static str, &'static str, String) {
         }
     };
     let png = options.png;
+    let span = crate::server::trace_start();
     let format = if png { "png" } else { "jpeg" };
     // Read BEFORE the capture overrides anything: what the tab is shown at
     // now is the caller's, not the viewport this capture is about to set.
-    let was = Viewport::read(tab);
+    // Only an emulated capture changes the viewport, so only it has to
+    // remember the old one.
+    let was = if options.emulates() {
+        Viewport::read(tab)
+    } else {
+        None
+    };
+    crate::server::trace("shot.after_viewport_read", span);
     let result = capture_annotated(tab, &options);
+    crate::server::trace("shot.after_capture", span);
     if options.emulates() {
         // Put the tab back the way this capture found it, even if it failed.
         restore_viewport(was, tab);
@@ -2719,7 +2823,44 @@ pub fn snapshot_refs(tab: &Tab) -> Vec<String> {
 /// Returns the CDP reply and a `"width":..,"height":..,` fragment with the
 /// size of the image in pixels.
 fn capture(tab: &Tab, options: &ShotOptions) -> Result<(String, String), String> {
+    let span = crate::server::trace_start();
     let scale = options.scale.unwrap_or(1.0);
+    // A plain capture of the viewport needs nothing measured: there is no
+    // clip to work out, and the page is laid out as it is. Measuring it
+    // anyway cost two animation frames -- and the frame the measure waited
+    // for was the frame the capture then had to wait *after* for, which is
+    // most of a capture's time.
+    if options.reference.is_none() && options.selector.is_none() && !options.emulates() {
+        let params = if options.png {
+            "{\"format\":\"png\"}".to_string()
+        } else {
+            format!(
+                "{{\"format\":\"jpeg\",\"quality\":{},\"optimizeForSpeed\":true}}",
+                options.quality
+            )
+        };
+        let result = tab.command("Page.captureScreenshot", &params)?;
+        if let Some(error) = json_object(&result, "error") {
+            return Err(json_string_value(&error, "message")
+                .or_else(|| {
+                    json_string_value(&error, "code").map(|c| format!("capture failed ({c})"))
+                })
+                .unwrap_or_else(|| "the browser returned no image".into()));
+        }
+        // Without an override the real device scale factor is unknown here,
+        // so the size is only reported when it is known.
+        let size = if options.scale.is_some() {
+            let (width, height) = viewport_size(tab)?;
+            format!(
+                "\"width\":{},\"height\":{},\"scale\":{scale},",
+                (width * scale).round() as u64,
+                (height * scale).round() as u64
+            )
+        } else {
+            String::new()
+        };
+        return Ok((result, size));
+    }
     if options.emulates() {
         // 0 keeps the browser's own value for a side that was not given.
         tab.command(
@@ -2792,6 +2933,7 @@ fn capture(tab: &Tab, options: &ShotOptions) -> Result<(String, String), String>
         "Runtime.evaluate",
         &crate::execution::evaluate_params(&expression, &helper_context(tab)?, true),
     )?;
+    crate::server::trace("shot.after_measure", span);
     if reply.contains("\"exceptionDetails\"") {
         return Err(json_string_value(&reply, "description")
             .unwrap_or_else(|| "measuring the page failed".into()));
@@ -2832,6 +2974,7 @@ fn capture(tab: &Tab, options: &ShotOptions) -> Result<(String, String), String>
     };
     params.push('}');
     let result = tab.command("Page.captureScreenshot", &params)?;
+    crate::server::trace("shot.after_cdp_capture", span);
     // A capture the browser refused has no `data`, and reporting that as a
     // 200 with a null image is what made a broken capture look like a working
     // one: the agent got `jpeg_base64: null` instead of the reason.
@@ -3127,7 +3270,7 @@ fn with_oopif_text(tab: &Tab, body: String) -> String {
     };
     let mut truncated = body.contains("\"truncated\":true");
     for (root, target) in oopif_targets(tab) {
-        let (_, _, part) = text_response(|m, p| target.command(m, p));
+        let (_, _, part) = text_response(&target, |m, p| target.command(m, p));
         match json_string_value(&part, "text") {
             Some(t) => {
                 truncated |= part.contains("\"truncated\":true");
@@ -3157,7 +3300,7 @@ pub fn snapshot_pages(state: &AppState) -> Result<String, String> {
 }
 
 fn snapshot_tab(tab: &Tab) -> Result<String, String> {
-    let (mut text, mut pairs) = walk_snapshot(tab, |method, params| tab.command(method, params))?;
+    let (mut text, mut pairs) = walk_snapshot(tab, |commands| call_batch(tab, commands))?;
     walk_oopifs(tab, &mut text, &mut pairs);
     note_ref_frames(tab, &pairs);
     Ok(format!("{{\"snapshot\":{}}}", json_string(&text)))
@@ -3166,12 +3309,85 @@ fn snapshot_tab(tab: &Tab) -> Result<String, String> {
 /// Walk every frame of the page, fetching the frame tree first.
 pub fn walk_snapshot<F>(tab: &Tab, cmd: F) -> Result<(String, Vec<(String, String)>), String>
 where
-    F: FnMut(&str, &str) -> Result<String, String>,
+    F: FnMut(&[(&str, &str)]) -> Vec<Result<String, String>>,
 {
     let mut cmd = cmd;
-    let tree = cmd("Page.getFrameTree", "{}")?;
+    // The fast path: the main frame's world is known from the last snapshot,
+    // so the frame tree and the walk go out together and cost one round
+    // trip instead of two.
+    if let Some(main) = pagecache::main_frame(tab)
+        && let Some(state) = pagecache::get(tab, &main)
+    {
+        let expression = if state.installed {
+            snapshot::call_script().to_string()
+        } else {
+            snapshot::install_script(snapshot::base_for(tab.cdp_port, &main))
+        };
+        let params = format!(
+            "{{\"expression\":{},\"contextId\":{},\"returnByValue\":true}}",
+            json_string(&expression),
+            state.context
+        );
+        let replies = cmd(&[
+            ("Page.getFrameTree", "{}"),
+            ("Runtime.evaluate", params.as_str()),
+        ]);
+        if let [Ok(tree), Ok(reply)] = replies.as_slice()
+            && let Some(value) = evaluated_string(reply)
+        {
+            let frames = flatten_frame_tree(tree);
+            // The frame list is the browser's answer to "what is this page
+            // made of"; the actions that follow need the same answer.
+            pagecache::remember_frames(tab, frames.clone());
+            if !state.installed {
+                pagecache::mark_installed(tab, &main);
+            }
+            snapshot::saw_refs_up_to(&value);
+            let snap = parse_snapshot(&value)?;
+            let mut text = snap.render();
+            let mut pairs: Vec<(String, String)> = snap
+                .nodes
+                .iter()
+                .map(|node| (node.ref_id.clone(), main.clone()))
+                .collect();
+            // The frames below the main document are walked on their own.
+            let others: Vec<Frame> = frames.iter().filter(|f| f.id != main).cloned().collect();
+            if !others.is_empty() {
+                // `nested`: these are frames below the main document, so each
+                // one is a section of its own.
+                let (more, more_pairs) = walk_frames_nested(
+                    tab,
+                    others,
+                    |method, params| one(&mut cmd, method, params),
+                    true,
+                )?;
+                text.push_str(&more);
+                pairs.extend(more_pairs);
+            }
+            return Ok((text, pairs));
+        }
+    }
+    // The slow path: the frame tree first, then every frame in it.
+    let replies = cmd(&[("Page.getFrameTree", "{}")]);
+    let tree = match replies.into_iter().next() {
+        Some(Ok(tree)) => tree,
+        Some(Err(error)) => return Err(error),
+        None => return Err("the browser did not answer with a frame tree".into()),
+    };
     let frames = flatten_frame_tree(&tree);
-    walk_frames(tab, frames, cmd)
+    pagecache::remember_frames(tab, frames.clone());
+    walk_frames(tab, frames, |method, params| one(&mut cmd, method, params))
+}
+
+/// One command, through a batch-capable runner.
+fn one<F>(cmd: &mut F, method: &str, params: &str) -> Result<String, String>
+where
+    F: FnMut(&[(&str, &str)]) -> Vec<Result<String, String>>,
+{
+    cmd(&[(method, params)])
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| Err("the browser did not answer".into()))
 }
 
 /// Walk every frame of the page and merge the result.
@@ -3208,7 +3424,6 @@ where
     let mut text = String::new();
     let mut pairs: Vec<(String, String)> = Vec::new();
     for (index, frame) in frames.iter().enumerate() {
-        let expression = snapshot::script_with_base(snapshot::base_for(tab.cdp_port, &frame.id));
         // The main document follows the helper policy (cu's isolated world
         // unless `CU_HELPER_WORLD=main`); an iframe is always read in its
         // isolated world, so a cross-origin frame's scripts are never touched.
@@ -3217,8 +3432,8 @@ where
         } else {
             crate::execution::World::Isolated
         };
-        let context = match crate::execution::context_fragment(&mut cmd, world, &frame.id) {
-            Ok(fragment) => fragment,
+        let value = match walk_frame(tab, frame, world, &mut cmd) {
+            Ok(value) => value,
             Err(e) if index == 0 => return Err(e),
             // The frame went away between the tree walk and here; its
             // section says so rather than failing the whole snapshot.
@@ -3229,31 +3444,6 @@ where
                 ));
                 continue;
             }
-        };
-        let params = format!(
-            "{{\"expression\":{},{}\"returnByValue\":true}}",
-            json_string(&expression),
-            context
-        );
-        let Ok(result) = cmd("Runtime.evaluate", &params) else {
-            if index == 0 {
-                return Err("page did not return a snapshot".into());
-            }
-            text.push_str(&format!(
-                "- frame: {} (unreadable right now; take a new snapshot)\n",
-                frame.url
-            ));
-            continue;
-        };
-        let Some(value) = evaluated_string(&result) else {
-            if index == 0 {
-                return Err("page did not return a snapshot".into());
-            }
-            text.push_str(&format!(
-                "- frame: {} (unreadable right now; take a new snapshot)\n",
-                frame.url
-            ));
-            continue;
         };
         snapshot::saw_refs_up_to(&value);
         let Ok(snap) = parse_snapshot(&value) else {
@@ -3277,6 +3467,131 @@ where
         }
     }
     Ok((text, pairs))
+}
+
+/// Walk one frame and return the JSON the walk produced.
+///
+/// The walk runs in cu's isolated world of the frame. That world belongs to
+/// the document, so it is made once and remembered (see
+/// [`crate::pagecache`]), and the helper script is sent once per document
+/// too: the walk is left in `window.__cuSnapshot` and the next snapshot
+/// only has to call it.
+///
+/// A world that is gone -- the document was replaced by a navigation the
+/// daemon did not see -- is made again, and the walk installed again.
+fn walk_frame<F>(
+    tab: &Tab,
+    frame: &Frame,
+    world: crate::execution::World,
+    cmd: &mut F,
+) -> Result<String, String>
+where
+    F: FnMut(&str, &str) -> Result<String, String>,
+{
+    for attempt in 0..2 {
+        let context = match world {
+            crate::execution::World::Main => None,
+            crate::execution::World::Isolated => Some(world_for_with(tab, &frame.id, cmd)?),
+        };
+        let installed =
+            context.is_some() && pagecache::get(tab, &frame.id).is_some_and(|f| f.installed);
+        let expression = if installed {
+            snapshot::call_script().to_string()
+        } else {
+            snapshot::install_script(snapshot::base_for(tab.cdp_port, &frame.id))
+        };
+        let params = match context {
+            Some(id) => format!(
+                "{{\"expression\":{},\"contextId\":{id},\"returnByValue\":true}}",
+                json_string(&expression)
+            ),
+            None => format!(
+                "{{\"expression\":{},\"returnByValue\":true}}",
+                json_string(&expression)
+            ),
+        };
+        let value = match cmd("Runtime.evaluate", &params) {
+            Ok(reply) => evaluated_string(&reply),
+            Err(error) => {
+                // The world is gone: the document behind it was replaced.
+                if attempt == 0 && stale_world(&error) {
+                    pagecache::forget(tab, &frame.id);
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        let Some(value) = value else {
+            // No value: either the page did not answer, or the helpers were
+            // not installed there after all (a document that replaced the one
+            // the cache remembered). Install them and walk again.
+            if attempt == 0 {
+                pagecache::forget(tab, &frame.id);
+                continue;
+            }
+            return Err("page did not return a snapshot".into());
+        };
+        if !installed {
+            pagecache::mark_installed(tab, &frame.id);
+        }
+        return Ok(value);
+    }
+    Err("page did not return a snapshot".into())
+}
+
+/// The execution context id of cu's isolated world in `frame_id`, made once
+/// per document and remembered until the document is replaced.
+fn world_for_with<F>(tab: &Tab, frame_id: &str, cmd: &mut F) -> Result<i64, String>
+where
+    F: FnMut(&str, &str) -> Result<String, String>,
+{
+    if let Some(frame) = pagecache::get(tab, frame_id) {
+        return Ok(frame.context);
+    }
+    let context = crate::execution::isolated_context(cmd, frame_id)?;
+    pagecache::remember(tab, frame_id, context, false);
+    Ok(context)
+}
+
+/// The `"contextId":N,` fragment for cu's isolated world of `frame_id`.
+///
+/// The world belongs to the document: it is made once and remembered until
+/// the document is replaced (see [`crate::pagecache`]).
+fn cached_context_fragment<F>(
+    tab: &Tab,
+    frame_id: &str,
+    world: crate::execution::World,
+    cmd: &mut F,
+) -> Result<String, String>
+where
+    F: FnMut(&str, &str) -> Result<String, String>,
+{
+    match world {
+        crate::execution::World::Main => Ok(String::new()),
+        crate::execution::World::Isolated => {
+            let context = world_for_with(tab, frame_id, cmd)?;
+            Ok(format!("\"contextId\":{context},"))
+        }
+    }
+}
+
+/// The execution context id of cu's isolated world in `frame_id` of `tab`,
+/// made once per document and remembered until the document is replaced.
+pub fn world_for(tab: &Tab, frame_id: &str) -> Result<i64, String> {
+    if let Some(frame) = pagecache::get(tab, frame_id) {
+        return Ok(frame.context);
+    }
+    let context = crate::execution::isolated_context(&mut |m, p| tab.command(m, p), frame_id)?;
+    pagecache::remember(tab, frame_id, context, false);
+    Ok(context)
+}
+
+/// Whether an error says the world cu remembered is gone: the document was
+/// replaced, and the world with it.
+pub fn stale_world(error: &str) -> bool {
+    error.contains("Cannot find context")
+        || error.contains("Execution context was destroyed")
+        || error.contains("Inspected target navigated or closed")
 }
 
 /// Parse the JSON the in-page walk produced.
@@ -3456,9 +3771,18 @@ fn helper_context(tab: &Tab) -> Result<String, String> {
     if world == crate::execution::World::Main {
         return Ok(String::new());
     }
-    let mut cmd = |m: &str, p: &str| tab.command(m, p);
-    let frame = crate::execution::main_frame(&mut cmd)?;
-    crate::execution::context_fragment(&mut cmd, world, &frame)
+    // The main frame's id is known from the last time the page was read, and
+    // the frame outlives the documents in it; only the world has to be made
+    // again, and only when the document behind it was replaced.
+    let frame = match pagecache::main_frame(tab) {
+        Some(frame) => frame,
+        None => {
+            let mut cmd = |m: &str, p: &str| tab.command(m, p);
+            crate::execution::main_frame(&mut cmd)?
+        }
+    };
+    let context = world_for(tab, &frame)?;
+    Ok(format!("\"contextId\":{context},"))
 }
 /// Page shown after the human submitted the local login form.
 fn login_result_page(delivered: bool, user: &str) -> String {
@@ -3985,6 +4309,81 @@ impl CdpConnection {
         self.call_observed(method, params, &mut |_| {})
     }
 
+    /// Send several commands and read their replies in one round trip.
+    ///
+    /// The commands are written before the first reply is read, so the
+    /// browser answers them without a round trip each: a click's press,
+    /// release and barrier cost one round trip instead of three. The
+    /// replies come back in the order the commands were sent, and the events
+    /// that arrive in between are handed to `observe`, exactly as they are
+    /// for a single command.
+    pub(crate) fn call_many(
+        &mut self,
+        commands: &[(&str, &str)],
+        observe: &mut dyn FnMut(&str),
+    ) -> Vec<Result<String, String>> {
+        let started = Instant::now();
+        let mut ids = Vec::with_capacity(commands.len());
+        for (method, params) in commands {
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1);
+            ids.push(id);
+            let message = format!("{{\"id\":{id},\"method\":\"{method}\",\"params\":{params}}}");
+            if let Err(error) = self
+                .stream
+                .write_all(&encode_client_frame(message.as_bytes()))
+            {
+                let error = error.to_string();
+                return commands.iter().map(|_| Err(error.clone())).collect();
+            }
+        }
+        let mut replies: Vec<Option<Result<String, String>>> =
+            (0..commands.len()).map(|_| None).collect();
+        let mut left = commands.len();
+        while left > 0 {
+            let text = match self.next_message(MAX_CDP_MESSAGE) {
+                Ok(text) => text,
+                Err(error) => {
+                    for slot in replies.iter_mut() {
+                        if slot.is_none() {
+                            *slot = Some(Err(error.clone()));
+                        }
+                    }
+                    break;
+                }
+            };
+            match message_id(&text) {
+                Some(id) => {
+                    if let Some(position) = ids.iter().position(|sent| *sent == id)
+                        && replies[position].is_none()
+                    {
+                        replies[position] = Some(Ok(text));
+                        left -= 1;
+                    }
+                }
+                None => {
+                    crate::diagnostics::record_event();
+                    observe(&text);
+                }
+            }
+        }
+        let elapsed = started.elapsed();
+        replies
+            .into_iter()
+            .enumerate()
+            .map(|(index, slot)| {
+                let reply = slot.unwrap_or_else(|| Err("the browser did not answer".into()));
+                crate::diagnostics::record_command(
+                    commands[index].0,
+                    commands[index].1,
+                    elapsed,
+                    reply.as_ref().is_ok_and(|r| !r.contains("\"error\":{")),
+                );
+                reply
+            })
+            .collect()
+    }
+
     /// Like [`call`](Self::call), but hands every event that arrives before
     /// the reply to `observe`. That is how an action learns it started a
     /// navigation without a second round trip: Chromium announces the
@@ -4000,6 +4399,7 @@ impl CdpConnection {
         let message = format!("{{\"id\":{id},\"method\":\"{method}\",\"params\":{params}}}");
         let started = Instant::now();
         let reply = self.exchange(id, &message, observe);
+        crate::server::trace(&format!("cdp {method}"), Some(started));
         crate::diagnostics::record_command(
             method,
             params,
@@ -4023,7 +4423,9 @@ impl CdpConnection {
             // Events carry no `id`; a reply for an older, abandoned command is
             // not ours either. Both are skipped rather than misreported.
             match message_id(&text) {
-                Some(got) if got == id => return Ok(text),
+                Some(got) if got == id => {
+                    return Ok(text);
+                }
                 Some(_) => continue,
                 None => {
                     crate::diagnostics::record_event();
@@ -4066,13 +4468,74 @@ impl CdpConnection {
     /// events this way never stops reading the stream — a command read for
     /// inline would swallow the events arriving while it waited, and a
     /// request paused for ever is a page hung for ever.
-    pub(crate) fn send(&mut self, method: &str, params: &str) {
+    pub(crate) fn send(&mut self, method: &str, params: &str) -> Result<(), String> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         let message = format!("{{\"id\":{id},\"method\":\"{method}\",\"params\":{params}}}");
-        let _ = self
-            .stream
-            .write_all(&encode_client_frame(message.as_bytes()));
+        self.stream
+            .write_all(&encode_client_frame(message.as_bytes()))
+            .map_err(|e| e.to_string())
+    }
+
+    /// Throw away the frames that are already waiting on this connection.
+    ///
+    /// A batch starts with whatever happened before it (a navigation the page
+    /// made on its own, say): those events are not this batch's business, and
+    /// a stale one would make it wait for a page that is not coming.
+    ///
+    /// Only whole frames are read. A frame that is half in the socket is
+    /// left alone: the connection cannot carry it any more, and the batch
+    /// that needs it opens a fresh one.
+    ///
+    /// Returns whether the connection is still usable.
+    pub(crate) fn drain_events(&mut self) -> bool {
+        loop {
+            let mut head = [0u8; 10];
+            // The peek must not wait: a blocking peek would sit out the
+            // read timeout on every batch with nothing to drain.
+            let _ = self.stream.set_nonblocking(true);
+            let peeked = self.stream.peek(&mut head);
+            let _ = self.stream.set_nonblocking(false);
+            let available = match peeked {
+                Ok(0) => return false, // the browser closed the connection
+                Ok(available) => available,
+                Err(_) => return true, // nothing is waiting
+            };
+            if available < 2 {
+                return true; // a header still on its way
+            }
+            let mut length = (head[1] & 0x7f) as usize;
+            let mut header = 2usize;
+            if length == 126 {
+                if available < 4 {
+                    return true;
+                }
+                length = u16::from_be_bytes([head[2], head[3]]) as usize;
+                header = 4;
+            } else if length == 127 {
+                if available < 10 {
+                    return true;
+                }
+                let mut wide = [0u8; 8];
+                wide.copy_from_slice(&head[2..10]);
+                length = u64::from_be_bytes(wide) as usize;
+                header = 10;
+            }
+            let frame = header + length;
+            if frame > MAX_CDP_MESSAGE {
+                return false;
+            }
+            // The whole frame has to be here before it is read: a frame read
+            // in two pieces leaves the connection out of step.
+            let mut whole = vec![0u8; frame];
+            match self.stream.peek(&mut whole) {
+                Ok(available) if available >= frame => {}
+                _ => return true,
+            }
+            if read_frame(&mut self.stream, MAX_CDP_MESSAGE).is_err() {
+                return false;
+            }
+        }
     }
 
     fn next_message(&mut self, limit: usize) -> Result<String, String> {
@@ -4295,12 +4758,12 @@ fn start_auth_keeper(tab: &Tab, host: &str, pair: (String, String)) {
                         continue;
                     }
                     if let Some(rid) = auth_required_id(&text) {
-                        connection.send(
+                        let _unused = connection.send(
                             "Fetch.continueWithAuth",
                             &continue_with_auth_params(&rid, &Some(keeper.pair.clone())),
                         );
                     } else if let Some(rid) = paused_request_id(&text) {
-                        connection.send(
+                        let _unused = connection.send(
                             "Fetch.continueRequest",
                             &format!("{{\"requestId\":{}}}", json_string(&rid)),
                         );
@@ -4411,6 +4874,36 @@ fn forget_tab(tab: &Tab) {
 /// reopened and retried once, so a target swap is not an error.
 pub fn cdp_command(cdp_port: u16, method: &str, params: &str) -> Result<String, String> {
     tab_command(&Tab::default_for(cdp_port), method, params)
+}
+
+/// Run several DevTools commands on `tab` and return their replies, in the
+/// order the commands were sent.
+///
+/// The commands travel together, so the browser answers them without a round
+/// trip each: a snapshot's frame tree and its walk cost one round trip
+/// instead of two.
+pub fn call_batch(tab: &Tab, commands: &[(&str, &str)]) -> Vec<Result<String, String>> {
+    for attempt in 0..2 {
+        let Ok(mut connection) = checkout(tab) else {
+            return commands
+                .iter()
+                .map(|_| Err("no DevTools connection".into()))
+                .collect();
+        };
+        let replies = connection.call_many(commands, &mut |_| {});
+        if replies.iter().all(|reply| reply.is_ok()) {
+            let mut guard = cdp_pool(tab).lock().unwrap_or_else(|e| e.into_inner());
+            guard.put(connection);
+            return replies;
+        }
+        // A broken connection is only worth retrying once: the second try
+        // has just opened a fresh one.
+        if attempt == 0 {
+            continue;
+        }
+        return replies;
+    }
+    unreachable!("the retry loop returns on its second attempt")
 }
 
 fn tab_command(tab: &Tab, method: &str, params: &str) -> Result<String, String> {
@@ -4575,6 +5068,30 @@ pub fn base64_encode(bytes: &[u8]) -> String {
         });
     }
     out
+}
+
+/// Start a timing span. Enabled with `CU_TRACE=1`; the daemon prints one
+/// `TRACE <label> <ms>` line per span on stderr.
+pub fn trace_start() -> Option<std::time::Instant> {
+    if std::env::var_os("CU_TRACE").is_some() {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    }
+}
+
+/// Print a timing span started by [`trace_start`].
+pub fn trace(label: &str, start: Option<std::time::Instant>) {
+    if let Some(start) = start {
+        eprintln!(
+            "TRACE {label} {:.2} @{}",
+            start.elapsed().as_secs_f64() * 1000.0,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+    }
 }
 
 pub fn json_value(input: &str, key: &str) -> Option<String> {
@@ -5384,7 +5901,11 @@ fn vault_api(
             };
             let token = json_value(body, "collect_token").unwrap_or_default();
             match vault.ack_otp_request(id, &token) {
-                Ok(true) => ("200 OK", "application/json", "{\"acknowledged\":true}".into()),
+                Ok(true) => (
+                    "200 OK",
+                    "application/json",
+                    "{\"acknowledged\":true}".into(),
+                ),
                 Ok(false) => error_json("not collecting, or the collect token does not match"),
                 Err(e) => error_json(&e),
             }
@@ -6210,14 +6731,24 @@ pub mod snapshot {
         *ports.entry(frame_id.to_string()).or_insert(next)
     }
 
-    /// The full in-page script: ref registry, then the walk, numbered from
-    /// `base`.
-    pub fn script_with_base(base: u64) -> String {
+    /// The script that installs cu's helpers in a frame and walks the page.
+    ///
+    /// It is sent once per document: the registry it installs is guarded
+    /// against a second install, and the walk is left behind in
+    /// `window.__cuSnapshot` for the next snapshot to call. Sending it again
+    /// for every snapshot made the browser compile ten kilobytes of
+    /// JavaScript every time, which was most of a snapshot's cost.
+    pub fn install_script(base: u64) -> String {
         format!(
-            "window.__cuBase={base};{}{}",
+            "window.__cuBase={base};{}{}\nwindow.__cuSnapshot()",
             crate::actions::REGISTRY_JS,
             SNAPSHOT_JS
         )
+    }
+
+    /// The walk alone, for a document whose helpers are already installed.
+    pub fn call_script() -> &'static str {
+        "window.__cuSnapshot()"
     }
 
     /// Record the highest ref a page has handed out.
@@ -6240,7 +6771,7 @@ pub mod snapshot {
     /// what the page itself sees.
     pub const SNAPSHOT_JS: &str = r#"
 /* cuAgentSnapshot */
-(() => {
+window.__cuSnapshot = function() {
   const INTERACTIVE = 'a[href],button,input,select,textarea,[role=button],[role=link],[role=checkbox],[role=tab],[role=menuitem],[contenteditable]:not([contenteditable=false])';
   const HEADINGS = 'h1,h2,h3,[role=heading]';
   const visible = (el) => {
@@ -6308,7 +6839,7 @@ pub mod snapshot {
     headings,
     next: window.__cu.next(),
   });
-})()
+};
 "#;
 }
 

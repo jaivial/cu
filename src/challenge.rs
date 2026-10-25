@@ -622,16 +622,21 @@ where
         ),
     )?;
     let value = evaluated_string(&reply).ok_or("the page did not answer the probe")?;
+    Ok(probe_value(&value, &frames))
+}
+
+/// What the probe read in the page.
+fn probe_value(value: &str, frames: &[crate::server::Frame]) -> Probe {
     let mut probe = Probe {
-        url: json_string_value(&value, "url").unwrap_or_default(),
-        title: json_string_value(&value, "title").unwrap_or_default(),
-        ready_state: json_string_value(&value, "ready").unwrap_or_default(),
-        status: json_number(&value, "status").unwrap_or(0.0) as u16,
-        text: json_string_value(&value, "text").unwrap_or_default(),
-        markers: json_array(&value, "markers")
+        url: json_string_value(value, "url").unwrap_or_default(),
+        title: json_string_value(value, "title").unwrap_or_default(),
+        ready_state: json_string_value(value, "ready").unwrap_or_default(),
+        status: json_number(value, "status").unwrap_or(0.0) as u16,
+        text: json_string_value(value, "text").unwrap_or_default(),
+        markers: json_array(value, "markers")
             .map(|a| json_strings(&a))
             .unwrap_or_default(),
-        frames: json_array(&value, "frames")
+        frames: json_array(value, "frames")
             .map(|a| json_strings(&a))
             .unwrap_or_default(),
         hints: Vec::new(),
@@ -641,7 +646,7 @@ where
     probe
         .frames
         .extend(frames.iter().skip(1).map(|f| f.url.clone()));
-    Ok(probe)
+    probe
 }
 
 /// The fingerprint values [`crate::stealth`] installs, read from the page's
@@ -676,17 +681,18 @@ pub fn wait_budget() -> Duration {
 /// until it clears or `budget` is spent; one that does not clear becomes
 /// `human_required`. A probe that fails mid-navigation (the interstitial
 /// reloading into the real page) is retried, not reported.
-pub fn assess<F>(cmd: F, budget: Duration) -> Assessment
+pub fn assess<F>(tab: &crate::server::Tab, cmd: F, budget: Duration) -> Assessment
 where
     F: FnMut(&str, &str) -> Result<String, String>,
 {
-    assess_response(cmd, budget, None)
+    assess_response(tab, cmd, budget, None)
 }
 
 /// [`assess`], with what the network saw of the main document: its status
 /// stands in when the page did not record one, and its header hints count
 /// as evidence.
 pub fn assess_response<F>(
+    tab: &crate::server::Tab,
     mut cmd: F,
     budget: Duration,
     response: Option<&crate::scheduler::DocumentResponse>,
@@ -696,7 +702,7 @@ where
 {
     let started = Instant::now();
     loop {
-        let error = match probe(&mut cmd) {
+        let error = match probe_on(tab, &mut cmd) {
             Ok(mut probe) => {
                 if let Some(response) = response {
                     if probe.status == 0 {
@@ -738,6 +744,51 @@ where
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// The same probe, using what cu already knows about the page.
+///
+/// The frame list and the isolated world are remembered between actions, so
+/// the probe costs one round trip instead of three: it is the answer the
+/// browser has already given.
+pub fn probe_on<F>(tab: &crate::server::Tab, mut cmd: F) -> Result<Probe, String>
+where
+    F: FnMut(&str, &str) -> Result<String, String>,
+{
+    let frames = match crate::pagecache::page_frames(tab) {
+        Some(frames) if !frames.is_empty() => frames,
+        _ => {
+            let tree = cmd("Page.getFrameTree", "{}")?;
+            let frames = flatten_frame_tree(&tree);
+            crate::pagecache::remember_frames(tab, frames.clone());
+            frames
+        }
+    };
+    let main = frames.first().ok_or("page has no main frame")?;
+    // The world belongs to the document: when the document was replaced the
+    // remembered one is gone, and the browser says so. The world is then
+    // made again, and the probe runs in the new document.
+    let mut answer = None;
+    for attempt in 0..2 {
+        let context = crate::server::world_for(tab, &main.id)?;
+        let reply = cmd(
+            "Runtime.evaluate",
+            &format!(
+                "{{\"expression\":{},\"contextId\":{context},\"returnByValue\":true}}",
+                json_string(PROBE_JS)
+            ),
+        )?;
+        if let Some(value) = evaluated_string(&reply) {
+            answer = Some(value);
+            break;
+        }
+        if attempt == 0 {
+            crate::pagecache::forget(tab, &main.id);
+            continue;
+        }
+    }
+    let value = answer.ok_or("the page did not answer the probe")?;
+    Ok(probe_value(&value, &frames))
 }
 
 /// One assessment of one tab, safe to log and to hand back to the agent.
@@ -1059,7 +1110,7 @@ fn recheck_after_url_change(tab: &Tab, changed_at: Instant) {
     if fresh_enough {
         return;
     }
-    let mut fresh = assess(|m, p| tab.command(m, p), Duration::ZERO);
+    let mut fresh = assess(tab, |m, p| tab.command(m, p), Duration::ZERO);
     if fresh.state == ChallengeState::Unknown
         && (fresh.url.is_empty() || fresh.signals.iter().any(|s| s == "page still loading"))
     {
@@ -1149,7 +1200,7 @@ pub fn gate(tab: &Tab) -> Option<Assessment> {
     if last.state != ChallengeState::HumanRequired {
         return None;
     }
-    let fresh = assess(|m, p| tab.command(m, p), Duration::ZERO);
+    let fresh = assess(tab, |m, p| tab.command(m, p), Duration::ZERO);
     match fresh.state {
         // Cleared, or turned into something no person can fix from here:
         // the tab goes back to automation with the new state on record.
@@ -1599,7 +1650,7 @@ pub mod handoff {
     /// gate and this wait all agree on the state) and returns it.
     fn probe_once(tab: &Tab) -> super::Assessment {
         super::gate(tab).unwrap_or_else(|| {
-            let fresh = super::assess(|m, p| tab.command(m, p), Duration::ZERO);
+            let fresh = super::assess(tab, |m, p| tab.command(m, p), Duration::ZERO);
             super::record(tab, &fresh);
             fresh
         })

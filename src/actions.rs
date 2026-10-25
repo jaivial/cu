@@ -415,6 +415,7 @@ pub fn run_batch(tab: &Tab, batch: &Batch) -> Result<String, String> {
                 let document = outcome.document.as_ref();
                 let assessment = (outcome.navigated && crate::challenge::enabled()).then(|| {
                     let assessment = crate::challenge::assess_response(
+                        tab,
                         |m, p| page.conn().call(m, p),
                         crate::challenge::wait_budget(),
                         document,
@@ -528,14 +529,29 @@ struct Page {
 impl Page {
     fn open(tab: &Tab) -> Result<Self, String> {
         // A pooled connection may belong to a browser that has gone away; the
-        // first command finds out, and one fresh connection is tried.
+        // drain finds out, and one fresh connection is tried.
         let mut connection = checkout(tab)?;
-        if connection.call("Page.enable", "{}").is_err() {
+        if !connection.drain_events() {
             connection = open_connection(tab)?;
-            connection.call("Page.enable", "{}")?;
+            connection.drain_events();
         }
-        let tree = connection.call("Page.getFrameTree", "{}")?;
-        let frames = server::flatten_frame_tree(&tree);
+        // The page's events have to be on before the action runs, but the
+        // browser does not have to answer for them: the command goes out
+        // ahead of the action, and the events arrive while the action runs.
+        // Waiting for the answer would cost a round trip per batch.
+        let _unused = connection.send("Page.enable", "{}");
+        // The frame list is the browser's answer to "what is this page made
+        // of". The snapshot read it already, and it only changes when the
+        // page navigates -- which the daemon forgets it on.
+        let frames = match crate::pagecache::page_frames(tab) {
+            Some(frames) if !frames.is_empty() => frames,
+            _ => {
+                let tree = connection.call("Page.getFrameTree", "{}")?;
+                let frames = server::flatten_frame_tree(&tree);
+                crate::pagecache::remember_frames(tab, frames.clone());
+                frames
+            }
+        };
         let frame = frames
             .first()
             .map(|f| f.id.clone())
@@ -557,11 +573,15 @@ impl Page {
 
     /// Stop `Page` events and give the connection back, so it does not fill
     /// up with events nobody reads.
+    ///
+    /// The command goes out without waiting for its answer: the browser
+    /// stops the events when it gets to it, and the next batch drains what
+    /// is left over.
     fn close(mut self) {
         if let Some(mut connection) = self.connection.take()
             && !self.poisoned
-            && connection.call("Page.disable", "{}").is_ok()
         {
+            let _unused = connection.send("Page.disable", "{}");
             checkin(&self.tab, connection);
         }
     }
@@ -616,13 +636,47 @@ impl Page {
                     self.type_paced(text, &mut watch)?;
                 } else {
                     self.focus(reference, *clear)?;
-                    self.input(
-                        "Input.insertText",
-                        &format!("{{\"text\":{}}}", json_string(text)),
-                        &mut watch,
-                    )?;
+                    // The text and the barrier that follows it go out
+                    // together: one round trip instead of two, and the
+                    // events between them (a navigation the text started)
+                    // are seen before the barrier's reply.
+                    let typed = format!("{{\"text\":{}}}", json_string(text));
+                    if *submit {
+                        let (key, code, vk, key_text) =
+                            key_event("Enter").ok_or("unsupported key \"Enter\"")?;
+                        let key_text = if key_text.is_empty() {
+                            String::new()
+                        } else {
+                            format!(",\"text\":{}", json_string(key_text))
+                        };
+                        let common = format!(
+                            "\"key\":{},\"code\":\"{code}\",\"windowsVirtualKeyCode\":{vk}",
+                            json_string(key)
+                        );
+                        let down = format!("{{\"type\":\"keyDown\",{common}{key_text}}}");
+                        let up = format!("{{\"type\":\"keyUp\",{common}}}");
+                        self.input_batch(
+                            &[
+                                ("Input.insertText", typed.as_str()),
+                                ("Input.dispatchKeyEvent", down.as_str()),
+                                ("Input.dispatchKeyEvent", up.as_str()),
+                                ("Runtime.evaluate", BARRIER),
+                            ],
+                            &mut watch,
+                        )?;
+                        watch.barrier = true;
+                    } else {
+                        self.input_batch(
+                            &[
+                                ("Input.insertText", typed.as_str()),
+                                ("Runtime.evaluate", BARRIER),
+                            ],
+                            &mut watch,
+                        )?;
+                        watch.barrier = true;
+                    }
                 }
-                if *submit {
+                if *submit && self.input_policy == InputPolicy::Paced {
                     self.key("Enter", &mut watch)?;
                 }
                 let navigated = self.settle(&mut watch)?;
@@ -861,8 +915,8 @@ impl Page {
         if let Some((frame, target)) = self.remote_frame(reference) {
             return eval_on(&target, &frame, &expression);
         }
-        let context = self.enter(reference)?;
-        self.registry_in(context, call)
+        let (frame, context) = self.enter_frame(reference)?;
+        self.registry_in(&frame, context, call)
     }
 
     /// Set `files` on the file input behind `reference` (or the page's only
@@ -904,6 +958,12 @@ impl Page {
         if reply.contains("\"exceptionDetails\"") {
             return Err(json_string_value(&reply, "description")
                 .unwrap_or_else(|| "script failed in the page".into()));
+        }
+        // The browser refused the command: the world it names is gone (the
+        // document behind it was replaced), or the page would not run it.
+        if reply.contains("\"error\":{") {
+            return Err(json_string_value(&reply, "message")
+                .unwrap_or_else(|| "the browser refused the command".into()));
         }
         let Some(object) = json_string_value(&reply, "objectId") else {
             // The helper answers with a JSON string when there is no input.
@@ -998,13 +1058,21 @@ impl Page {
         server::target_for_frame(&self.tab, &frame).map(|t| (frame, t))
     }
 
-    fn registry_in(&mut self, context: Option<i64>, call: &str) -> Result<String, String> {
-        self.eval_in(
-            context,
-            &format!(
-                "{REGISTRY}?{REGISTRY}.{call}:JSON.stringify({{error:'this page has no refs yet; take a snapshot first'}})"
-            ),
-        )
+    fn registry_in(
+        &mut self,
+        frame: &str,
+        context: Option<i64>,
+        call: &str,
+    ) -> Result<String, String> {
+        let expression = format!(
+            "{REGISTRY}?{REGISTRY}.{call}:JSON.stringify({{error:'this page has no refs yet; take a snapshot first'}})"
+        );
+        match context {
+            // The page's own world (`CU_HELPER_WORLD=main`): there is no
+            // world to make again.
+            None => self.eval_in(None, &expression),
+            Some(_) => self.eval_in_world(frame, &expression),
+        }
     }
 
     /// The execution context of the frame that owns `reference`: cu's
@@ -1013,9 +1081,21 @@ impl Page {
     /// Isolated worlds persist per document under the fixed name `cu`, so the
     /// walk's registry is the one found here later.
     fn enter(&mut self, reference: &str) -> Result<Option<i64>, String> {
+        Ok(self.enter_frame(reference)?.1)
+    }
+
+    /// The frame a helper for `reference` runs in, and the world it runs in.
+    fn enter_frame(&mut self, reference: &str) -> Result<(String, Option<i64>), String> {
         match self.subframe_of(reference) {
-            None => self.main_world(),
-            Some(frame) => self.world(&frame).map(Some),
+            None => {
+                let frame = self.frame.clone();
+                let context = self.main_world()?;
+                Ok((frame, context))
+            }
+            Some(frame) => {
+                let context = Some(self.world(&frame)?);
+                Ok((frame, context))
+            }
         }
     }
 
@@ -1036,17 +1116,49 @@ impl Page {
         server::frame_for_ref(&self.tab, reference).filter(|f| *f != self.frame)
     }
 
+    /// The execution context id of cu's isolated world in `frame_id`.
+    ///
+    /// The world belongs to the document, so it is made once and remembered
+    /// until the document is replaced (see [`crate::pagecache`]).
     fn world(&mut self, frame_id: &str) -> Result<i64, String> {
+        if let Some(frame) = crate::pagecache::get(&self.tab, frame_id) {
+            return Ok(frame.context);
+        }
         let conn = self.conn();
-        crate::execution::isolated_context(&mut |m, p| conn.call(m, p), frame_id)
+        let context = crate::execution::isolated_context(&mut |m, p| conn.call(m, p), frame_id)?;
+        crate::pagecache::remember(&self.tab, frame_id, context, false);
+        Ok(context)
     }
 
     /// Run a helper on the main document (in the helper world) and return
     /// the string it produced. A script that reports `{"error":...}` becomes
     /// an `Err` with that message.
     fn eval(&mut self, expression: &str) -> Result<String, String> {
-        let context = self.main_world()?;
-        self.eval_in(context, expression)
+        let (frame, context) = self.enter_frame("")?;
+        match context {
+            None => self.eval_in(None, expression),
+            Some(_) => self.eval_in_world(&frame, expression),
+        }
+    }
+
+    /// [`eval_in`](Self::eval_in) in cu's isolated world of `frame_id`.
+    ///
+    /// The world belongs to the document: when the document was replaced the
+    /// remembered world is gone and the browser says so. The world is then
+    /// made again, and the helper runs in the new document.
+    fn eval_in_world(&mut self, frame_id: &str, expression: &str) -> Result<String, String> {
+        for attempt in 0..2 {
+            let context = self.world(frame_id)?;
+            match self.eval_in(Some(context), expression) {
+                Ok(value) => return Ok(value),
+                Err(error) if attempt == 0 && crate::server::stale_world(&error) => {
+                    crate::pagecache::forget(&self.tab, frame_id);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err("the page was replaced under the action; take a new snapshot".into())
     }
 
     /// [`eval`](Self::eval) in an execution context: `Some(context)` for an
@@ -1086,11 +1198,12 @@ impl Page {
                 &format!("locate({},{hit_test})", json_string(reference)),
             )?
         } else {
-            let context = match &subframe {
-                None => self.main_world()?,
-                Some(frame) => Some(self.world(frame)?),
+            let (frame, context) = match &subframe {
+                None => self.enter_frame(reference)?,
+                Some(frame) => (frame.clone(), Some(self.world(frame)?)),
             };
             self.registry_in(
+                &frame,
                 context,
                 &format!("locate({},{hit_test})", json_string(reference)),
             )?
@@ -1455,13 +1568,21 @@ impl Page {
             )
         };
         if self.input_policy == InputPolicy::Instant {
-            for kind in ["mousePressed", "mouseReleased"] {
-                self.input(
-                    "Input.dispatchMouseEvent",
-                    &mouse(kind, target.at, 0),
-                    watch,
-                )?;
-            }
+            // The press, the release and the barrier that follows them go
+            // out together: the browser answers them in order, and the
+            // events between them (a navigation the click started) are seen
+            // before the barrier's reply. One round trip instead of three.
+            let press = mouse("mousePressed", target.at, 0);
+            let release = mouse("mouseReleased", target.at, 0);
+            self.input_batch(
+                &[
+                    ("Input.dispatchMouseEvent", press.as_str()),
+                    ("Input.dispatchMouseEvent", release.as_str()),
+                    ("Runtime.evaluate", BARRIER),
+                ],
+                watch,
+            )?;
+            watch.barrier = true;
             return Ok(());
         }
         let from = match crate::input::pointer(&self.tab) {
@@ -1547,6 +1668,28 @@ impl Page {
 
     /// Send an input command, feeding the events that precede its reply to
     /// the navigation watch.
+    /// Send several commands in one round trip and check that the browser
+    /// accepted them.
+    fn input_batch(
+        &mut self,
+        commands: &[(&str, &str)],
+        watch: &mut NavWatch,
+    ) -> Result<(), String> {
+        let replies = self
+            .conn()
+            .call_many(commands, &mut |event| watch.see(event));
+        for (index, reply) in replies.into_iter().enumerate() {
+            let reply = reply?;
+            let (method, _) = commands[index];
+            if let Some(message) =
+                json_value(&reply, "message").filter(|_| reply.contains("\"error\""))
+            {
+                return Err(format!("{method}: {message}"));
+            }
+        }
+        Ok(())
+    }
+
     fn input(
         &mut self,
         method: &str,
@@ -1578,7 +1721,7 @@ impl Page {
     /// has not changed and `navigated` must say false -- for a download the
     /// file name is reported instead.
     fn settle(&mut self, watch: &mut NavWatch) -> Result<bool, String> {
-        if !watch.started {
+        if !watch.started && !watch.barrier {
             let _ = self
                 .conn()
                 .call_observed("Runtime.evaluate", BARRIER, &mut |event| watch.see(event));
@@ -1608,6 +1751,14 @@ impl Page {
                 .conn()
                 .call_observed("Runtime.evaluate", BARRIER, &mut |event| watch.see(event));
         }
+        if watch.committed {
+            // The page is a new document: every world cu remembered for this
+            // tab died with the old one, and the frame list is stale. This
+            // is where the commit is known, so the cache is dropped here and
+            // not a moment earlier.
+            crate::pagecache::forget_tab(&self.tab);
+            crate::pagecache::forget_frames(&self.tab);
+        }
         Ok(watch.committed || watch.within)
     }
 
@@ -1633,6 +1784,8 @@ struct NavWatch {
     frame: String,
     started: bool,
     done: bool,
+    /// The barrier was already sent with the input that started the action.
+    barrier: bool,
     /// The frame committed a real navigation (`Page.frameNavigated`).
     committed: bool,
     /// The frame moved within the same document (hash change).
@@ -1652,6 +1805,7 @@ impl NavWatch {
             frame: frame.to_string(),
             started: false,
             done: false,
+            barrier: false,
             committed: false,
             within: false,
             download: None,
