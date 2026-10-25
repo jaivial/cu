@@ -203,6 +203,11 @@ download already named it in its result. A download started from
 Latency for every one of these is tracked in [BENCHMARKS.md](BENCHMARKS.md),
 including a comparison with agent-browser and Playwright MCP.
 
+`CU_TRACE=1` makes the daemon print one line per step it takes
+(`TRACE cdp Runtime.evaluate 0.34`, `TRACE navigate.after_settle 7.34`, ...)
+on its stderr: where the time of an action went, down to the DevTools round
+trips. It is off by default and changes nothing else.
+
 The browser executable defaults to `chromium`; set `CU_BROWSER` to an alternate binary. Browsers are launched headless, which is what an agent usually wants; set `CU_HEADLESS=0` to attach a display instead. `CU_DATA_DIR` changes the default data directory and `CU_CDP_PORT` the DevTools port (default `9222`). Do not expose this server beyond localhost without adding TLS and an access-control layer; the one supported exposure is the login form behind a reverse proxy (see *Public login URL*).
 
 ### Browser mode: fast-test and compatibility
