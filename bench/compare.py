@@ -107,14 +107,17 @@ class Site(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path == "/done":
             q = parse_qs(u.query)
-            return self.send(("<title>Done</title><h1>Thanks %s, size %s</h1>" % (
+            # The greeting is the link back home: a tool whose snapshot
+            # lists only the interactive elements then still reads it.
+            return self.send(("<title>Done</title>"
+                              "<a href=/>Thanks %s, size %s</a>" % (
                 q.get("name", [""])[0], q.get("size", [""])[0])).encode())
         self.send({"/form": FORM, "/login": LOGIN}.get(u.path, HOME))
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0"))
         user = parse_qs(self.rfile.read(n).decode()).get("user", [""])[0]
-        self.send(("<title>Welcome</title><h1>Welcome %s</h1><a href=/>Home</a>" % user).encode())
+        self.send(("<title>Welcome</title><a href=/>Welcome %s</a>" % user).encode())
 
 
 def free_port():
