@@ -88,6 +88,12 @@ pub const FAST_TEST_ARGS: &[&str] = &[
     // process, but it crashes chrome-headless-shell on cross-document
     // navigation, so it is not used.)
     "--disable-gpu",
+    // No frame-rate limit. Chromium otherwise waits for the compositor's
+    // next vsync before it hands a frame to a screenshot, and a capture then
+    // costs two frame intervals (~33 ms) instead of the few milliseconds the
+    // raster itself takes. The browser only paints when something changed, so
+    // an idle page still costs nothing.
+    "--disable-frame-rate-limit",
     // The network service as a thread of the browser, not a process.
     "--enable-features=NetworkServiceInProcess",
     // Fewer processes: same-site frames share a renderer.

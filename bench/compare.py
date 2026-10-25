@@ -91,11 +91,17 @@ class Site(BaseHTTPRequestHandler):
         pass
 
     def send(self, body):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        # One write, and no Nagle: the head and the body go out in a single
+        # segment. Written in pieces they waited for the peer's delayed ACK,
+        # which added 40 ms to every navigation -- more than the browser's
+        # own work, and the same for every tool under test.
+        head = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: keep-alive\r\n\r\n"
+        ).encode()
+        self.wfile.write(head + body)
 
     def do_GET(self):
         u = urlparse(self.path)
@@ -431,6 +437,7 @@ def main():
     args = ap.parse_args()
 
     site = ThreadingHTTPServer(("127.0.0.1", 0), Site)
+    site.disable_nagle_algorithm = True
     threading.Thread(target=site.serve_forever, daemon=True).start()
     base = "http://127.0.0.1:%d" % site.server_address[1]
     makers = {"cu": lambda: Cu(args.bin), "cu-batch": lambda: CuBatch(args.bin),
