@@ -6,9 +6,11 @@ credentials on a local HTML form so passwords never pass through chat or
 model-visible arguments.
 
 An agent pays for every browser action twice: in milliseconds and in tokens.
-`cu` cuts both — a snapshot is **350 tokens and 3.7 ms**, ten clicks in a batch
-take **25 ms**, and **50 tests can run in parallel on one shared Chrome**, one
-leased tab each.
+`cu` cuts both — a snapshot is **350 tokens and 3 ms**, ten clicks in a batch
+take **9 ms**, and **50 tests can run in parallel on one shared Chrome**, one
+leased tab each. Every tool was measured again, before and after, in the
+[second speed pass](docs/BENCHMARKS.md#the-second-speed-pass): a screenshot is
+**3-4x** faster, a click and a batch **1.6-1.7x**, a snapshot **1.5x**.
 
 Landing page: <https://jaivial.github.io/cu/> · API: [docs/README.md](docs/README.md) ·
 Benchmarks: [docs/BENCHMARKS.md](docs/BENCHMARKS.md) · Skill: [SKILL.md](SKILL.md)
@@ -84,7 +86,11 @@ agent tasks, median of 10 rounds, every tool driven the way an agent drives it.
 | login (open, read, user, password + Enter, read) | **81** | **81** | 157 | 670 |
 | 10 clicks in a row | 55 | **25** | 155 | 5 491 |
 
-The best of each row is bold. Reading it fairly: `cu` and Playwright MCP wait
+The best of each row is bold. (One session, one machine, all four tools:
+the numbers above are that session's. The second speed pass re-measured `cu`
+alone, before and after, on the same harness -- see
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md#the-second-speed-pass).) Reading it
+fairly: `cu` and Playwright MCP wait
 for a navigation an action starts (agent-browser's form/login include the
 `wait` calls an agent would have to add); Playwright MCP mints new refs after
 every action, so its "10 clicks" reads a snapshot before each one; and
