@@ -17,8 +17,11 @@
   - One connection, one page: the `cu mcp` process is the session the daemon
     leases a tab to, so `navigate` then `snapshot` read the same page and two
     connections never share one. Calls on that page run in arrival order;
-    calls naming a `tab` or a `context` run alongside them. On disconnect the
-    pending answers are sent and the session's tabs are closed.
+    calls naming a `tab` or a `context`, and a hand-off `wait`, run alongside
+    them. On disconnect the pending answers are sent and the session's tabs
+    are closed.
+  - Upload paths, in the `upload` tool and in `act` upload steps, resolve
+    against the server's working directory, not the daemon's.
   - Replies that carry a snapshot answer the rest as JSON on the first line
     and the snapshot as plain lines below it; `text` answers the words. A
     failed call is an `isError` result with the daemon's reason. Tools carry

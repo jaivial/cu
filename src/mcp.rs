@@ -58,6 +58,11 @@ pub struct Call {
     pub session: bool,
     /// Ask the daemon for a fresh tab for this session (`new_tab`).
     pub fresh: bool,
+    /// A read the daemon parks (a hand-off `wait`, up to its ceiling): it
+    /// still names the session, so the daemon resolves the same tab, but it
+    /// does not take a turn in the session's queue, where it would hold up
+    /// every later call on the page long after the client gave up on it.
+    pub parked: bool,
 }
 
 impl Call {
@@ -68,6 +73,7 @@ impl Call {
             body: body.map(str::to_string),
             session: false,
             fresh: false,
+            parked: false,
         }
     }
 }
@@ -259,7 +265,9 @@ impl Server {
                 Err(e) => return self.send(&failed(e)),
             },
         };
-        let on_page = call.as_ref().is_some_and(|call| call.session);
+        let on_page = call
+            .as_ref()
+            .is_some_and(|call| call.session && !call.parked);
         let name = name.to_string();
         *lock(&self.running) += 1;
         let server = Arc::clone(self);
@@ -484,7 +492,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "act",
         title: "Batch of actions",
-        description: "Run several steps on one connection and get the resulting page back, e.g. [{\"do\":\"type\",\"ref\":\"e2\",\"text\":\"Ada\"},{\"do\":\"click\",\"ref\":\"e5\"}]. Steps: click (ref); type or fill (ref, text, clear default true, submit); press (key: Enter, Tab, Escape, arrows...); select (ref, value or label); navigate (url); scroll (dy/dx px or to: top|bottom, optional ref); tap, longpress, swipe, pinch (ref or x and y; dx, dy, scale, ms); emulate (mode: mobile|tablet|desktop|custom, width, height); wait (ms); upload (files, optional ref). `\"ok\":false` names the step that failed and why; a stale ref means take a new snapshot.",
+        description: "Run several steps on one connection and get the resulting page back, e.g. [{\"do\":\"type\",\"ref\":\"e2\",\"text\":\"Ada\"},{\"do\":\"click\",\"ref\":\"e5\"}]. Steps: click (ref); type or fill (ref, text, clear default true, submit); press (key: Enter, Tab, Escape, arrows...); select (ref, value or label); navigate (url); scroll (dy/dx px or to: top|bottom, optional ref); tap, longpress, swipe, pinch (ref or x and y; dx, dy, scale, ms); emulate (mode: mobile|tablet|desktop|custom, width, height); wait (ms); upload (files, relative to the server's working directory; optional ref). `\"ok\":false` names the step that failed and why; a stale ref means take a new snapshot.",
         properties: r#""actions":{"type":"array","items":{"type":"object"},"description":"The steps, in order. Each is an object with \"do\" and that step's fields."},"snapshot":{"type":"boolean","description":"End with a fresh snapshot (default true)."}"#,
         required: &["actions"],
         target: Target::Page,
@@ -790,6 +798,7 @@ fn page(
         body,
         session: tab.is_none() && context.is_none(),
         fresh,
+        parked: false,
     })
 }
 
@@ -907,15 +916,9 @@ fn plan(name: &str, args: &Args) -> Result<Call, String> {
             if files.is_empty() {
                 return Err("`files` is empty".into());
             }
-            // The browser reads the files on this machine: absolute and
-            // existing here, or the page gets an empty File.
             let files = files
                 .iter()
-                .map(|f| {
-                    fs::canonicalize(f)
-                        .map(|p| json_string(&p.to_string_lossy()))
-                        .map_err(|e| format!("{f}: {e}"))
-                })
+                .map(|f| absolute_file(f).map(|p| json_string(&p)))
                 .collect::<Result<Vec<_>, _>>()?;
             let reference = match args.reference("ref")? {
                 Some(r) => format!(",\"ref\":{}", json_string(r)),
@@ -1032,18 +1035,31 @@ fn plan(name: &str, args: &Args) -> Result<Call, String> {
                 );
             }
             match args.number("wait")? {
-                Some(seconds) if seconds.parse::<f64>().is_ok_and(|s| s > 0.0) => page(
-                    args,
-                    "GET",
-                    "/v1/challenge",
-                    vec![("wait", seconds.to_string())],
-                    None,
-                ),
+                Some(seconds) if seconds.parse::<f64>().is_ok_and(|s| s > 0.0) => {
+                    let mut call = page(
+                        args,
+                        "GET",
+                        "/v1/challenge",
+                        vec![("wait", seconds.to_string())],
+                        None,
+                    )?;
+                    call.parked = true;
+                    Ok(call)
+                }
                 _ => page(args, "GET", "/v1/handoff", Vec::new(), None),
             }
         }
         other => Err(format!("unknown tool: {other}")),
     }
+}
+
+/// A file to upload, absolute and existing: the daemon reads it on this
+/// machine, and resolves a relative path against its own working directory
+/// rather than this server's.
+fn absolute_file(path: &str) -> Result<String, String> {
+    fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .map_err(|e| format!("{path}: {e}"))
 }
 
 /// `,"snapshot":true` when a single action asks for the resulting page (the
@@ -1089,12 +1105,30 @@ fn actions(value: Option<&Json>) -> Result<String, String> {
         let Json::Object(members) = step else {
             return Err("every step is an object such as {\"do\":\"click\",\"ref\":\"e3\"}".into());
         };
+        let upload = step.get("do").and_then(Json::as_str) == Some("upload");
         let mut ordered: Vec<(String, Json)> = members
             .iter()
             .filter(|(key, _)| key == "do")
             .cloned()
             .collect();
-        ordered.extend(members.iter().filter(|(key, _)| key != "do").cloned());
+        for (key, value) in members.iter().filter(|(key, _)| key != "do") {
+            // The daemon resolves a relative path against its own working
+            // directory; the caller means this server's, as with `upload`.
+            let value = match (upload, key.as_str(), value) {
+                (true, "file", Json::String(path)) => Json::String(absolute_file(path)?),
+                (true, "files", Json::Array(paths)) => Json::Array(
+                    paths
+                        .iter()
+                        .map(|path| match path {
+                            Json::String(path) => absolute_file(path).map(Json::String),
+                            other => Ok(other.clone()),
+                        })
+                        .collect::<Result<_, _>>()?,
+                ),
+                _ => value.clone(),
+            };
+            ordered.push((key.clone(), value));
+        }
         steps.push(Json::Object(ordered).to_json());
     }
     Ok(format!("[{}]", steps.join(",")))

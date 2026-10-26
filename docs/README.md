@@ -456,9 +456,9 @@ Clients configured through JSON (Cursor, Claude Desktop, pi's `mcp.json`):
 tools without `tab` or `context` work in the tab the daemon leases to it,
 opened on first use, so `navigate` then `snapshot` read the same page and two
 connections never share one. Calls on that page run one at a time in the
-order they arrived; calls that name a `tab` or a `context` (and the ones that
-touch no page) run alongside them, so a hand-off `wait` in one tab does not
-hold up a snapshot in another. When the client closes the connection, the
+order they arrived; calls that name a `tab` or a `context`, the ones that
+touch no page, and a hand-off `wait` (a read the daemon parks for minutes) run
+alongside them, so a wait does not hold up a snapshot, here or in another tab. When the client closes the connection, the
 answers still owed are sent and the tabs the session opened are closed; a
 killed process leaves them to the daemon's collector instead. The first time
 the session gets a tab, the result says which one, so the CLI can reach the
@@ -477,7 +477,7 @@ same page with `--tab ID`.
 | `close_context` | `DELETE /v1/contexts/NAME` | drop a context a page tool opened |
 | `console` | `GET /v1/console` | console, exceptions, CSP and network failures |
 | `inspect`, `mark`, `marks` | `/v1/inspect`, `/v1/marks` | visual QA references and the report |
-| `upload` | `POST /v1/act` (`upload` step) | files into a file input |
+| `upload` | `POST /v1/act` (`upload` step) | files into a file input; paths (here and in `act` upload steps) resolve against the server's working directory |
 | `downloads` | `GET /v1/downloads` | finished downloads |
 | `handoff` | `/v1/handoff`, `/v1/challenge` | hand-off state, `wait`, `release` |
 | `session_save`, `session_load` | `POST /v1/session/NAME` | saved logins |
