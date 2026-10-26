@@ -114,6 +114,7 @@ where
         out: Mutex::new(Box::new(output)),
         page,
         opened: Mutex::new(Vec::new()),
+        pinned: Mutex::new(None),
         running: Mutex::new(0),
         settled: Condvar::new(),
     });
@@ -148,6 +149,13 @@ struct Server {
     page: mpsc::Sender<Job>,
     /// The tabs the daemon opened for this session, closed when it ends.
     opened: Mutex<Vec<String>>,
+    /// The tab this session works in, once the daemon named it. Later calls
+    /// name it themselves (`?tab=`) instead of leaning on the daemon's lease,
+    /// which is keyed on this process's pid as the daemon's `/proc` sees it:
+    /// from another pid namespace (a container that shares the host's network
+    /// but not its pids) that pid is a different process or none, and every
+    /// call landed in a fresh tab -- `navigate`, then `snapshot` of a blank one.
+    pinned: Mutex<Option<String>>,
     /// Tool calls not answered yet, and the signal that one was.
     running: Mutex<usize>,
     settled: Condvar,
@@ -295,7 +303,7 @@ impl Server {
                 self.host.login_url()
             ))]);
         };
-        let (head, body) = self.host.request(call).map_err(|e| e.trim().to_string())?;
+        let (head, body) = self.in_session(call).map_err(|e| e.trim().to_string())?;
         let mut content = match name {
             "screenshot" => shot_content(&body, args)?,
             "text" => vec![Content::Text(readable_text(&body))],
@@ -305,17 +313,57 @@ impl Server {
             && let Some(id) = args.str("id")
         {
             lock(&self.opened).retain(|open| open != id);
+            let mut pinned = lock(&self.pinned);
+            if pinned.as_deref() == Some(id) {
+                *pinned = None;
+            }
         }
+        // The daemon names the tab only when it resolved the session itself:
+        // the first page call, a `new_tab`, or the fallback after a lost tab.
         if call.session
-            && header(&head, "x-cu-tab-new").is_some()
             && let Some(tab) = header(&head, "x-cu-tab")
         {
-            lock(&self.opened).push(tab.to_string());
-            content.push(Content::Text(format!(
-                "cu: this session works in a fresh tab ({tab}); page tools without `tab` use it, and it is closed when this MCP session ends"
-            )));
+            *lock(&self.pinned) = Some(tab.to_string());
+            if header(&head, "x-cu-tab-new").is_some() {
+                lock(&self.opened).push(tab.to_string());
+                content.push(Content::Text(format!(
+                    "cu: this session works in a fresh tab ({tab}); page tools without `tab` use it, and it is closed when this MCP session ends"
+                )));
+            }
         }
         Ok(content)
+    }
+
+    /// One daemon request; a call on this session's page goes to the pinned
+    /// tab when there is one. A pinned tab that is gone (closed by hand,
+    /// collected, crashed) is forgotten and the call goes to the session
+    /// instead, where the daemon opens a fresh one.
+    fn in_session(&self, call: &Call) -> Result<(String, String), String> {
+        let pinned = match call.session && !call.fresh {
+            true => lock(&self.pinned).clone(),
+            false => None,
+        };
+        let Some(tab) = pinned else {
+            return self.host.request(call);
+        };
+        let separator = if call.path.contains('?') { '&' } else { '?' };
+        let named = Call {
+            path: format!("{}{separator}tab={}", call.path, url_encode(&tab)),
+            session: false,
+            ..call.clone()
+        };
+        match self.host.request(&named) {
+            Err(e) if e.contains("no such tab") => {
+                let mut pinned = lock(&self.pinned);
+                if pinned.as_deref() == Some(tab.as_str()) {
+                    *pinned = None;
+                }
+                drop(pinned);
+                lock(&self.opened).retain(|open| *open != tab);
+                self.host.request(call)
+            }
+            other => other,
+        }
     }
 
     /// Close the tabs this session opened: the connection is over and nobody
