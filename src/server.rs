@@ -3758,14 +3758,33 @@ fn wait_for_page_on(tab: &Tab, budget: Duration) -> (Duration, bool) {
 /// Any outcome is reported as a plain bool; the secret never reaches the
 /// response or the daemon's log.
 fn fill_login_form(user: &str, password: &str, state: &AppState) -> Result<(), String> {
+    // The form of a modern app is a React form: its inputs are controlled,
+    // so writing `value` into them is not enough -- the framework only sees
+    // the change if the value goes through its own setter and the input
+    // event follows. The submit is a button click, not `form.submit()`,
+    // because the framework listens for the submit event.
     let script = format!(
-        "(function(){{var p=document.querySelector('input[type=password]');\
+        "(function(){{\
+         var p=document.querySelector('input[type=password]');\
          if(!p)return 'no password field';\
-         var u=document.querySelector('input[name=username],input[type=email],input[type=text]');\
-         if(u)u.value={user};\
-         p.value={password};\
+         var u=document.querySelector('input[name=username],input[name=email],input[type=text]');\
+         var set=function(el,value){{\
+           if(!el)return;\
+           var proto=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;\
+           var desc=Object.getOwnPropertyDescriptor(proto,'value');\
+           if(desc&&desc.set)desc.set.call(el,value);else el.value=value;\
+           el.dispatchEvent(new Event('input',{{bubbles:true}}));\
+           el.dispatchEvent(new Event('change',{{bubbles:true}}));\
+         }};\
+         if(u){{if(u.disabled)u.disabled=false;set(u,{user});}}\
+         if(p.disabled)p.disabled=false;\
+         set(p,{password});\
          var f=p.closest('form');\
-         if(f){{f.submit();return 'submitted';}}\
+         if(f){{\
+           var btn=f.querySelector('button[type=submit]')||f.querySelector('button');\
+           if(btn){{btn.click();return 'clicked the submit button';}}\
+           f.submit();return 'submitted';\
+         }}\
          return 'filled';}})()",
         user = json_string(user),
         password = json_string(password)

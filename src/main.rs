@@ -399,8 +399,22 @@ fn start(args: &[String]) -> Result<(), String> {
 /// Where a person opens the login form: the running daemon's public URL, else
 /// `CU_PUBLIC_URL`, else the daemon's loopback port.
 fn login_url() -> String {
-    let data = env::var_os("CU_DATA_DIR").unwrap_or_else(|| ".cu".into());
-    let config = fs::read_to_string(PathBuf::from(data).join("server.json")).unwrap_or_default();
+    // The daemon that answers is the one whose config is read: the
+    // per-instance one (CU_DATA_DIR), the canonical daemon, or a legacy
+    // `.cu` in this directory. Reading the wrong one printed a port nobody
+    // listens on.
+    let mut sources: Vec<PathBuf> = Vec::new();
+    if let Some(data) = env::var_os("CU_DATA_DIR") {
+        sources.push(PathBuf::from(data));
+    } else {
+        sources.push(daemon_dir());
+        sources.push(PathBuf::from(".cu"));
+    }
+    let config = sources
+        .iter()
+        .filter_map(|dir| fs::read_to_string(dir.join("server.json")).ok())
+        .find(|config| server::json_value(config, "port").is_some())
+        .unwrap_or_default();
     let public = server::json_value(&config, "public_url")
         .or_else(|| env::var("CU_PUBLIC_URL").ok())
         .and_then(|u| server::parse_public_url(&u).ok());
