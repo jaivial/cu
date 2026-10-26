@@ -323,6 +323,26 @@ pub fn classify(probe: &Probe) -> Verdict {
         }
     }
 
+    // Google's "unusual traffic" page (`/sorry/index`): a reCAPTCHA a
+    // person has to solve, served instead of the results. Never ready, and
+    // never something cu answers itself.
+    if probe.url.contains("google.") && probe.url.contains("/sorry/") {
+        return Verdict::new(
+            HumanRequired,
+            Some("google-sorry"),
+            vec!["google unusual-traffic page (/sorry/)".into()],
+        );
+    }
+    if let Some(s) = text_has(
+        probe,
+        &[
+            "our systems have detected unusual traffic",
+            "nuestros sistemas han detectado tráfico inusual",
+        ],
+    ) {
+        return Verdict::new(HumanRequired, Some("google-sorry"), vec![s]);
+    }
+
     // A CAPTCHA puzzle open on screen, whatever the page.
     if frame(probe, "recaptcha/api2/bframe", true)
         || frame(probe, "recaptcha/enterprise/bframe", true)
@@ -1748,6 +1768,27 @@ mod tests {
             frames: Vec::new(),
             hints: Vec::new(),
         }
+    }
+
+    #[test]
+    fn googles_unusual_traffic_page_needs_a_person() {
+        let p = probe(
+            "https://www.google.com/sorry/index",
+            "https://www.google.com/search?q=pizza",
+            200,
+            "",
+            &[],
+        );
+        assert_eq!(classify(&p).state, ChallengeState::HumanRequired);
+        assert_eq!(classify(&p).vendor, Some("google-sorry"));
+        let p = probe(
+            "https://www.google.es/search?q=x",
+            "",
+            200,
+            "nuestros sistemas han detectado tráfico inusual procedente de tu red",
+            &[],
+        );
+        assert_eq!(classify(&p).state, ChallengeState::HumanRequired);
     }
 
     #[test]

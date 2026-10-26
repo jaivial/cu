@@ -109,4 +109,15 @@ Use `cu` when an agent needs a persistent local browser session.
     password or a code: `login_url` for sign-ins, and the vault and `cu otp`
     stay on the CLI.
 
+13. SEO work. `cu seo audit URL --keywords "a,b"` answers one page's SEO
+    report (JSON; `--md` for people); `cu seo crawl URL --max-pages N` walks
+    one site politely and prints a summary. For anything about *where* a
+    search happens, give the context a location first --
+    `cu serp "query" --geo "Town,Region,CC"` (or `cu seo geo NAME "..."`
+    then `--context NAME`) -- and use `cu serp compare ... --geo A --geo B`
+    to show what changes between places. Read the `warnings`: without a
+    `--proxy` the IP is still this machine's. Keep searches few and spaced;
+    a `409` with a challenge means stop and hand the tab to a person, never
+    retry around it.
+
 The bearer token is stored in `.cu/server.json`; keep that file private. The server binds to loopback only.

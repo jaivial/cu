@@ -949,6 +949,11 @@ fn route_with(
         (method, path),
         ("POST", "/v1/tabs")
             | ("POST", "/v1/navigate")
+            | ("POST", "/v1/seo/audit")
+            | ("GET", "/v1/seo/robots")
+            | ("POST", "/v1/seo/serp")
+            | ("POST", "/v1/seo/geo")
+            | ("GET", "/v1/seo/geo")
             | ("GET", "/v1/screenshot")
             | ("GET", "/v1/snapshot")
             | ("POST", "/v1/navigate-and-snapshot")
@@ -980,7 +985,10 @@ fn route_with(
     // the same browser; `?tab=ID` runs it in another real tab (a popup, a
     // window a click opened). They are two ways of picking a page, so giving
     // both is an error rather than a silent preference.
-    let tab = if needs_browser && !path.starts_with("/v1/contexts") && !path.starts_with("/v1/tabs")
+    let tab = if needs_browser
+        && !path.starts_with("/v1/contexts")
+        && !path.starts_with("/v1/tabs")
+        && !(method == "POST" && path == "/v1/seo/geo")
     {
         let context = form_value(query(full_path), "context");
         let wanted = form_value(query(full_path), "tab");
@@ -1049,6 +1057,8 @@ fn route_with(
             | ("POST", "/v1/click")
             | ("POST", "/v1/type")
             | ("POST", "/v1/upload")
+            | ("POST", "/v1/seo/audit")
+            | ("POST", "/v1/seo/serp")
     ) && crate::live_stream::taken(&tab)
     {
         return (
@@ -1066,6 +1076,8 @@ fn route_with(
             | ("POST", "/v1/act")
             | ("POST", "/v1/click")
             | ("POST", "/v1/type")
+            | ("POST", "/v1/seo/audit")
+            | ("POST", "/v1/seo/serp")
     ) && let Some(blocking) = crate::challenge::gate(&tab)
     {
         return (
@@ -1246,7 +1258,30 @@ fn route_with(
             "application/json",
             downloads_json(&state.data_dir.join("downloads")),
         ),
+        // SEO (see `crate::seo`): audit a page, read robots.txt, give a
+        // context a location, read a search result page from it.
+        ("POST", "/v1/seo/audit") => {
+            ensure_context_geo(&tab);
+            crate::seo::audit(&tab, body)
+        }
+        ("GET", "/v1/seo/robots") => crate::seo::robots(&tab),
+        ("POST", "/v1/seo/serp") => crate::seo::serp(&tab, state.cdp_port, body),
+        ("POST", "/v1/seo/geo") => crate::seo::apply_geo(
+            state.cdp_port,
+            &state.data_dir,
+            &form_value(query(full_path), "context"),
+            body,
+        ),
+        ("GET", "/v1/seo/geo") => match context_of(&tab) {
+            Some(name) => crate::seo::show_geo(&tab, state.cdp_port, &name),
+            None => (
+                "400 Bad Request",
+                "application/json",
+                "{\"error\":\"a location belongs to a named context: add ?context=NAME\"}".into(),
+            ),
+        },
         ("POST", "/v1/navigate") => {
+            ensure_context_geo(&tab);
             let url = json_value(body, "url").unwrap_or_default();
             if url.is_empty() {
                 return (
@@ -1560,7 +1595,7 @@ fn context_session(
 /// assess, and retry a 429/503 or a transient network error within the
 /// budget (see [`crate::scheduler`]). A challenge or a block is never
 /// retried.
-fn navigate_scheduled(
+pub fn navigate_scheduled(
     tab: &Tab,
     url: &str,
     auth: Option<(String, String)>,
@@ -3989,6 +4024,8 @@ impl Tab {
 struct Context {
     browser_context: String,
     target: String,
+    /// The proxy the context was created with (`seo geo --proxy`).
+    proxy: Option<String>,
     /// Where this context's downloads are directed, once `cu` has told the
     /// browser. `None` until then, and left `None` if the browser refused.
     downloads: Option<PathBuf>,
@@ -4087,6 +4124,27 @@ fn page_target_ids_and_sockets(discovery: &str, cdp_port: u16) -> Vec<(String, S
 
 /// The tab of context `name`, created on first use.
 pub fn context_tab(cdp_port: u16, name: &str, data: &Path) -> Result<Tab, String> {
+    context_tab_with(cdp_port, name, data, None)
+}
+
+/// `(browserContextId, target, proxy)` of context `name`, if it is open.
+pub fn context_info(cdp_port: u16, name: &str) -> Option<(String, String, Option<String>)> {
+    contexts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(cdp_port, name.to_string()))
+        .map(|c| (c.browser_context.clone(), c.target.clone(), c.proxy.clone()))
+}
+
+/// [`context_tab`], creating the context behind `proxy` when it is new: a
+/// browser context carries its own proxy (`Target.createBrowserContext`'s
+/// `proxyServer`), so contexts in different countries share one browser.
+pub fn context_tab_with(
+    cdp_port: u16,
+    name: &str,
+    data: &Path,
+    proxy: Option<&str>,
+) -> Result<Tab, String> {
     if !valid_name(name) {
         return Err("invalid context name".into());
     }
@@ -4098,11 +4156,14 @@ pub fn context_tab(cdp_port: u16, name: &str, data: &Path) -> Result<Tab, String
             target: Some(context.target.clone()),
         });
     }
-    let created = cdp_browser_command(
-        cdp_port,
-        "Target.createBrowserContext",
-        "{\"disposeOnDetach\":false}",
-    )?;
+    let params = match proxy {
+        Some(proxy) => format!(
+            "{{\"disposeOnDetach\":false,\"proxyServer\":{},\"proxyBypassList\":\"<-loopback>\"}}",
+            json_string(proxy)
+        ),
+        None => "{\"disposeOnDetach\":false}".to_string(),
+    };
+    let created = cdp_browser_command(cdp_port, "Target.createBrowserContext", &params)?;
     let browser_context = json_string_value(&created, "browserContextId")
         .ok_or("Chromium did not create a browser context")?;
     let target = cdp_browser_command(
@@ -4124,6 +4185,7 @@ pub fn context_tab(cdp_port: u16, name: &str, data: &Path) -> Result<Tab, String
         Context {
             browser_context,
             target: target.clone(),
+            proxy: proxy.map(str::to_string),
             downloads: None,
         },
     );
@@ -4206,6 +4268,7 @@ pub fn close_context(cdp_port: u16, name: &str) -> Result<bool, String> {
     let Some(context) = removed else {
         return Ok(false);
     };
+    crate::seo::forget_geo(cdp_port, name);
     forget_tab(&Tab {
         cdp_port,
         target: Some(context.target),
@@ -4234,6 +4297,16 @@ fn dispose_context(cdp_port: u16, browser_context: &str) -> Result<(), String> {
         &format!("{{\"browserContextId\":{}}}", json_string(browser_context)),
     )
     .map(|_| ())
+}
+
+/// Re-arm a geo context's overrides before a page action, in case the
+/// browser dropped the DevTools session that held them.
+fn ensure_context_geo(tab: &Tab) {
+    if let Some(name) = context_of(tab)
+        && let Err(e) = crate::seo::ensure_geo(tab.cdp_port, &name)
+    {
+        eprintln!("cu: the location of context {name} could not be re-applied: {e}");
+    }
 }
 
 /// The name of the context `tab` is the tab of, if it is one.

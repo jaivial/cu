@@ -43,6 +43,18 @@ CLOSED = set()
 # Every Browser.setDownloadBehavior call, as the params it arrived with, so a
 # test can see whether the daemon gave a named context a directory of its own.
 DOWNLOAD_BEHAVIOUR = []
+# Params of the SEO/location commands, in order, for `GET /geo-log`:
+# browser contexts (with their proxy), locale / time zone / position
+# overrides, the User-Agent override and permission grants.
+GEO_LOG = []
+GEO_METHODS = (
+    "Target.createBrowserContext",
+    "Emulation.setLocaleOverride",
+    "Emulation.setTimezoneOverride",
+    "Emulation.setGeolocationOverride",
+    "Network.setUserAgentOverride",
+    "Browser.setPermission",
+)
 DENY_ON = {"on": False}
 # Big enough to force the 64-bit websocket length form that a real screenshot
 # uses, so the frame reader cannot get away with the 16-bit one alone.
@@ -153,8 +165,10 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path == "/json":
+        if self.path in ("/json", "/json/list"):
             self.send_discovery()
+        elif self.path == "/geo-log":
+            self.send_raw(json.dumps(GEO_LOG, separators=(",", ":")))
         elif self.path == "/input-log":
             self.send_json(INPUT_LOG)
         elif self.path == "/command-log":
@@ -266,6 +280,8 @@ class Handler(BaseHTTPRequestHandler):
                 break
             method = message.get("method", "")
             COMMANDS.append(method)
+            if method in GEO_METHODS:
+                GEO_LOG.append({"method": method, "params": message.get("params") or {}})
             reply = self.result_for(method, message.get("params"))
             reply["id"] = message.get("id", 1)
             self.reply(reply)
@@ -453,6 +469,17 @@ class Handler(BaseHTTPRequestHandler):
         if method == "Emulation.clearDeviceMetricsOverride":
             EMULATED[0] = None
             return {"result": {}}
+        if method == "Runtime.evaluate" and "navigator.userAgent" == ((params or {}).get("expression") or ""):
+            return {"result": {"result": {"type": "string", "value": "Mozilla/5.0 (X11; Linux x86_64) HeadlessChrome/150.0.0.0"}}}
+        if method == "Runtime.evaluate" and "kws" in ((params or {}).get("expression") or "") and "top_terms" in ((params or {}).get("expression") or ""):
+            # The SEO audit (seo::AUDIT_JS): a small, fixed report.
+            value = json.dumps({
+                "url": "https://example.test/", "status": 200, "title": "Example",
+                "meta_description": None, "headings": {"h1": 1}, "h1_texts": ["Example"],
+                "word_count": 12, "links": {"internal": 1, "internal_urls": ["https://example.test/a"]},
+                "keywords": {}, "issues": ["missing meta description", "thin content (12 words)"],
+            }, separators=(",", ":"))
+            return {"result": {"result": {"type": "string", "value": value}}}
         if method == "Runtime.evaluate":
             expr = (params or {}).get("expression", "")
             context = (params or {}).get("contextId")
