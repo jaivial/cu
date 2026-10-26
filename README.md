@@ -1,7 +1,7 @@
 # cu — computer use for AI agents
 
 `cu` runs **one persistent Chromium** behind a loopback-only HTTP server.
-Agents get a small CLI, a Rust SDK and a skill for browser work; users enter
+Agents get a small CLI, an MCP server, a Rust SDK and a skill for browser work; users enter
 credentials on a local HTML form so passwords never pass through chat or
 model-visible arguments.
 
@@ -61,9 +61,11 @@ cargo run -- marks --md     # the QA report a developer can act on
   `cu shot --annotate all --marks` draws refs and marks on the image so
   pixels, refs and code point at each other. See
   [Visual QA references](docs/README.md#visual-qa-references).
-- **Skill and native tool.** [SKILL.md](SKILL.md) teaches an agent the whole
-  flow (agentic tests, user stories, failure reports), and mini-tui exposes `cu`
-  as a **native tool** next to `bash` — no MCP server in between.
+- **Skill, native tool and MCP server.** [SKILL.md](SKILL.md) teaches an agent
+  the whole flow (agentic tests, user stories, failure reports), mini-tui
+  exposes `cu` as a **native tool** next to `bash`, and `cu mcp` serves the
+  same tools to any MCP client -- pi, Claude Code, Codex, Cursor -- with one
+  page per connection. See [MCP server](#mcp-server).
 - **Passwords never reach the model.** `cu login` prints a local form; the
   daemon types what the human enters. Credentials are never logged, returned
   or passed as arguments.
@@ -381,6 +383,7 @@ cu shot [FILE.jpg] [--annotate REFS|all] [--marks] · cu downloads · cu login
 cu console [--level warn+|error,warn|all] [--grep S] [--clear]   # page console, all levels
 cu inspect e3 · cu mark e3 "what is wrong" [--severity major] · cu marks [--md|clear]
 cu session save NAME · cu session load NAME
+cu mcp                       # the same tools for an MCP client, over stdio
 ```
 
 Everything answers compact JSON, one line per command for `cu batch`, and
@@ -398,6 +401,27 @@ and adds `--use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader
 GPU-less server under xvfb (Chromium 137+ needs `--enable-unsafe-swiftshader`
 to expose it to pages). It costs CPU, so leave it off unless a site needs it;
 `cu diagnostics` shows the GL renderer in use.
+
+## MCP server
+
+`cu mcp` is a stdio [MCP](https://modelcontextprotocol.io) server in front of
+the daemon, for agents whose harness speaks MCP rather than bash:
+
+```sh
+pi mcp add cu -- cu mcp          # pi; `pi mcp list` shows the 21 tools
+claude mcp add cu -- cu mcp      # Claude Code
+codex mcp add cu -- cu mcp       # Codex
+```
+
+or `{"mcpServers":{"cu":{"command":"cu","args":["mcp"]}}}` in a client's JSON
+config. The tools mirror the CLI -- `navigate`, `snapshot`, `text`, `click`,
+`type`, `act`, `screenshot` (an image block), `tabs`, `console`, `inspect`,
+`mark`/`marks`, `upload`, `downloads`, `handoff`, `session_save`/`session_load`,
+`login_url` -- and each is one request to the running daemon. The `cu mcp`
+process is the session: its page tools share one tab, another connection never
+lands in it, and the tab is closed when the connection ends. No tool takes or
+returns a password, a vault secret or a one-time code. Details:
+[MCP server](docs/README.md#mcp-server).
 
 ## Security
 

@@ -223,6 +223,7 @@ fn main() {
         }
         Some("session") => session(&args[1..]),
         Some("daemon") => daemon(&args[1..]),
+        Some("mcp") => mcp(&args[1..]),
         // The global `--tab` lifter has already taken a `--tab ID` out of
         // the arguments; the vault session save wants it.
         Some("vault") => vault(&args[1..], tab.clone()),
@@ -279,7 +280,7 @@ fn wait_for_handoff(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<
 
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release|wait [--timeout S]]\n  cu handoff [wait [--timeout S]]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]\n          levels: debug|verbose log info trace warn error exception csp network, all, LEVEL+\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n  cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup]\n          [--wait] [--timeout S]\n  cu otp wait ID [--timeout S] | cancel ID | list\n  cu otp capture --tab T [--domain D] [--request ID] [--credential ID] [--replace]\n  cu otp code DOMAIN | --credential ID\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release|wait [--timeout S]]\n  cu handoff [wait [--timeout S]]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]\n          levels: debug|verbose log info trace warn error exception csp network, all, LEVEL+\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu mcp   the daemon's tools as an MCP server on stdio (pi, Claude Code, Codex, Cursor)\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n  cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup]\n          [--wait] [--timeout S]\n  cu otp wait ID [--timeout S] | cancel ID | list\n  cu otp capture --tab T [--domain D] [--request ID] [--credential ID] [--replace]\n  cu otp code DOMAIN | --credential ID\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
     );
 }
 
@@ -758,7 +759,12 @@ fn ensure_daemon() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let log_err = log.try_clone().map_err(|e| e.to_string())?;
     let mut cmd = Command::new(exe);
-    cmd.arg("daemon").stdout(log).stderr(log_err);
+    // No stdin: under `cu mcp` this process's stdin is the client's protocol
+    // pipe, and the daemon outlives the client.
+    cmd.arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(log)
+        .stderr(log_err);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1055,6 +1061,56 @@ fn daemon(args: &[String]) -> Result<(), String> {
     });
     server::serve(state, listener);
     Ok(())
+}
+
+/// `cu mcp`: serve the daemon's tools to an MCP client over stdio (see
+/// `cu::mcp`). The client launches this process and talks JSON-RPC on its
+/// stdin and stdout; every tool is one daemon request, made the way the CLI
+/// makes it, and this process is the session whose tab page tools work in.
+fn mcp(args: &[String]) -> Result<(), String> {
+    if let Some(flag) = args.first() {
+        return Err(format!("unknown option {flag}; usage: cu mcp"));
+    }
+    struct Daemon {
+        /// Whether the daemon was brought up for the first page call.
+        warmed: std::sync::atomic::AtomicBool,
+    }
+    impl cu::mcp::Host for Daemon {
+        fn request(&self, call: &cu::mcp::Call) -> Result<(String, String), String> {
+            use std::sync::atomic::Ordering;
+            // The session header goes only to the canonical daemon, as with
+            // the CLI. On a fresh boot nothing answers yet: bring the daemon
+            // up before the first page call, or that call would land in the
+            // default tab and the next one in this session's own.
+            if call.session
+                && daemon_config().is_none()
+                && env::var_os("CU_DATA_DIR").is_none()
+                && !self.warmed.swap(true, Ordering::Relaxed)
+            {
+                request("GET", "/v1/status", None)?;
+            }
+            let mut headers = Vec::new();
+            if call.session && daemon_config().is_some() {
+                // This process is the session: one MCP connection, one page.
+                headers.push(("X-Cu-Session", std::process::id().to_string()));
+                if call.fresh {
+                    headers.push(("X-Cu-Session-Fresh", "1".to_string()));
+                }
+            }
+            request_x_lines(call.method, &call.path, call.body.as_deref(), headers)
+        }
+        fn login_url(&self) -> String {
+            login_url()
+        }
+    }
+    eprintln!(
+        "cu mcp {}: serving the daemon's tools on stdio",
+        env!("CARGO_PKG_VERSION")
+    );
+    let host = Arc::new(Daemon {
+        warmed: std::sync::atomic::AtomicBool::new(false),
+    });
+    cu::mcp::serve(std::io::stdin().lock(), std::io::stdout(), host)
 }
 
 /// The first free port at or after `from` (25 candidates, then give up with
