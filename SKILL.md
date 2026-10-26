@@ -100,4 +100,13 @@ Use `cu` when an agent needs a persistent local browser session.
     secret: never print it, screenshot it into a report, or paste it
     anywhere — the capture reply never carries it, keep it that way.
 
+12. Over MCP. When the harness has the `cu mcp` server configured (tools named
+    like `mcp__cu__navigate`), the same flow is tools instead of commands:
+    `navigate`, `snapshot`, `click`, `type`, `act`, `screenshot`, `tabs`,
+    `console`, `inspect`, `mark`/`marks`, `handoff`, `login_url`... The
+    connection is the session: its page tools share one tab (pass `tab` for a
+    popup), and the tab is closed when the connection ends. No MCP tool takes a
+    password or a code: `login_url` for sign-ins, and the vault and `cu otp`
+    stay on the CLI.
+
 The bearer token is stored in `.cu/server.json`; keep that file private. The server binds to loopback only.

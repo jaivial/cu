@@ -8,6 +8,7 @@ pub mod human;
 pub mod input;
 pub mod live;
 pub mod live_stream;
+pub mod mcp;
 pub mod otp;
 pub mod pagecache;
 pub mod policy;

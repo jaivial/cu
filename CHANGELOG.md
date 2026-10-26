@@ -1,5 +1,37 @@
 # Changelog
 
+## [1.5.0] - 2026-10-26
+
+### Added
+
+- **`cu mcp`: the daemon's tools for any MCP client.** A stdio Model Context
+  Protocol server (JSON-RPC 2.0, protocol revisions 2024-11-05 to 2025-11-25)
+  that pi, Claude Code, Codex, Cursor or Claude Desktop launch as
+  `cu mcp` (`pi mcp add cu -- cu mcp`). 21 tools mirror the CLI: `navigate`,
+  `snapshot`, `text`, `click`, `type`, `act`, `screenshot` (an image block,
+  optionally saved to a file), `tabs`, `close_tab`, `close_context`,
+  `console`, `inspect`, `mark`, `marks`, `upload`, `downloads`, `handoff`
+  (with `wait` and `release`), `session_save`, `session_load`, `login_url`
+  and `status`. Each is one request to the running daemon on the CLI's
+  routes, and the daemon is started the CLI's way when nothing answers.
+  - One connection, one page: the `cu mcp` process is the session the daemon
+    leases a tab to, so `navigate` then `snapshot` read the same page and two
+    connections never share one. Calls on that page run in arrival order;
+    calls naming a `tab` or a `context` run alongside them. On disconnect the
+    pending answers are sent and the session's tabs are closed.
+  - Replies that carry a snapshot answer the rest as JSON on the first line
+    and the snapshot as plain lines below it; `text` answers the words. A
+    failed call is an `isError` result with the daemon's reason. Tools carry
+    read-only / destructive / open-world annotations for permission gates.
+  - No tool takes or returns a password, a vault secret or a one-time code:
+    `login_url` points the person at the local form, and the vault and
+    `cu otp` stay on the CLI.
+
+### Changed
+
+- A daemon the CLI starts on demand no longer inherits the caller's stdin
+  (under `cu mcp` that is the client's protocol pipe).
+
 ## [1.4.0] - 2026-10-20
 
 ### Added

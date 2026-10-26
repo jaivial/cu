@@ -429,6 +429,74 @@ Answering a hand-off is the person's side and stays UI-only: the daemon's
 bearer token cannot look up, answer or render the QR of a request, the same
 rule as secret-request approvals.
 
+## MCP server
+
+`cu mcp` serves the daemon's browser tools to any
+[Model Context Protocol](https://modelcontextprotocol.io) client over stdio:
+pi, Claude Code, Codex, Cursor, Claude Desktop. The client launches the
+process and speaks JSON-RPC 2.0 to it, one message per line; logs go to
+stderr. Every tool is one request to the running daemon on the routes the CLI
+uses, and the daemon is started the way the CLI starts it when nothing
+answers yet, so the browser, the vault and the login form stay where they
+are.
+
+```sh
+pi mcp add cu -- cu mcp            # pi (then `pi mcp list`)
+claude mcp add cu -- cu mcp        # Claude Code
+codex mcp add cu -- cu mcp         # Codex
+```
+
+Clients configured through JSON (Cursor, Claude Desktop, pi's `mcp.json`):
+
+```json
+{ "mcpServers": { "cu": { "command": "cu", "args": ["mcp"] } } }
+```
+
+**One connection, one page.** The `cu mcp` process is the session: page
+tools without `tab` or `context` work in the tab the daemon leases to it,
+opened on first use, so `navigate` then `snapshot` read the same page and two
+connections never share one. Calls on that page run one at a time in the
+order they arrived; calls that name a `tab` or a `context` (and the ones that
+touch no page) run alongside them, so a hand-off `wait` in one tab does not
+hold up a snapshot in another. When the client closes the connection, the
+answers still owed are sent and the tabs the session opened are closed; a
+killed process leaves them to the daemon's collector instead. The first time
+the session gets a tab, the result says which one, so the CLI can reach the
+same page with `--tab ID`.
+
+| Tool | Daemon route | What it does |
+|---|---|---|
+| `status` | `GET /v1/status` | daemon and browser up? |
+| `navigate` | `POST /v1/navigate` | open a URL (`inject`, `new_tab`) |
+| `snapshot` | `GET /v1/snapshot` | the ref-addressable page, as plain lines |
+| `text` | `GET /v1/text` | the page's words |
+| `click`, `type` | `POST /v1/click`, `/v1/type` | act on a ref (`snapshot: true` adds the page) |
+| `act` | `POST /v1/act` | a batch of steps, answering the resulting snapshot |
+| `screenshot` | `GET /v1/screenshot` | an image block; `path` saves it, `inline: false` only saves |
+| `tabs`, `close_tab` | `GET /v1/tabs`, `DELETE /v1/tabs/ID` | popups and extra tabs |
+| `close_context` | `DELETE /v1/contexts/NAME` | drop a context a page tool opened |
+| `console` | `GET /v1/console` | console, exceptions, CSP and network failures |
+| `inspect`, `mark`, `marks` | `/v1/inspect`, `/v1/marks` | visual QA references and the report |
+| `upload` | `POST /v1/act` (`upload` step) | files into a file input |
+| `downloads` | `GET /v1/downloads` | finished downloads |
+| `handoff` | `/v1/handoff`, `/v1/challenge` | hand-off state, `wait`, `release` |
+| `session_save`, `session_load` | `POST /v1/session/NAME` | saved logins |
+| `login_url` | (none) | the login form's link for the person |
+
+Page tools take `tab` (a tab id from `tabs`) or `context` (an isolated
+cookie jar). A reply that carries a page snapshot answers the rest of the
+reply as JSON on the first line and the snapshot as plain lines below it,
+instead of one JSON-escaped string; `text` answers the words themselves. A
+failed call answers `isError` with the daemon's reason, so the model can
+correct it. Tool annotations mark the reads (`snapshot`, `text`, `tabs`, ...)
+read-only and the page actions destructive and open-world, which is what
+permission gates in the clients go by.
+
+Credentials stay out of the protocol: no tool takes or returns a password, a
+vault secret or a one-time code. The vault and `cu otp` stay on the CLI and
+the vault UI, and `login_url` hands the person the local form, as
+`cu login` does.
+
 ## SDK
 
 ```rust
