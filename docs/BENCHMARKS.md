@@ -38,7 +38,10 @@ What the pass did, and why each number moved:
   compositor's next vsync before it hands a frame to a screenshot, and a
   capture then costs two frame intervals (~33 ms) instead of the few
   milliseconds the raster takes. The browser still only paints when
-  something changed.
+  something changed. The price is a page that *animates*: it is then
+  rendered as fast as the CPU allows (2.4 cores on a host without a GPU,
+  headless; a windowed browser keeps the display's rate either way).
+  `CU_FAST_CAPTURE=0` keeps the limit.
 - **The helpers are installed once per document.** The ref registry and the
   page walk are eleven kilobytes of JavaScript that the browser compiles
   every time it is sent. They are installed in the document's isolated world

@@ -502,7 +502,8 @@ fn request_config_x(
 /// every action.
 fn read_reply(stream: &mut TcpStream) -> Result<String, String> {
     let mut response = Vec::new();
-    let mut chunk = [0u8; 4096];
+    // A screenshot's reply is a few hundred kilobytes: read them in one go.
+    let mut chunk = [0u8; 64 * 1024];
     let head_end = loop {
         if let Some(end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
             break end + 4;
@@ -1070,8 +1071,8 @@ fn otp(args: &[String], tab: Option<String>) -> Result<(), String> {
             println!("{created}");
             if wait {
                 let id = server::json_string_value(&created, "id")
-                    .or_else(|| server::json_number(&created, "id").map(|n| (n as i64).to_string()))
-                    .ok_or("no id in reply")?;
+                .or_else(|| server::json_number(&created, "id").map(|n| (n as i64).to_string()))
+                .ok_or("no id in reply")?;
                 otp_wait(&id, timeout)?;
             }
             Ok(())
@@ -1455,7 +1456,11 @@ fn otp_collect_save(id: &str, token: &str, response: Option<&str>) -> Result<(),
     // existing one is never followed or truncated) renamed over the target
     // - the rename replaces whatever was there, symlink included, and the
     // final file always carries the creation-mode permissions.
-    let tmp = dir.join(format!(".{id}.tmp-{}-{}", std::process::id(), now,));
+    let tmp = dir.join(format!(
+        ".{id}.tmp-{}-{}",
+        std::process::id(),
+        now,
+    ));
     let written = (|| -> Result<(), String> {
         let mut opts = fs::OpenOptions::new();
         opts.create_new(true).write(true);

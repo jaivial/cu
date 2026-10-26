@@ -142,6 +142,22 @@ pub const WEBGL_ARGS: &[&str] = &[
     "--ignore-gpu-blocklist",
 ];
 
+/// Whether the browser may render as fast as the CPU allows.
+///
+/// Chromium's frame-rate limit is what makes a screenshot wait for the
+/// compositor's next vsync. Removing it makes a capture cost ~6 ms instead
+/// of ~34 ms, and it makes a page that animates cost the cores it takes to
+/// render it. `CU_FAST_CAPTURE=0` keeps the limit.
+pub fn fast_capture() -> bool {
+    !matches!(
+        env::var("CU_FAST_CAPTURE")
+            .ok()
+            .map(|v| v.trim().to_lowercase())
+            .as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
 /// Whether `CU_WEBGL` asks for WebGL (any value but empty, `0` or `false`).
 pub fn webgl_from_env() -> bool {
     env::var("CU_WEBGL")
@@ -289,6 +305,7 @@ impl BrowserPolicy {
         args.extend(
             base.iter()
                 .filter(|a| !(self.webgl && **a == "--disable-gpu"))
+                .filter(|a| !(!fast_capture() && **a == "--disable-frame-rate-limit"))
                 .map(|a| a.to_string()),
         );
         if self.webgl {

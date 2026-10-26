@@ -3996,10 +3996,21 @@ pub fn tabs_for_target(cdp_port: u16, id: &str) -> Vec<Tab> {
 /// Remember which page target the default tab is, so popups and `/json`
 /// ordering cannot move it under the agent's feet.
 fn pin_target(cdp_port: u16, id: &str) {
-    pinned_targets()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(cdp_port, id.to_string());
+    let mut pinned = pinned_targets().lock().unwrap_or_else(|e| e.into_inner());
+    let moved = pinned
+        .get(&cdp_port)
+        .map(|p| p != id)
+        .unwrap_or(false);
+    pinned.insert(cdp_port, id.to_string());
+    drop(pinned);
+    // The default tab now points at another page: what cu remembered about
+    // the old one (its frames, its isolated world) is about a document that
+    // is gone. Execution context ids are per session, not global, so a stale
+    // one can name a frame of the new page.
+    if moved {
+        pagecache::forget_tab(&Tab::default_for(cdp_port));
+        pagecache::forget_frames(&Tab::default_for(cdp_port));
+    }
 }
 
 /// Forget the pinned default (after it was closed); the next action that
@@ -4008,6 +4019,11 @@ fn unpin_target(cdp_port: u16, id: &str) {
     let mut pinned = pinned_targets().lock().unwrap_or_else(|e| e.into_inner());
     if pinned.get(&cdp_port).is_some_and(|p| p == id) {
         pinned.remove(&cdp_port);
+        drop(pinned);
+        // The default tab has no page any more; what cu remembered about the
+        // closed one is about a document that is gone.
+        pagecache::forget_tab(&Tab::default_for(cdp_port));
+        pagecache::forget_frames(&Tab::default_for(cdp_port));
     }
 }
 
