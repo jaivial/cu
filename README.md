@@ -70,21 +70,22 @@ cargo run -- marks --md     # the QA report a developer can act on
 
 ## How `cu` compares
 
-All numbers are copied from [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — same
-browser binary (Chrome for Testing headless shell 153), same local site, same
-agent tasks, median of 10 rounds, every tool driven the way an agent drives it.
+All numbers are copied from [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — one
+session, one machine (16 cores, Chrome for Testing headless shell 153,
+agent-browser 0.13.0, Playwright MCP 0.0.83), same local site, same agent
+tasks, median of 6 rounds, every tool driven the way an agent drives it.
 
 ### Speed, per task (ms, lower is better)
 
 | task | cu | cu (batch) | agent-browser | Playwright MCP |
 | --- | ---: | ---: | ---: | ---: |
-| cold start + first open | **206** | 220 | 321 | 2 437 |
-| open page | 14 | **12** | 20 | 53 |
-| snapshot | **3.7** | 3.8 | 11 | 12 |
-| click | **5.5** | 6.7 | 8.1 | 567 |
-| form (open, read, 2 fields, select, submit, read) | 83 | **73** | 162 | 727 |
-| login (open, read, user, password + Enter, read) | **81** | **81** | 157 | 670 |
-| 10 clicks in a row | 55 | **25** | 155 | 5 491 |
+| cold start + first open | **90** | 85 | 785 | 2 635 |
+| open page | **16** | **16** | 160 | 28 |
+| snapshot | **2** | **2** | 157 | 5 |
+| click | **2** | **2** | 170 | 559 |
+| form (open, read, 2 fields, select, submit, read) | 42 | **39** | 1 445 | 629 |
+| login (open, read, user, password + Enter, read) | 42 | **40** | 1 259 | 591 |
+| 10 clicks in a row | 20 | **7** | 1 666 | 5 346 |
 
 The best of each row is bold. (One session, one machine, all four tools:
 the numbers above are that session's. The second speed pass re-measured `cu`

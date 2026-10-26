@@ -201,22 +201,27 @@ stdio JSON-RPC, one `tools/call` per action. Refs always come from the tool's
 own snapshot.
 
 ```sh
-CU_BROWSER=.../chrome-headless-shell python3 bench/compare.py --iters 10
+CU_BROWSER=.../chrome-headless-shell python3 bench/compare.py --iters 6
 ```
 
 All tools are up at once and each round runs every task on every tool in a
-rotating order, so load on the shared machine falls on all of them alike. Median
-of 10 rounds, in ms (lower is better):
+rotating order, so load on the shared machine falls on all of them alike.
+Median of 6 rounds on a 16-core Linux box, with agent-browser 0.13.0 and
+Playwright MCP 0.0.83, in ms (lower is better):
 
 | task | cu | cu (batch) | agent-browser | Playwright MCP |
 | --- | ---: | ---: | ---: | ---: |
-| cold start + first open | **206** | 220 | 321 | 2 437 |
-| open page | 14 | **12** | 20 | 53 |
-| snapshot | **3.7** | 3.8 | 11 | 12 |
-| click | **5.5** | 6.7 | 8.1 | 567 |
-| form (open, read, 2 fields, select, submit, read) | 83 | **73** | 162 | 727 |
-| login (open, read, user, password + Enter, read) | **81** | 81 | 157 | 670 |
-| 10 clicks in a row | 55 | **25** | 155 | 5 491 |
+| cold start + first open | **90** | 85 | 785 | 2 635 |
+| open page | **16** | **16** | 160 | 28 |
+| snapshot | **2** | **2** | 157 | 5 |
+| click | **2** | **2** | 170 | 559 |
+| form (open, read, 2 fields, select, submit, read) | 42 | **39** | 1 445 | 629 |
+| login (open, read, user, password + Enter, read) | 42 | **40** | 1 259 | 591 |
+| 10 clicks in a row | 20 | **7** | 1 666 | 5 346 |
+
+agent-browser's per-call cost here is its own process start (a node runtime
+per action); the numbers move with the machine and with the versions, so the
+order is the thing to read, not the ratio.
 
 Snapshot of the same 2.3 KB catalogue page (12 nav links, 10 items with a
 button each, search, footer), counted with tiktoken `o200k_base`:

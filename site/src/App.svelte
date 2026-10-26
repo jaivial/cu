@@ -1,12 +1,13 @@
 <script>
   import CompareTable from './lib/CompareTable.svelte';
-  import { tools, tasks, tokens, speed, actionCosts, contexts, resources, sweep, sweepHeadline,
+  import { tools, tasks, tokens, speed, speed2, actionCosts, contexts, resources, sweep, sweepHeadline,
     realLevels, realHeadline, realWaits, realBlock, realVsAb,
     parRound1, parRound2, parHeadline, par429, parCost, parFails } from './lib/data.js';
 
   let tab = $state('cli');
 
   const maxSpeed = Math.max(...speed.map((s) => s.before));
+  const maxSpeed2 = Math.max(...speed2.map((s) => s.before));
   const grp = (s) => s.replace(/\B(?=(\d{3})+(?!\d))/g, '\u202f');
   const n = (v) => grp(v.toLocaleString('es-ES'));
   const fmt = (v) => (v < 10 ? v.toLocaleString('es-ES', { maximumFractionDigits: 1 }) : grp(Math.round(v).toLocaleString('es-ES')));
@@ -302,8 +303,8 @@
         misma llamada.
       </p>
       <dl class="stats">
-        <div><dt>snapshot</dt><dd>3,7<small> ms</small></dd></div>
-        <div><dt>10 clicks en lote</dt><dd>25<small> ms</small></dd></div>
+        <div><dt>snapshot</dt><dd>2<small> ms</small></dd></div>
+        <div><dt>10 clicks en lote</dt><dd>7<small> ms</small></dd></div>
         <div><dt>tokens por página</dt><dd>350<small> vs 1 314</small></dd></div>
         <div><dt>tests en paralelo</dt><dd>50<small> en 1 Chrome</small></dd></div>
       </dl>
@@ -551,6 +552,20 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
           </tbody>
         </table>
       </div>
+      <div class="speed-head second">
+        <h3><code>cu</code> contra sí mismo, segunda pasada</h3>
+        <p>Los dos binarios alternados, acción por acción, para que la carga de la máquina cayera sobre los dos por igual: mediana de 20 rondas sobre la API del daemon.</p>
+      </div>
+      {#each speed2 as s}
+        <div class="sp">
+          <span class="sp-name"><code>{s.action}</code></span>
+          <div class="sp-bars">
+            <span class="b before" style="width:{(s.before / maxSpeed2) * 100}%"><em>{n(s.before)} ms</em></span>
+            <span class="b after" style="width:{(s.after / maxSpeed2) * 100}%"><em>{n(s.after)} ms</em></span>
+          </div>
+          <span class="sp-note">{s.note}</span>
+        </div>
+      {/each}
     </div>
   </section>
 
@@ -1091,6 +1106,7 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
 
   .speed { margin-top: 3rem; padding: 1.6rem; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
   .speed-head h3 { margin: 0; font-size: 1.15rem; }
+  .speed-head.second { margin-top: 2.2rem; padding-top: 1.6rem; border-top: 1px solid var(--line); }
   .speed-head p { margin: 0.3rem 0 1.4rem; color: var(--dim); font-size: 0.88rem; }
   .sp { display: grid; grid-template-columns: 11rem 1fr 14rem; gap: 1rem; align-items: center; padding: 0.7rem 0; border-top: 1px solid var(--line); }
   .sp-name code { color: var(--fg); }

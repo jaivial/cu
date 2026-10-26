@@ -7,15 +7,17 @@ export const tools = [
   { id: 'pw', label: 'Playwright MCP', color: 'var(--pw)' },
 ];
 
-// Median of 10 rounds, ms, same Chrome headless shell 153, same local site.
+// One session, one machine (16 cores, Chrome for Testing headless shell 153,
+// agent-browser 0.13.0, Playwright MCP 0.0.83), median of 6 rounds, ms.
+// Same local site for every tool.
 export const tasks = [
-  { name: 'Arranque en frío + primera página', key: 'cold', v: { cu: 206, batch: 220, ab: 321, pw: 2437 } },
-  { name: 'Abrir página', key: 'open', v: { cu: 14, batch: 12, ab: 20, pw: 53 } },
-  { name: 'Snapshot', key: 'snap', v: { cu: 3.7, batch: 3.8, ab: 11, pw: 12 } },
-  { name: 'Click', key: 'click', v: { cu: 5.5, batch: 6.7, ab: 8.1, pw: 567 } },
-  { name: 'Formulario', note: 'abrir, leer, 2 campos, select, enviar, leer', key: 'form', v: { cu: 83, batch: 73, ab: 162, pw: 727 } },
-  { name: 'Login', note: 'abrir, leer, usuario, contraseña + Enter, leer', key: 'login', v: { cu: 81, batch: 81, ab: 157, pw: 670 } },
-  { name: '10 clicks seguidos', key: 'ten', v: { cu: 55, batch: 25, ab: 155, pw: 5491 } },
+  { name: 'Arranque en frío + primera página', key: 'cold', v: { cu: 90, batch: 85, ab: 785, pw: 2635 } },
+  { name: 'Abrir página', key: 'open', v: { cu: 16, batch: 16, ab: 160, pw: 28 } },
+  { name: 'Snapshot', key: 'snap', v: { cu: 2, batch: 2, ab: 157, pw: 5 } },
+  { name: 'Click', key: 'click', v: { cu: 2, batch: 2, ab: 170, pw: 559 } },
+  { name: 'Formulario', note: 'abrir, leer, 2 campos, select, enviar, leer', key: 'form', v: { cu: 42, batch: 39, ab: 1445, pw: 629 } },
+  { name: 'Login', note: 'abrir, leer, usuario, contraseña + Enter, leer', key: 'login', v: { cu: 42, batch: 40, ab: 1259, pw: 591 } },
+  { name: '10 clicks seguidos', key: 'ten', v: { cu: 20, batch: 7, ab: 1666, pw: 5346 } },
 ];
 
 // Same 2.3 KB catalogue page, tiktoken o200k_base.
@@ -26,17 +28,32 @@ export const tokens = [
   { tool: 'Playwright MCP', cmd: 'browser_snapshot', tokens: 1314, bytes: 3684, color: 'var(--pw)' },
 ];
 
-// cu before/after the speed work, same loaded machine.
+// cu before/after the first speed work, same loaded machine.
 export const speed = [
   { action: 'cu start', before: 461.7, after: 48.8, note: '9,5x · hasta 71x en máquina tranquila' },
   { action: 'shot (jpeg)', before: 48.1, after: 43.1, note: '1,1x' },
   { action: 'shot x8 en paralelo', before: 86.6, after: 73.0, note: '1,2x' },
 ];
 
+// cu before/after the second speed work. The two binaries were run
+// alternately, action by action, so the machine's load fell on both alike:
+// median of 20 rounds, ms, over the daemon's own HTTP API.
+export const speed2 = [
+  { action: 'shot (jpeg)', before: 49.6, after: 12.6, note: '3,9x' },
+  { action: 'shot (png)', before: 49.6, after: 16.0, note: '3,1x' },
+  { action: 'lote (un click)', before: 2.54, after: 1.53, note: '1,7x' },
+  { action: 'click', before: 1.68, after: 1.07, note: '1,6x' },
+  { action: 'texto', before: 1.12, after: 0.75, note: '1,5x' },
+  { action: 'snapshot', before: 1.27, after: 0.86, note: '1,5x' },
+  { action: 'navigate', before: 14.3, after: 14.3, note: '1,0x · ya es el navegador' },
+];
+
 export const actionCosts = [
-  { what: 'click sin navegación, dentro de un lote', ms: '~1 ms' },
-  { what: 'click sin navegación, una llamada HTTP', ms: '3-5 ms' },
-  { what: 'click que navega (hasta DOM nuevo listo)', ms: '15-35 ms' },
+  { what: 'click sin navegación, dentro de un lote', ms: '~0,4 ms' },
+  { what: 'click sin navegación, una llamada HTTP', ms: '~1 ms' },
+  { what: 'snapshot (la lectura para el modelo)', ms: '~0,9 ms' },
+  { what: 'captura (jpeg)', ms: '~13 ms' },
+  { what: 'click que navega (hasta DOM nuevo listo)', ms: '~14 ms · casi todo del navegador' },
 ];
 
 export const contexts = [
