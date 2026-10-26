@@ -10,7 +10,7 @@ An agent pays for every browser action twice: in milliseconds and in tokens.
 take **9 ms**, and **50 tests can run in parallel on one shared Chrome**, one
 leased tab each. Every tool was measured again, before and after, in the
 [second speed pass](docs/BENCHMARKS.md#the-second-speed-pass): a screenshot is
-**3-4x** faster, a click and a batch **1.6-1.7x**, a snapshot **1.5x**.
+**5-7x** faster, a click and a batch **1.5-1.7x**, a snapshot **1.5x**.
 
 Landing page: <https://jaivial.github.io/cu/> · API: [docs/README.md](docs/README.md) ·
 Benchmarks: [docs/BENCHMARKS.md](docs/BENCHMARKS.md) · Skill: [SKILL.md](SKILL.md)

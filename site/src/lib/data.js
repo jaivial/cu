@@ -39,21 +39,22 @@ export const speed = [
 // alternately, action by action, so the machine's load fell on both alike:
 // median of 20 rounds, ms, over the daemon's own HTTP API.
 export const speed2 = [
-  { action: 'shot (jpeg)', before: 49.6, after: 12.6, note: '3,9x' },
-  { action: 'shot (png)', before: 49.6, after: 16.0, note: '3,1x' },
-  { action: 'lote (un click)', before: 2.54, after: 1.53, note: '1,7x' },
-  { action: 'click', before: 1.68, after: 1.07, note: '1,6x' },
-  { action: 'texto', before: 1.12, after: 0.75, note: '1,5x' },
-  { action: 'snapshot', before: 1.27, after: 0.86, note: '1,5x' },
-  { action: 'navigate', before: 14.3, after: 14.3, note: '1,0x · ya es el navegador' },
+  { action: 'shot (jpeg)', before: 83.0, after: 12.3, note: '6,7x' },
+  { action: 'shot (png)', before: 83.4, after: 15.7, note: '5,3x' },
+  { action: 'click (enlace)', before: 1.16, after: 0.68, note: '1,7x' },
+  { action: 'lote (un click)', before: 2.15, after: 1.44, note: '1,5x' },
+  { action: 'click', before: 1.61, after: 1.10, note: '1,5x' },
+  { action: 'snapshot', before: 1.15, after: 0.79, note: '1,5x' },
+  { action: 'texto', before: 0.95, after: 0.69, note: '1,4x' },
+  { action: 'navigate', before: 13.0, after: 13.0, note: '1,0x · ya es el navegador' },
 ];
 
 export const actionCosts = [
   { what: 'click sin navegación, dentro de un lote', ms: '~0,4 ms' },
   { what: 'click sin navegación, una llamada HTTP', ms: '~1 ms' },
-  { what: 'snapshot (la lectura para el modelo)', ms: '~0,9 ms' },
-  { what: 'captura (jpeg)', ms: '~13 ms' },
-  { what: 'click que navega (hasta DOM nuevo listo)', ms: '~14 ms · casi todo del navegador' },
+  { what: 'snapshot (la lectura para el modelo)', ms: '~0,8 ms' },
+  { what: 'captura (jpeg)', ms: '~12 ms' },
+  { what: 'click que navega (hasta DOM nuevo listo)', ms: '~13 ms · casi todo del navegador' },
 ];
 
 export const contexts = [

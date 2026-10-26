@@ -14,18 +14,23 @@ HTTP API *and* the CLI (one process per action, the way an agent calls it).
 
 | tool | before | after | change |
 | --- | ---: | ---: | ---: |
-| `shot(jpeg)` | 49.6 ms | 12.6 ms | **3.9x** |
-| `shot(png)` | 49.6 ms | 16.0 ms | **3.1x** |
-| `act(click)` | 2.54 ms | 1.53 ms | 1.7x |
-| `click` | 1.68 ms | 1.07 ms | 1.6x |
-| `text` | 1.12 ms | 0.75 ms | 1.5x |
-| `snapshot` | 1.27 ms | 0.86 ms | 1.5x |
-| `navigate` | 14.3 ms | 14.3 ms | 1.0x |
+| `shot(jpeg)` | 83.0 ms | 12.3 ms | **6.7x** |
+| `shot(png)` | 83.4 ms | 15.7 ms | **5.3x** |
+| `click(link)` | 1.16 ms | 0.68 ms | 1.7x |
+| `act(click)` | 2.15 ms | 1.44 ms | 1.5x |
+| `click` | 1.61 ms | 1.10 ms | 1.5x |
+| `snapshot` | 1.15 ms | 0.79 ms | 1.5x |
+| `text` | 0.95 ms | 0.69 ms | 1.4x |
+| `navigate` | 13.0 ms | 13.0 ms | 1.0x |
 
-Medians of 20 alternating rounds, Chrome for Testing's headless shell 153 on
+Medians of 24 alternating rounds, Chrome for Testing's headless shell 153 on
 a 16-core Linux box. The same run, measured inside the daemon, where the
 client's own cost is not counted: a click costs 1.2 ms before and 0.41 ms
 after (**2.9x**), a snapshot 0.9 ms before and 0.5 ms after.
+
+In the **canonical daemon** -- the mode an agent's own `cu` calls use --
+the CLI asks for its session's tab and acts on it in one request now, and a
+snapshot over the shell went from 2.87 ms to 1.67 ms (**1.7x**).
 
 What the pass did, and why each number moved:
 
