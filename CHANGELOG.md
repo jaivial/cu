@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.5.1] - 2026-10-26
+
+### Fixed
+
+- **`cu mcp` keeps its page when it runs in a container.** The daemon resolves
+  a session's tab by the caller's pid, read in its own `/proc`; from another
+  pid namespace (mini-tui's container shares the host's network, not its pids)
+  that pid is a different process or none, so every call landed in a fresh tab:
+  `navigate`, then the `snapshot` of a blank page. The MCP server now pins the
+  tab the daemon names on the first page call (and on a `new_tab`) and sends
+  it explicitly (`?tab=`) on every later call. A pinned tab that is gone
+  (closed by hand, collected, crashed) is dropped and the call falls back to
+  the session, which opens a fresh tab and reports it.
+
 ## [1.5.0] - 2026-10-26
 
 ### Added

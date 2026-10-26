@@ -462,7 +462,12 @@ alongside them, so a wait does not hold up a snapshot, here or in another tab. W
 answers still owed are sent and the tabs the session opened are closed; a
 killed process leaves them to the daemon's collector instead. The first time
 the session gets a tab, the result says which one, so the CLI can reach the
-same page with `--tab ID`.
+same page with `--tab ID`. From then on the server names that tab on every
+call (`?tab=ID`) instead of relying on the daemon's per-process lease, so the
+page holds when `cu mcp` runs in another pid namespace than the daemon (a
+container sharing the host's network but not its pids, where the daemon cannot
+see the session's pid). A pinned tab that is gone (closed by hand, collected)
+is dropped and the next call opens a fresh one, and says so.
 
 | Tool | Daemon route | What it does |
 |---|---|---|
