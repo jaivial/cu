@@ -91,24 +91,33 @@ class Site(BaseHTTPRequestHandler):
         pass
 
     def send(self, body):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        # One write, and no Nagle: the head and the body go out in a single
+        # segment. Written in pieces they waited for the peer's delayed ACK,
+        # which added 40 ms to every navigation -- more than the browser's
+        # own work, and the same for every tool under test.
+        head = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: keep-alive\r\n\r\n"
+        ).encode()
+        self.wfile.write(head + body)
 
     def do_GET(self):
         u = urlparse(self.path)
         if u.path == "/done":
             q = parse_qs(u.query)
-            return self.send(("<title>Done</title><h1>Thanks %s, size %s</h1>" % (
+            # The greeting is the link back home: a tool whose snapshot
+            # lists only the interactive elements then still reads it.
+            return self.send(("<title>Done</title>"
+                              "<a href=/>Thanks %s, size %s</a>" % (
                 q.get("name", [""])[0], q.get("size", [""])[0])).encode())
         self.send({"/form": FORM, "/login": LOGIN}.get(u.path, HOME))
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0"))
         user = parse_qs(self.rfile.read(n).decode()).get("user", [""])[0]
-        self.send(("<title>Welcome</title><h1>Welcome %s</h1><a href=/>Home</a>" % user).encode())
+        self.send(("<title>Welcome</title><a href=/>Welcome %s</a>" % user).encode())
 
 
 def free_port():
@@ -431,6 +440,7 @@ def main():
     args = ap.parse_args()
 
     site = ThreadingHTTPServer(("127.0.0.1", 0), Site)
+    site.disable_nagle_algorithm = True
     threading.Thread(target=site.serve_forever, daemon=True).start()
     base = "http://127.0.0.1:%d" % site.server_address[1]
     makers = {"cu": lambda: Cu(args.bin), "cu-batch": lambda: CuBatch(args.bin),

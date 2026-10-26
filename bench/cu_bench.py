@@ -50,11 +50,17 @@ class Site(BaseHTTPRequestHandler):
         pass
 
     def _send(self, body, ctype="text/html", code=200):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        # One write, and no Nagle: the head and the body go out in a single
+        # segment. Written in pieces they waited for the peer's delayed ACK,
+        # which added 40 ms to every navigation -- more than the browser's
+        # own work, and the same for every tool under test.
+        head = (
+            f"HTTP/1.1 {code} OK\r\n"
+            f"Content-Type: {ctype}\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: keep-alive\r\n\r\n"
+        ).encode()
+        self.wfile.write(head + body)
 
     def do_GET(self):
         if self.path == "/stream":  # never ends: blocks a networkidle wait
@@ -194,6 +200,7 @@ def main():
 
     workdir = tempfile.mkdtemp(prefix="cu-bench-")
     site = ThreadingHTTPServer(("127.0.0.1", 0), Site)
+    site.disable_nagle_algorithm = True
     threading.Thread(target=site.serve_forever, daemon=True).start()
     page = "http://127.0.0.1:%d/" % site.server_address[1]
 

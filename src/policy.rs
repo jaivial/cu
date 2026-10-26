@@ -88,6 +88,12 @@ pub const FAST_TEST_ARGS: &[&str] = &[
     // process, but it crashes chrome-headless-shell on cross-document
     // navigation, so it is not used.)
     "--disable-gpu",
+    // No frame-rate limit. Chromium otherwise waits for the compositor's
+    // next vsync before it hands a frame to a screenshot, and a capture then
+    // costs two frame intervals (~33 ms) instead of the few milliseconds the
+    // raster itself takes. The browser only paints when something changed, so
+    // an idle page still costs nothing.
+    "--disable-frame-rate-limit",
     // The network service as a thread of the browser, not a process.
     "--enable-features=NetworkServiceInProcess",
     // Fewer processes: same-site frames share a renderer.
@@ -135,6 +141,22 @@ pub const WEBGL_ARGS: &[&str] = &[
     "--enable-unsafe-swiftshader",
     "--ignore-gpu-blocklist",
 ];
+
+/// Whether the browser may render as fast as the CPU allows.
+///
+/// Chromium's frame-rate limit is what makes a screenshot wait for the
+/// compositor's next vsync. Removing it makes a capture cost ~6 ms instead
+/// of ~34 ms, and it makes a page that animates cost the cores it takes to
+/// render it. `CU_FAST_CAPTURE=0` keeps the limit.
+pub fn fast_capture() -> bool {
+    !matches!(
+        env::var("CU_FAST_CAPTURE")
+            .ok()
+            .map(|v| v.trim().to_lowercase())
+            .as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
 
 /// Whether `CU_WEBGL` asks for WebGL (any value but empty, `0` or `false`).
 pub fn webgl_from_env() -> bool {
@@ -283,6 +305,7 @@ impl BrowserPolicy {
         args.extend(
             base.iter()
                 .filter(|a| !(self.webgl && **a == "--disable-gpu"))
+                .filter(|a| !(!fast_capture() && **a == "--disable-frame-rate-limit"))
                 .map(|a| a.to_string()),
         );
         if self.webgl {

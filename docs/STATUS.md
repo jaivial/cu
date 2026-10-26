@@ -1,5 +1,35 @@
 # STATUS
 
+## The second speed pass
+
+Every tool was measured before and after and worked over again; the numbers
+are in [docs/BENCHMARKS.md](BENCHMARKS.md). A screenshot of the viewport is
+**3-4x** faster, a click and a batch **1.6-1.7x**, a snapshot and a text
+read **1.5x**, and a navigation is unchanged -- it is the browser's own
+navigation latency now, not cu's.
+
+What changed under the hood:
+
+- A capture of the whole viewport does not measure the page first (the
+  measure was two animation frames, and the capture then waited for the
+  frame after that one).
+- Chromium is launched with `--disable-frame-rate-limit`: a capture no
+  longer waits for the compositor's next vsync.
+- The page helpers (the ref registry and the walk) are installed once per
+  document instead of once per snapshot, and the isolated world they run in
+  is remembered instead of made again for every action.
+- The frame list is remembered between the snapshot and the actions that
+  follow it, and dropped when the page navigates.
+- Related DevTools commands travel together (a click's press, release and
+  barrier are one round trip), and the page's events are armed without
+  waiting for the browser's answer.
+- The navigation stops waiting for the network stack to go quiet.
+
+The benchmark harness had a bug of its own: its page server wrote the reply
+in pieces with Nagle on, which added 40 ms to every navigation -- in the
+measurement, not in cu. It is fixed, and the numbers above are measured
+without it.
+
 Work done on `feat/cu-speed` and `feat/cu-pending`: the full `cargo test`
 suite is green (77 tests), and cu was driven against real public sites -- form login
 (the-internet.herokuapp.com, via both `cu act` and the `/login` form flow),

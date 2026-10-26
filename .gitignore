@@ -4,3 +4,4 @@ target
 screenshot.png
 bench_*.json
 __pycache__/
+vault.key

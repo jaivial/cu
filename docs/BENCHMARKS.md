@@ -5,6 +5,84 @@ What an agent pays per action, before and after the speed work on
 real Chromium, so the numbers include HTTP parsing, the CDP bridge and the
 process hand-off -- the whole thing an agent waits for.
 
+## The second speed pass
+
+Every tool was measured again, before and after, with the two binaries run
+alternately so machine load falls on both alike
+(`bench/cu_speed.py --compare OLD,NEW`). The harness drives the daemon's
+HTTP API *and* the CLI (one process per action, the way an agent calls it).
+
+| tool | before | after | change |
+| --- | ---: | ---: | ---: |
+| `shot(jpeg)` | 49.6 ms | 12.6 ms | **3.9x** |
+| `shot(png)` | 49.6 ms | 16.0 ms | **3.1x** |
+| `act(click)` | 2.54 ms | 1.53 ms | 1.7x |
+| `click` | 1.68 ms | 1.07 ms | 1.6x |
+| `text` | 1.12 ms | 0.75 ms | 1.5x |
+| `snapshot` | 1.27 ms | 0.86 ms | 1.5x |
+| `navigate` | 14.3 ms | 14.3 ms | 1.0x |
+
+Medians of 20 alternating rounds, Chrome for Testing's headless shell 153 on
+a 16-core Linux box. The same run, measured inside the daemon, where the
+client's own cost is not counted: a click costs 1.2 ms before and 0.41 ms
+after (**2.9x**), a snapshot 0.9 ms before and 0.5 ms after.
+
+What the pass did, and why each number moved:
+
+- **A capture no longer measures the page first.** A screenshot of the whole
+  viewport has no clip to work out, so the measure step -- two animation
+  frames in the page -- was pure cost. The capture also waits for the frame
+  it photographs, so the frame the measure waited for was the frame the
+  capture then had to wait *after* for.
+- **`--disable-frame-rate-limit`.** Chromium otherwise waits for the
+  compositor's next vsync before it hands a frame to a screenshot, and a
+  capture then costs two frame intervals (~33 ms) instead of the few
+  milliseconds the raster takes. The browser still only paints when
+  something changed. The price is a page that *animates*: it is then
+  rendered as fast as the CPU allows (2.4 cores on a host without a GPU,
+  headless; a windowed browser keeps the display's rate either way).
+  `CU_FAST_CAPTURE=0` keeps the limit.
+- **The helpers are installed once per document.** The ref registry and the
+  page walk are eleven kilobytes of JavaScript that the browser compiles
+  every time it is sent. They are installed in the document's isolated world
+  once, and the walk is left in `window.__cuSnapshot` for the next snapshot
+  to call. The world itself (its execution context) is remembered too, so it
+  is made once per document instead of once per action.
+- **The frame list is remembered.** The snapshot reads the frame tree from
+  the browser anyway; the actions that follow use the same answer, and the
+  answer is dropped when the page navigates.
+- **Commands travel together.** A click's press, release and barrier go out
+  as one batch and cost one round trip instead of three; a snapshot's frame
+  tree and its walk likewise. The page's `Page` events are armed without
+  waiting for the browser's answer, and what is left over is drained before
+  the next batch.
+- **The navigation stops waiting for the network stack.** After a navigation
+  cu drained the queued events with `Network.disable`, which the browser
+  answers only after the navigation committed *and* the network went quiet.
+  The frame tree answers the same question (the new document has committed)
+  and comes back as soon as it has.
+
+Two things did not move, and both are the browser's own work:
+
+- **`navigate` is browser-bound.** Of the 14 ms, the browser's share is
+  ~11 ms: it accepts the URL in ~3 ms, commits the new document in ~3 ms
+  and renders it in ~3 ms. cu's own share is now ~3 ms, and it was ~3 ms
+  before. Making the tool itself twice as fast would mean answering before
+  the page is usable, which is the bug the settle wait was written to fix.
+- **A CLI call has a floor of ~0.6 ms** (process start, the config file, the
+  loopback round trip) before the daemon does anything, which is why the
+  same snapshot is 1.5x faster over the API and 1.2x faster from the shell.
+
+### The harness had a 40 ms bug
+
+The benchmark's own page server wrote its head and its body in pieces, and
+Python's sockets have Nagle on: every navigation waited for the peer's
+delayed ACK, 40 ms of it. That was in the measurement, not in cu -- and it
+was in *every* column of the numbers above, before and after. The harness
+now writes the reply in one piece with Nagle off
+(`disable_nagle_algorithm = True`), and the navigations dropped from ~51 ms
+to ~14 ms in both binaries.
+
 ## Method
 
 ```sh

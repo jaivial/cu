@@ -486,6 +486,109 @@ fn the_default_screenshot_is_a_fast_jpeg() {
 }
 
 #[test]
+fn a_plain_capture_does_not_measure_the_page_first() {
+    // A capture of the whole viewport has nothing to measure: the old way
+    // ran a script in the page and waited for two animation frames, which
+    // cost more than the capture itself.
+    let server = TestServer::start("shot-plain", true);
+    let before = command_log(&server).len();
+    let response = server.get("/v1/screenshot");
+    assert_eq!(status_code(&response), "200");
+    let sent = command_log(&server);
+    let sent = &sent[before..];
+    assert!(
+        sent.contains(&"Page.captureScreenshot".to_string()),
+        "no capture in {sent:?}"
+    );
+    assert!(
+        !sent.contains(&"Runtime.evaluate".to_string()),
+        "the page was measured first: {sent:?}"
+    );
+}
+
+#[test]
+fn a_capture_of_one_element_still_measures_the_page() {
+    // A clip needs the element's box, so the page is measured -- but the
+    // helpers it needs are installed once per document, not once per
+    // capture.
+    let server = TestServer::start("shot-clip", true);
+    let response = server.get("/v1/screenshot?selector=h1");
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let sent = command_log(&server);
+    assert!(
+        sent.contains(&"Runtime.evaluate".to_string()),
+        "the element was not measured: {sent:?}"
+    );
+}
+
+#[test]
+fn the_snapshot_installs_its_helpers_once_per_document() {
+    // The walk and the ref registry are ten kilobytes of JavaScript the
+    // browser compiles every time it is sent. The second snapshot of the
+    // same document calls the walk that is already there.
+    let server = TestServer::start("snapshot-install", true);
+    server.post("/v1/navigate", r#"{"url":"https://example.test/"}"#);
+    let before = command_log(&server).len();
+    let response = server.get("/v1/snapshot");
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let first = command_log(&server);
+    let first = &first[before..];
+    let installs = first
+        .iter()
+        .filter(|method| *method == "Runtime.evaluate")
+        .count();
+    assert_eq!(installs, 1, "the first snapshot: {first:?}");
+
+    let before = command_log(&server).len();
+    let response = server.get("/v1/snapshot");
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let second = command_log(&server);
+    let second = &second[before..];
+    assert_eq!(
+        second.iter().filter(|m| *m == "Runtime.evaluate").count(),
+        1,
+        "the second snapshot: {second:?}"
+    );
+    // The world of the document is made once, not once per snapshot.
+    assert_eq!(
+        second
+            .iter()
+            .filter(|m| *m == "Page.createIsolatedWorld")
+            .count(),
+        0,
+        "the world was made again: {second:?}"
+    );
+}
+
+#[test]
+fn a_navigation_makes_the_world_again() {
+    // A navigation replaces the document, and with it the world the helpers
+    // ran in. The next snapshot has to notice and make a new one.
+    let server = TestServer::start("world-after-nav", true);
+    server.post("/v1/navigate", r#"{"url":"https://example.test/"}"#);
+    let response = server.get("/v1/snapshot");
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+
+    let before = command_log(&server).len();
+    let response = server.post("/v1/navigate", r#"{"url":"https://example.test/other"}"#);
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let after_navigation = command_log(&server);
+    let after_navigation = &after_navigation[before..];
+    assert!(
+        after_navigation
+            .iter()
+            .any(|m| m == "Page.createIsolatedWorld"),
+        "no new world after the navigation: {after_navigation:?}"
+    );
+
+    // And the snapshot after it still reads the page.
+    let response = server.get("/v1/snapshot");
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&response);
+    assert!(body.contains("ref=e1"), "no refs in {body}");
+}
+
+#[test]
 fn a_request_without_a_token_is_unauthorized() {
     let server = TestServer::start("auth", false);
     let response = server
@@ -799,6 +902,20 @@ fn stopping_the_daemon_closes_its_browser() {
 /// Input commands the fake browser received, in order.
 fn input_log(server: &TestServer) -> String {
     server::http_get(&format!("127.0.0.1:{}", server.cdp_port), "/input-log").expect("input log")
+}
+
+/// Every DevTools command the daemon sent, in order: how many round trips a
+/// tool took.
+fn command_log(server: &TestServer) -> Vec<String> {
+    let body = server::http_get(&format!("127.0.0.1:{}", server.cdp_port), "/command-log")
+        .expect("command log");
+    // A JSON array of plain method names: the quoted members are the
+    // commands.
+    body.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(|name| name.to_string())
+        .collect()
 }
 
 /// Every `Browser.setDownloadBehavior` the daemon sent, as the fake browser saw

@@ -381,7 +381,10 @@ fn push_frames(
             let now = Instant::now();
             while acks.front().is_some_and(|(due, _)| *due <= now) {
                 if let Some((_, session)) = acks.pop_front() {
-                    cdp.send("Page.screencastFrameAck", &format!("{{\"sessionId\":{session}}}"));
+                    let _unused = cdp.send(
+                        "Page.screencastFrameAck",
+                        &format!("{{\"sessionId\":{session}}}"),
+                    );
                 }
             }
             let idle = acks

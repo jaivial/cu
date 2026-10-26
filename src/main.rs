@@ -488,13 +488,50 @@ fn request_config_x(
         None => String::new(),
     };
     write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\n\r\n{body}", body.len()).map_err(|e| e.to_string())?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|e| e.to_string())?;
-    let ok = response.starts_with("HTTP/1.1 2");
-    let reply = response.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
-    if ok { Ok(reply) } else { Err(reply) }
+    let reply = read_reply(&mut stream)?;
+    let ok = reply.starts_with("HTTP/1.1 2");
+    let body = reply.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    if ok { Ok(body) } else { Err(body) }
+}
+
+/// Read one HTTP reply: the head, then as many bytes as the head says.
+///
+/// The daemon frames its replies with a `Content-Length`, so the body is
+/// read as it is. Reading to the end of the connection instead waited for
+/// the close the daemon sends after the reply -- a round trip of its own on
+/// every action.
+fn read_reply(stream: &mut TcpStream) -> Result<String, String> {
+    let mut response = Vec::new();
+    // A screenshot's reply is a few hundred kilobytes: read them in one go.
+    let mut chunk = [0u8; 64 * 1024];
+    let head_end = loop {
+        if let Some(end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+            break end + 4;
+        }
+        let read = stream.read(&mut chunk).map_err(|e| e.to_string())?;
+        if read == 0 {
+            return Ok(String::from_utf8_lossy(&response).into_owned());
+        }
+        response.extend_from_slice(&chunk[..read]);
+    };
+    let head = String::from_utf8_lossy(&response[..head_end]).into_owned();
+    let length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    while response.len() < head_end + length {
+        let read = stream.read(&mut chunk).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..read]);
+    }
+    Ok(String::from_utf8_lossy(&response).into_owned())
 }
 
 /// The canonical daemon's data directory.

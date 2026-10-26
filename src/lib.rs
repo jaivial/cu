@@ -9,6 +9,7 @@ pub mod input;
 pub mod live;
 pub mod live_stream;
 pub mod otp;
+pub mod pagecache;
 pub mod policy;
 pub mod qr;
 pub mod scheduler;
