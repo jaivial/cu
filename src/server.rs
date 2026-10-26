@@ -4515,7 +4515,16 @@ impl CdpConnection {
             let available = match peeked {
                 Ok(0) => return false, // the browser closed the connection
                 Ok(available) => available,
-                Err(_) => return true, // nothing is waiting
+                // Nothing is waiting: the socket had nothing to give.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return true;
+                }
+                // The connection is broken (the browser went away): it cannot
+                // carry a command any more.
+                Err(_) => return false,
             };
             if available < 2 {
                 return true; // a header still on its way
