@@ -713,6 +713,7 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
         return;
     }
     let mut set_cookie: Option<String> = None;
+    let mut tab_used: Option<(String, bool)> = None;
     let route_span = crate::server::trace_start();
     let (status, content_type, response) = if !host_ok {
         (
@@ -760,6 +761,8 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
             body,
             &state,
             header_value(head, "x-cu-otp-collect-token"),
+            session_of(head),
+            &mut tab_used,
         )
     };
     crate::server::trace("http.route.total", route_span);
@@ -769,6 +772,13 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
     );
     if let Some(cookie) = set_cookie {
         head.push_str(&format!("Set-Cookie: {cookie}\r\n"));
+    }
+    // The tab the request was served on, for the CLI to name it.
+    if let Some((tab, is_new)) = &tab_used {
+        head.push_str(&format!("X-Cu-Tab: {tab}\r\n"));
+        if *is_new {
+            head.push_str("X-Cu-Tab-New: 1\r\n");
+        }
     }
     // Only the read-only viewer page may be framed, and only by the one origin
     // named in CU_LIVE_FRAME_ORIGIN (an exact `https://host`); without it
@@ -787,6 +797,19 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
     head.push_str("\r\n");
     let _ = write!(stream, "{head}{response}");
     crate::server::trace("http.handle.total", span);
+}
+
+/// The session a request belongs to: the process it works in, and whether it
+/// asked for a tab of its own.
+///
+/// The CLI names its session in a header, and the daemon resolves the tab
+/// that session works in, in the same request.
+fn session_of(head: &str) -> Option<(u32, bool)> {
+    let pid = header_value(head, "x-cu-session")?.trim().parse::<u32>().ok()?;
+    let fresh = header_value(head, "x-cu-session-fresh")
+        .map(|v| !v.trim().eq_ignore_ascii_case("0") && !v.trim().is_empty())
+        .unwrap_or(false);
+    Some((pid, fresh))
 }
 
 /// Whether a request's `Host` header is one this daemon answers.
@@ -895,7 +918,8 @@ pub fn route(
     body: &str,
     state: &AppState,
 ) -> (&'static str, &'static str, String) {
-    route_with(method, full_path, body, state, None)
+    let mut tab_used = None;
+    route_with(method, full_path, body, state, None, None, &mut tab_used)
 }
 
 /// `route` plus the OTP collect token header, threaded to the vault API.
@@ -905,6 +929,8 @@ fn route_with(
     body: &str,
     state: &AppState,
     collect_token: Option<&str>,
+    session: Option<(u32, bool)>,
+    tab_used: &mut Option<(String, bool)>,
 ) -> (&'static str, &'static str, String) {
     // A query string selects options (`?format=png`), never a different
     // resource, so the match below is on the path alone.
@@ -982,6 +1008,27 @@ fn route_with(
                 Err(e) => {
                     return (
                         "400 Bad Request",
+                        "application/json",
+                        format!("{{\"error\":{}}}", json_string(&e)),
+                    );
+                }
+            }
+        } else if let Some((pid, fresh)) = session {
+            // The tab of the session that sent the request: the one it had,
+            // or a new one. The CLI names its session in a header, so the page
+            // it works in is resolved here, in the same request -- a round
+            // trip of its own cost about as much as the action.
+            match session_tab(state, Some(pid), fresh, "about:blank") {
+                Ok((id, reused)) => {
+                    *tab_used = Some((id.clone(), !reused));
+                    Tab {
+                        cdp_port: state.cdp_port,
+                        target: Some(id),
+                    }
+                }
+                Err(e) => {
+                    return (
+                        "502 Bad Gateway",
                         "application/json",
                         format!("{{\"error\":{}}}", json_string(&e)),
                     );
@@ -1118,49 +1165,16 @@ fn route_with(
             // The string-only JSON reader cannot see a bare boolean, which is
             // what `--new-tab` sends (`"fresh":true`).
             let fresh = body.contains("\"fresh\":true") || body.contains("\"fresh\": true");
-            if !fresh
-                && let Some(pid) = owner
-                && let Some(id) = leased_tab_of(state.cdp_port, pid)
-            {
-                touch_tab_lease(&id);
-                return (
+            match session_tab(state, owner, fresh, &url) {
+                Ok((id, reused)) => (
                     "200 OK",
                     "application/json",
                     format!(
-                        "{{\"id\":{},\"tab\":{},\"reused\":true}}",
+                        "{{\"id\":{},\"tab\":{},\"reused\":{reused}}}",
                         json_string(&id),
                         json_string(&id)
                     ),
-                );
-            }
-            match browser_command(
-                state.cdp_port,
-                "Target.createTarget",
-                &format!("{{\"url\":{},\"background\":true}}", json_string(&url)),
-            ) {
-                Ok(reply) => {
-                    let id = json_string_value(&reply, "targetId").unwrap_or_default();
-                    if !id.is_empty() {
-                        if let Some(pid) = owner {
-                            register_tab_lease(&id, pid);
-                        }
-                        (
-                            "200 OK",
-                            "application/json",
-                            format!(
-                                "{{\"id\":{},\"tab\":{},\"reused\":false}}",
-                                json_string(&id),
-                                json_string(&id)
-                            ),
-                        )
-                    } else {
-                        (
-                            "502 Bad Gateway",
-                            "application/json",
-                            format!("{{\"error\":{}}}", json_string(&reply)),
-                        )
-                    }
-                }
+                ),
                 Err(e) => (
                     "502 Bad Gateway",
                     "application/json",
@@ -6243,6 +6257,39 @@ fn register_tab_lease(id: &str, owner_pid: u32) {
                 used: Instant::now(),
             },
         );
+}
+
+/// The tab a session works in: the one it had, or a new one.
+///
+/// `fresh` asks for a new one (the `--new-tab` flag). The owner is the
+/// process the tab belongs to: a session's tab is collected when that
+/// process is gone.
+fn session_tab(
+    state: &AppState,
+    owner: Option<u32>,
+    fresh: bool,
+    url: &str,
+) -> Result<(String, bool), String> {
+    if !fresh
+        && let Some(pid) = owner
+        && let Some(id) = leased_tab_of(state.cdp_port, pid)
+    {
+        touch_tab_lease(&id);
+        return Ok((id, true));
+    }
+    let reply = browser_command(
+        state.cdp_port,
+        "Target.createTarget",
+        &format!("{{\"url\":{},\"background\":true}}", json_string(url)),
+    )?;
+    let id = json_string_value(&reply, "targetId").unwrap_or_default();
+    if id.is_empty() {
+        return Err(json_string_value(&reply, "error").unwrap_or(reply));
+    }
+    if let Some(pid) = owner {
+        register_tab_lease(&id, pid);
+    }
+    Ok((id, false))
 }
 
 /// The live tab a session already works in, if any: the most recently used

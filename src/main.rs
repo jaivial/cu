@@ -47,12 +47,13 @@ fn main() {
         Some(id) if path.contains('?') => format!("{path}&tab={id}"),
         Some(id) => format!("{path}?tab={id}"),
     };
+    set_new_tab(new_tab);
     let result = match args.first().map(String::as_str) {
         Some("start") => start(&args[1..]),
         Some("status") => request("GET", "/v1/status", None).map(|s| println!("{s}")),
         Some("challenge") => match args.get(1).map(String::as_str) {
-            None => request("GET", &on_tab("/v1/challenge"), None).map(|s| println!("{s}")),
-            Some("release") => request("POST", &on_tab("/v1/challenge/release"), Some("{}"))
+            None => page_request("GET", &on_tab("/v1/challenge"), None).map(|s| println!("{s}")),
+            Some("release") => page_request("POST", &on_tab("/v1/challenge/release"), Some("{}"))
                 .map(|s| println!("{s}")),
             // `cu challenge wait --timeout S`: park until the person has
             // finished, instead of polling `cu challenge` in a loop.
@@ -64,7 +65,7 @@ fn main() {
         // `cu handoff`: the hand-off state -- is a person needed, on which
         // tab, for how long -- and the passes already recorded.
         Some("handoff") => match args.get(1).map(String::as_str) {
-            None => request("GET", &on_tab("/v1/handoff"), None).map(|s| println!("{s}")),
+            None => page_request("GET", &on_tab("/v1/handoff"), None).map(|s| println!("{s}")),
             Some("wait") => wait_for_handoff(&args[2..], &on_tab),
             Some(other) => Err(format!(
                 "unknown handoff command {other}; usage: cu handoff [wait]"
@@ -101,7 +102,7 @@ fn main() {
             request("GET", &on_tab(&format!("/v1/screenshot?{query}")), None)
                 .and_then(|s| write_screenshot(&s, file.as_deref()))
         }),
-        Some("snapshot") => request("GET", &on_tab("/v1/snapshot"), None).map(|s| println!("{s}")),
+        Some("snapshot") => page_request("GET", &on_tab("/v1/snapshot"), None).map(|s| println!("{s}")),
         // `cu inspect REF` / `cu inspect --selector CSS`: how to find an
         // element again and which component and source file render it.
         Some("inspect") => target_query(&args[1..], "usage: cu inspect REF | --selector CSS")
@@ -111,12 +112,12 @@ fn main() {
         // an element, collected by `cu marks`.
         Some("mark") => mark(&args[1..], &on_tab),
         Some("marks") => match args.get(1).map(String::as_str) {
-            None => request("GET", &on_tab("/v1/marks"), None).map(|s| println!("{s}")),
+            None => page_request("GET", &on_tab("/v1/marks"), None).map(|s| println!("{s}")),
             Some("--md") => {
-                request("GET", &on_tab("/v1/marks?format=md"), None).map(|s| print!("{s}"))
+                page_request("GET", &on_tab("/v1/marks?format=md"), None).map(|s| print!("{s}"))
             }
             Some("clear") => {
-                request("DELETE", &on_tab("/v1/marks"), Some("{}")).map(|s| println!("{s}"))
+                page_request("DELETE", &on_tab("/v1/marks"), Some("{}")).map(|s| println!("{s}"))
             }
             Some(other) => Err(format!(
                 "unknown marks command {other}; usage: cu marks [--md | clear]"
@@ -124,7 +125,7 @@ fn main() {
         },
         // `cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]`
         Some("console") => console_cmd(&args[1..], &on_tab),
-        Some("text") => request("GET", &on_tab("/v1/text"), None).map(|s| println!("{s}")),
+        Some("text") => page_request("GET", &on_tab("/v1/text"), None).map(|s| println!("{s}")),
         Some("downloads") => request("GET", "/v1/downloads", None).map(|s| println!("{s}")),
         Some("tabs") => match args.get(1).map(String::as_str) {
             None => request("GET", "/v1/tabs", None).map(|s| println!("{s}")),
@@ -205,7 +206,7 @@ fn main() {
                 }
             };
             actions.and_then(|actions| {
-                request(
+                page_request(
                     "POST",
                     &on_tab("/v1/act"),
                     Some(&format!("{{\"actions\":{}}}", actions.trim())),
@@ -428,10 +429,30 @@ fn request_x(
     body: Option<&str>,
     header: Option<(&str, &str)>,
 ) -> Result<String, String> {
+    request_x_lines(
+        method,
+        path,
+        body,
+        header
+            .map(|(name, value)| (name, value.to_string()))
+            .into_iter()
+            .collect(),
+    )
+    .map(|(_, body)| body)
+}
+
+/// `request_x` with a list of header lines, answering with the reply's head
+/// as well as its body (the daemon names the tab it used there).
+fn request_x_lines(
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    headers: Vec<(&str, String)>,
+) -> Result<(String, String), String> {
     if let Some(data) = env::var_os("CU_DATA_DIR") {
         let config = fs::read_to_string(PathBuf::from(&data).join("server.json"))
             .map_err(|_| "server not running (start it with `cu start`)")?;
-        return request_config_x(&config, method, path, body, header);
+        return request_config_x(&config, method, path, body, &headers);
     }
     let daemon_config = daemon_dir().join("server.json");
     let legacy_config = PathBuf::from(".cu").join("server.json");
@@ -440,7 +461,7 @@ fn request_x(
             && let Some((port, _)) = endpoint(&config)
             && TcpStream::connect(("127.0.0.1", port)).is_ok()
         {
-            return request_config_x(&config, method, path, body, header);
+            return request_config_x(&config, method, path, body, &headers);
         }
     }
     ensure_daemon()?;
@@ -450,7 +471,7 @@ fn request_x(
     for _ in 0..2 {
         let config = fs::read_to_string(&daemon_config)
             .map_err(|_| "the daemon did not come up (see ~/.cu/daemon/daemon.log)")?;
-        match request_config_x(&config, method, path, body, header) {
+        match request_config_x(&config, method, path, body, &headers) {
             Ok(reply) => return Ok(reply),
             Err(_) => thread::sleep(Duration::from_millis(300)),
         }
@@ -473,8 +494,8 @@ fn request_config_x(
     method: &str,
     path: &str,
     body: Option<&str>,
-    header: Option<(&str, &str)>,
-) -> Result<String, String> {
+    headers: &[(&str, String)],
+) -> Result<(String, String), String> {
     let port = server::json_value(config, "port").ok_or("invalid server state")?;
     let token = server::json_value(config, "token").ok_or("invalid server state")?;
     let mut stream = TcpStream::connect((
@@ -483,15 +504,14 @@ fn request_config_x(
     ))
     .map_err(|e| e.to_string())?;
     let body = body.unwrap_or("");
-    let extra = match header {
-        Some((name, value)) => format!("{name}: {value}\r\n"),
-        None => String::new(),
-    };
+    let mut extra = String::new();
+    for (name, value) in headers {
+        extra.push_str(&format!("{name}: {value}\r\n"));
+    }
     write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\n\r\n{body}", body.len()).map_err(|e| e.to_string())?;
-    let reply = read_reply(&mut stream)?;
-    let ok = reply.starts_with("HTTP/1.1 2");
-    let body = reply.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
-    if ok { Ok(body) } else { Err(body) }
+    let (head, body) = read_reply_head(&mut stream)?;
+    let ok = head.starts_with("HTTP/1.1 2");
+    if ok { Ok((head, body)) } else { Err(body) }
 }
 
 /// Read one HTTP reply: the head, then as many bytes as the head says.
@@ -500,7 +520,8 @@ fn request_config_x(
 /// read as it is. Reading to the end of the connection instead waited for
 /// the close the daemon sends after the reply -- a round trip of its own on
 /// every action.
-fn read_reply(stream: &mut TcpStream) -> Result<String, String> {
+/// Read one HTTP reply: the head and the body.
+fn read_reply_head(stream: &mut TcpStream) -> Result<(String, String), String> {
     let mut response = Vec::new();
     // A screenshot's reply is a few hundred kilobytes: read them in one go.
     let mut chunk = [0u8; 64 * 1024];
@@ -510,7 +531,9 @@ fn read_reply(stream: &mut TcpStream) -> Result<String, String> {
         }
         let read = stream.read(&mut chunk).map_err(|e| e.to_string())?;
         if read == 0 {
-            return Ok(String::from_utf8_lossy(&response).into_owned());
+            let whole = String::from_utf8_lossy(&response).into_owned();
+            let body = whole.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            return Ok((whole, body));
         }
         response.extend_from_slice(&chunk[..read]);
     };
@@ -531,7 +554,19 @@ fn read_reply(stream: &mut TcpStream) -> Result<String, String> {
         }
         response.extend_from_slice(&chunk[..read]);
     }
-    Ok(String::from_utf8_lossy(&response).into_owned())
+    let whole = String::from_utf8_lossy(&response).into_owned();
+    let body = whole.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    Ok((head, body))
+}
+
+/// A header of a reply, by name.
+fn head_value(head: &str, name: &str) -> Option<String> {
+    head.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_string())
+    })
 }
 
 /// The canonical daemon's data directory.
@@ -564,42 +599,64 @@ fn daemon_config() -> Option<(u16, String)> {
 /// `cu snapshot` an agent runs after it are two invocations of one session, so
 /// the second reads the page the first opened; two sessions are two processes
 /// and never share a page.
-fn invocation_tab(path: &str, new_tab: bool) -> String {
-    let Some((port, token)) = daemon_config() else {
-        return path.to_string();
+fn invocation_tab(path: &str, _new_tab: bool) -> String {
+    // The daemon resolves this session's tab, in the same request: asking for
+    // it in a round trip of its own (and having the daemon check it is still
+    // open in another) cost about as much as the action itself.
+    path.to_string()
+}
+
+/// The header lines that tell the daemon which session this is.
+///
+/// The daemon answers with the tab it used (`X-Cu-Tab`), so the CLI can say
+/// which page the session is in without asking for it.
+fn session_headers(new_tab: bool) -> Vec<(&'static str, String)> {
+    if daemon_config().is_none() {
+        // The legacy per-instance mode has no session tabs: the daemon's
+        // default page is the page.
+        return Vec::new();
+    }
+    let owner = session_pid().to_string();
+    let mut headers = vec![("X-Cu-Session", owner)];
+    if new_tab {
+        headers.push(("X-Cu-Session-Fresh", "1".to_string()));
+    }
+    headers
+}
+
+/// A page command: the daemon resolves this session's tab, in the same
+/// request.
+fn page_request(method: &str, path: &str, body: Option<&str>) -> Result<String, String> {
+    let headers = if path.contains("?tab=") {
+        Vec::new()
+    } else {
+        session_headers(new_tab())
     };
-    let owner = session_pid();
-    let body = format!("{{\"owner_pid\":{owner},\"fresh\":{new_tab}}}");
-    match request_daemon(port, &token, "POST", "/v1/tabs", Some(&body)) {
-        Ok(reply) => {
-            if let Some(id) = server::json_value(&reply, "id") {
-                // A bare boolean, which `json_value` (string-only) cannot read.
-                if reply.contains("\"reused\":true") {
-                    eprintln!(
-                        "cu: working in tab ({id}), the page this session already had; it is collected when the session exits"
-                    );
-                } else {
-                    eprintln!(
-                        "cu: working in a fresh tab ({id}); it is collected when this session exits"
-                    );
-                }
-                return if path.contains('?') {
-                    format!("{path}&tab={id}")
-                } else {
-                    format!("{path}?tab={id}")
-                };
-            }
-            eprintln!("cu: the daemon answered without a tab id; working in its default page");
-            path.to_string()
-        }
-        Err(e) => {
-            // Never silent: a page command that could not get a tab of its own
-            // would run in whatever page the daemon shows, which is how an
-            // agent ends up reading another agent's tab.
-            eprintln!("cu: could not open this session's tab ({e}); working in the default page");
-            path.to_string()
+    let (head, body) = request_x_lines(method, path, body, headers)?;
+    if let Some(tab) = head_value(&head, "X-Cu-Tab") {
+        if head_value(&head, "X-Cu-Tab-New").is_some() {
+            eprintln!(
+                "cu: working in a fresh tab ({tab}); it is collected when the session exits"
+            );
+        } else {
+            eprintln!(
+                "cu: working in tab ({tab}), the page this session already had; it is collected when the session exits"
+            );
         }
     }
+    Ok(body)
+}
+
+/// Whether this invocation asked for a tab of its own (`--new-tab`).
+static NEW_TAB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn new_tab() -> bool {
+    NEW_TAB.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Remember whether this invocation asked for a tab of its own.
+fn set_new_tab(fresh: bool) {
+    NEW_TAB.store(fresh, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The process this CLI call belongs to: the nearest ancestor that is not a
@@ -653,25 +710,6 @@ fn is_transient_shell(pid: u32) -> bool {
 /// Shells and one-shot wrappers an agent (or a person) runs a command through.
 const SHELLS: [&str; 8] = ["sh", "bash", "dash", "zsh", "ash", "ksh", "fish", "busybox"];
 const WRAPPERS: [&str; 6] = ["timeout", "env", "nohup", "setsid", "nice", "stdbuf"];
-
-fn request_daemon(
-    port: u16,
-    token: &str,
-    method: &str,
-    path: &str,
-    body: Option<&str>,
-) -> Result<String, String> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
-    let body = body.unwrap_or("");
-    write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).map_err(|e| e.to_string())?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|e| e.to_string())?;
-    let ok = response.starts_with("HTTP/1.1 2");
-    let reply = response.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
-    if ok { Ok(reply) } else { Err(reply) }
-}
 
 /// Spawn the daemon detached (own process group, output into its data
 /// directory) and wait for it to answer. `cu daemon` itself runs under
