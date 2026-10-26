@@ -85,7 +85,7 @@ fn main() {
                 None => true,
             };
             match args.get(1) {
-                Some(url) => request(
+                Some(url) => page_request(
                     "POST",
                     &on_tab("/v1/navigate"),
                     Some(&format!(
@@ -99,14 +99,14 @@ fn main() {
             }
         }
         Some("shot" | "screenshot") => shot_query(&args[1..]).and_then(|(query, file)| {
-            request("GET", &on_tab(&format!("/v1/screenshot?{query}")), None)
+            page_request("GET", &on_tab(&format!("/v1/screenshot?{query}")), None)
                 .and_then(|s| write_screenshot(&s, file.as_deref()))
         }),
         Some("snapshot") => page_request("GET", &on_tab("/v1/snapshot"), None).map(|s| println!("{s}")),
         // `cu inspect REF` / `cu inspect --selector CSS`: how to find an
         // element again and which component and source file render it.
         Some("inspect") => target_query(&args[1..], "usage: cu inspect REF | --selector CSS")
-            .and_then(|(query, _)| request("GET", &on_tab(&format!("/v1/inspect?{query}")), None))
+            .and_then(|(query, _)| page_request("GET", &on_tab(&format!("/v1/inspect?{query}")), None))
             .map(|s| println!("{s}")),
         // `cu mark REF "what is wrong" [--severity S]`: a QA note pinned to
         // an element, collected by `cu marks`.
@@ -139,7 +139,7 @@ fn main() {
             )),
         },
         Some("click") => match args.get(1) {
-            Some(r) => request(
+            Some(r) => page_request(
                 "POST",
                 &on_tab("/v1/click"),
                 Some(&format!("{{\"ref\":{}}}", server::json_string(r))),
@@ -148,7 +148,7 @@ fn main() {
             None => Err("usage: cu click REF".into()),
         },
         Some("type") => match (args.get(1), args.get(2)) {
-            (Some(r), Some(text)) => request(
+            (Some(r), Some(text)) => page_request(
                 "POST",
                 &on_tab("/v1/type"),
                 Some(&format!(
@@ -184,7 +184,7 @@ fn main() {
                     let reference = reference
                         .map(|r| format!("\"ref\":{},", server::json_string(&r)))
                         .unwrap_or_default();
-                    request(
+                    page_request(
                         "POST",
                         &on_tab("/v1/upload"),
                         Some(&format!("{{{reference}\"files\":[{}]}}", files.join(","))),
