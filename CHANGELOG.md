@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.5.2] - 2026-10-29
+
+### Changed
+
+- **Agents may type credentials.** `cu mcp` told the model never to type a
+  password or a one-time code and to send `login_url` instead, which blocked
+  every login with a test account or a secret the person had handed over. The
+  MCP instructions and the `type` / `login_url` descriptions now say `type`
+  and `act` fill those fields like any other text, and `login_url` is for when
+  the person should type their own. The skill, README and agent notes say the
+  same.
+
+### Fixed
+
+- **The snapshot never names a field by a typed secret.** An input with no
+  label, placeholder or text was named by its value, so an unlabelled password
+  field came back in the snapshot with the password in it. Password and
+  `one-time-code` fields are no longer named by their value.
+
 ## [1.5.1] - 2026-10-26
 
 ### Fixed

@@ -13,9 +13,12 @@
 //! closed when it ends (the daemon's collector is the backstop when the
 //! process is killed instead).
 //!
-//! Credentials never pass through here: no tool takes or returns a password,
-//! a vault secret or a one-time code. `login_url` hands the person the local
-//! form instead, exactly like `cu login`.
+//! Credentials: `type` and `act` fill a password or a one-time code like any
+//! other text when the agent has one to enter (a test account, a secret the
+//! person handed over). Nothing echoes it back: no tool returns a field's value
+//! (the snapshot never names a password field by its value) and this process
+//! logs no arguments. When the person would rather type their own, `login_url`
+//! hands them the local form, exactly like `cu login`.
 
 use std::fs;
 use std::io::{BufRead, Write};
@@ -43,7 +46,7 @@ const INSTRUCTIONS: &str = "cu drives one persistent local Chrome: navigate, rea
 - Read with `snapshot` (one line per element, interactive ones carry a ref such as e3) or `text` when the answer is words. Use `screenshot` only when pixels matter.
 - Act by ref with `click` and `type`, or `act` for several steps in one call; `act` answers the resulting snapshot (`click` and `type` do with `snapshot: true`). A stale ref means: take a new snapshot.
 - Popups and extra tabs: `tabs` lists them, any page tool takes `tab`, `close_tab` dismisses one. `context` gives an isolated cookie jar.
-- Credentials: never ask for, type or pass a password or a one-time code. Call `login_url` and send the person that link; the daemon types what they enter.
+- Credentials: `type` (or `act`) fills a password or a one-time code like any other field when you have one to enter. cu never echoes it back; do not repeat it in your answer either. When the person should type their own, call `login_url` and send them that link; the daemon types what they enter.
 - A human-verification page pauses actions on its tab: `handoff` shows the state, `handoff` with `wait` parks until the person is done.";
 
 /// One daemon request a tool call turns into.
@@ -299,7 +302,7 @@ impl Server {
     fn run(&self, name: &str, args: &Args, call: Option<&Call>) -> Result<Vec<Content>, String> {
         let Some(call) = call else {
             return Ok(vec![Content::Text(format!(
-                "Send the person this link to sign in: {}\nThey type their credentials into that local form and the daemon enters them into the browser. Navigate to the site's sign-in page first. Never ask for a password or a one-time code in chat and never pass one to a tool.",
+                "Send the person this link to sign in: {}\nThey type their credentials into that local form and the daemon enters them into the browser. Navigate to the site's sign-in page first. (When you already have the credentials, `type` fills them directly.)",
                 self.host.login_url()
             ))]);
         };
@@ -528,7 +531,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "type",
         title: "Type",
-        description: "Replace the value of the field with this snapshot ref with `text`; `submit` presses Enter afterwards. Answers like `click`. Never type a password or a one-time code: use `login_url`.",
+        description: "Replace the value of the field with this snapshot ref with `text`; `submit` presses Enter afterwards. Answers like `click`. Fills password and one-time-code fields too; the value is never echoed back.",
         properties: r#""ref":{"type":"string","description":"Snapshot ref of the field, e.g. e2."},"text":{"type":"string","description":"What to type."},"submit":{"type":"boolean","description":"Press Enter after typing (default false)."},"snapshot":{"type":"boolean","description":"Also answer the resulting snapshot (default false)."}"#,
         required: &["ref", "text"],
         target: Target::Page,
@@ -708,7 +711,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "login_url",
         title: "Login form link",
-        description: "The link to the local login form, for the person to sign in: they type their credentials there and the daemon enters them into the browser. The only way credentials reach a page; never ask for them in chat.",
+        description: "The link to the local login form, for the person to sign in: they type their credentials there and the daemon enters them into the browser. For when the person enters their own; with credentials in hand, `type` fills the field directly.",
         properties: "",
         required: &[],
         target: Target::None,
