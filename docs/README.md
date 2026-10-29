@@ -497,10 +497,12 @@ correct it. Tool annotations mark the reads (`snapshot`, `text`, `tabs`, ...)
 read-only and the page actions destructive and open-world, which is what
 permission gates in the clients go by.
 
-Credentials stay out of the protocol: no tool takes or returns a password, a
-vault secret or a one-time code. The vault and `cu otp` stay on the CLI and
-the vault UI, and `login_url` hands the person the local form, as
-`cu login` does.
+Credentials: `type` and `act` fill a password or a one-time code like any
+other text when the agent has one to enter; no tool returns a field's value
+and the snapshot never names a password or one-time-code field by it. The
+vault and `cu otp` stay on the CLI and the vault UI, and `login_url` hands
+the person the local form, as `cu login` does, when they should type their
+own.
 
 ## SDK
 

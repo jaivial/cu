@@ -6885,7 +6885,10 @@ window.__cuSnapshot = function() {
     if (el.tagName === 'SELECT') return clean(el.selectedOptions[0]?.label);
     const img = el.querySelector('img[alt]');
     if (img) return img.alt;
-    return clean(el.textContent) || clean(el.getAttribute('placeholder')) || clean(el.value) || '';
+    // A field's value names it only when nothing else does - and never a
+    // password or one-time-code field's: a typed secret must not come back.
+    const secret = el.type === 'password' || el.autocomplete === 'one-time-code';
+    return clean(el.textContent) || clean(el.getAttribute('placeholder')) || (secret ? '' : clean(el.value)) || '';
   };
   const roleOf = (el) => el.getAttribute('role')
     || ({A:'link',BUTTON:'button',SELECT:'combobox',TEXTAREA:'textbox'})

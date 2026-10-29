@@ -41,7 +41,7 @@ Use `cu` when an agent needs a persistent local browser session.
    that starts a download answers `"download":"name"` (list finished files
    with `cu downloads`), and one that opens a window answers `"popup":true`
    (see `cu tabs`).
-6. For credentials, run `cu login`, navigate to the site's sign-in page, then direct the user to the printed `/login` page. The daemon types what they enter into the browser. Never ask the user to paste a password into chat and never include passwords in tool arguments.
+6. Credentials. When you have them (a test account, a secret the user gave you, a vault entry, `cu otp code`), type them like any field: `cu type e4 "$PASSWORD"` or a `type` step in `cu act`. Read them from a `chmod 600` secrets file into a variable rather than writing the literal on the command line, and never repeat one in your answer; cu never echoes it back (no reply carries a field's value). When the user should type their own, run `cu login`, navigate to the site's sign-in page, then direct them to the printed `/login` page; the daemon types what they enter.
 7. Popups and extra tabs: `cu tabs` lists them (the default is flagged);
    any page command takes `--tab ID` to run there, and `cu tabs close ID`
    dismisses one. A tab a session opened is its own: another agent never
