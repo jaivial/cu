@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.9.0] - 2026-11-05
+
+### Changed
+
+- **Chrome/Chromium is the default browser again; Min is opt-in.** Min as the
+  default (1.6.0) is reverted to an opt-in (`CU_MIN_DEFAULT=1` or
+  `CU_BROWSER`): Electron cannot be driven as fully as Chromium (no
+  `Target.createTarget`, no browser contexts, and a view Min never loaded a
+  URL into stays detached from its window, so pages such as Figma's editor
+  never return a capture). Without the opt-in nothing is auto-installed.
+  `cu eval`, `CU_BROWSER_LOG` and the Min support itself stay.
+
+### Added
+
+- **`CU_BROWSER_LOG=<file>`** keeps the browser's own stderr.
+
 ## [1.8.0] - 2026-11-05
 
 ### Added

@@ -1,4 +1,4 @@
-//! Min Browser as cu's default browser.
+//! Min Browser support (opt-in: `CU_MIN_DEFAULT=1` or `CU_BROWSER`).
 //!
 //! Min (minbrowser.org) is an Electron browser: same CDP endpoint as
 //! Chromium (its engine currently reports Chrome/150), it honours

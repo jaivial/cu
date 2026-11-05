@@ -240,14 +240,15 @@ impl BrowserPolicy {
     /// `CU_HEADLESS`). Fails, rather than quietly downgrading, when
     /// `Compatibility` would end up on a headless-shell build.
     pub fn resolve(mode: BrowserMode) -> Result<Self, String> {
-        // Min Browser is the default when nothing else is asked for: an
-        // installed one, or an auto-install (CU_MIN_AUTOINSTALL=0 turns it
-        // off). Electron has no `Target.createTarget`, so cu opens Min's tabs
-        // through Min's own window UI instead (`crate::minbrowser`).
-        // `CU_MIN_DEFAULT=0` keeps cu on the Chromium candidates; an explicit
-        // `CU_BROWSER` wins over both.
-        let prefer_min = !matches!(env::var("CU_MIN_DEFAULT"), Ok(v)
-            if matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"));
+        // Chrome/Chromium is the default. Min Browser is opt-in
+        // (`CU_MIN_DEFAULT=1`, or `CU_BROWSER` pointing at it): an Electron
+        // browser cannot be driven as fully as Chromium (no
+        // `Target.createTarget`, no browser contexts, views Min never loaded
+        // stay detached from its window and paint nothing), so it is not
+        // what cu picks on its own. With the opt-in, a missing Min is
+        // auto-installed (`CU_MIN_AUTOINSTALL=0` turns that off).
+        let prefer_min = matches!(env::var("CU_MIN_DEFAULT"), Ok(v)
+            if matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"));
         let min_default = || match minbrowser::find() {
             Some(path) => Some(path.display().to_string()),
             None => match minbrowser::ensure() {
