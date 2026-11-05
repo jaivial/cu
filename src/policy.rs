@@ -29,6 +29,8 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+use crate::minbrowser;
+
 /// Which launch profile the daemon uses. Chosen with `CU_MODE` or
 /// `cu start --mode`; the default is `FastTest`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,11 +180,13 @@ pub fn stealth_from_env() -> bool {
     )
 }
 
-/// Executables tried, in order, when `CU_BROWSER` is not set.
+/// Executables tried, in order, when `CU_BROWSER` is not set and no Min
+/// Browser is available.
 ///
 /// `FastTest` keeps cu's historical default first. `Compatibility` prefers a
 /// stock Google Chrome install (a package-managed full browser) and falls back
-/// to distribution Chromium.
+/// to distribution Chromium. An installed (or auto-installed) Min is preferred
+/// over both lists: see [`minbrowser`].
 fn candidates(mode: BrowserMode) -> &'static [&'static str] {
     match mode {
         BrowserMode::FastTest => &[
@@ -225,6 +229,10 @@ pub struct BrowserPolicy {
     /// windowed User-Agent, no `navigator.webdriver`, no DevTools command
     /// line, no `SwiftShader` in the GL renderer. Off with `CU_STEALTH=0`.
     pub stealth: bool,
+    /// The browser is Min (Electron): same CDP, honours
+    /// `--remote-debugging-port` and `--user-data-dir`, but it has no
+    /// `--headless` mode, so it always runs on [`Self::display`].
+    pub min: bool,
 }
 
 impl BrowserPolicy {
@@ -232,13 +240,33 @@ impl BrowserPolicy {
     /// `CU_HEADLESS`). Fails, rather than quietly downgrading, when
     /// `Compatibility` would end up on a headless-shell build.
     pub fn resolve(mode: BrowserMode) -> Result<Self, String> {
+        // Min Browser is the default when nothing else is asked for: an
+        // installed one, or an auto-install (CU_MIN_AUTOINSTALL=0 turns it
+        // off). Electron has no `Target.createTarget`, so cu opens Min's tabs
+        // through Min's own window UI instead (`crate::minbrowser`).
+        // `CU_MIN_DEFAULT=0` keeps cu on the Chromium candidates; an explicit
+        // `CU_BROWSER` wins over both.
+        let prefer_min = !matches!(env::var("CU_MIN_DEFAULT"), Ok(v)
+            if matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"));
+        let min_default = || match minbrowser::find() {
+            Some(path) => Some(path.display().to_string()),
+            None => match minbrowser::ensure() {
+                Ok(path) => Some(path.display().to_string()),
+                Err(why) => {
+                    eprintln!("[min] staying on the Chromium candidates: {why}");
+                    None
+                }
+            },
+        };
         let requested = match env::var("CU_BROWSER") {
             Ok(binary) if !binary.trim().is_empty() => binary,
-            _ => candidates(mode)
-                .iter()
-                .find(|name| find_executable(name).is_some())
-                .unwrap_or(&candidates(mode)[0])
-                .to_string(),
+            _ => if prefer_min { min_default() } else { None }.unwrap_or_else(|| {
+                candidates(mode)
+                    .iter()
+                    .find(|name| find_executable(name).is_some())
+                    .unwrap_or(&candidates(mode)[0])
+                    .to_string()
+            }),
         };
         let executable = find_executable(&requested).unwrap_or_else(|| PathBuf::from(&requested));
         let resolved = std::fs::canonicalize(&executable).unwrap_or_else(|_| executable.clone());
@@ -250,6 +278,7 @@ impl BrowserPolicy {
                 resolved.display()
             ));
         }
+        let min = is_min(&executable) || is_min(&resolved);
         let stealth = stealth_from_env();
         // A headful browser needs a display, and a headless-shell build is
         // headless whatever it is told, so one of the two decides on its own.
@@ -259,10 +288,25 @@ impl BrowserPolicy {
             .ok()
             .map(|v| v.trim() != "0")
             .filter(|headless| *headless || env::var("CU_HEADLESS").is_ok());
+        if min && asked == Some(true) {
+            return Err(format!(
+                "{} is Min (Electron) and cannot run headless; unset CU_HEADLESS, \
+                 or point CU_BROWSER at a Chrome/Chromium",
+                resolved.display()
+            ));
+        }
         let mut display = None;
         let mut headless = true;
         if !headless_shell && asked != Some(true) {
-            match crate::stealth::display() {
+            // Min always has a window: on a private Xvfb rather than the
+            // desktop the daemon inherited, so its windows never appear on
+            // the user's screen.
+            let found = if min {
+                crate::stealth::private_display()
+            } else {
+                crate::stealth::display()
+            };
+            match found {
                 Some(found) => {
                     let name = found.name.clone();
                     crate::stealth::remember_display(found);
@@ -276,6 +320,21 @@ impl BrowserPolicy {
             headless = true;
             display = None;
         }
+        // Min has no headless mode: a window is not an optimisation there
+        // but a requirement, so a missing display is a hard error instead of
+        // a silent `--headless=new` that Electron cannot honour.
+        if min {
+            match &display {
+                Some(_) => headless = false,
+                None => {
+                    return Err(format!(
+                        "{} is Min (Electron) and needs a display: set CU_DISPLAY or DISPLAY, \
+                         or have Xvfb installed so the daemon can start one",
+                        resolved.display()
+                    ));
+                }
+            }
+        }
         Ok(Self {
             mode,
             requested,
@@ -286,6 +345,7 @@ impl BrowserPolicy {
             webgl: webgl_from_env(),
             display,
             stealth,
+            min,
         })
     }
 
@@ -368,6 +428,19 @@ fn is_headless_shell(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.contains("headless_shell") || n.contains("headless-shell"))
+}
+
+/// Whether `path` is the Min browser: its executable is called `min` and
+/// lives in a `Min` install dir (distro package, `/opt/Min`, or the
+/// user-space install of [`crate::minbrowser`]).
+fn is_min(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("min"))
+        || path.ancestors().any(|dir| {
+            dir.file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("min"))
+        })
 }
 
 /// `name` as an executable path: as given if it has a slash, else the first

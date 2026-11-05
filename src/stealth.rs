@@ -219,6 +219,36 @@ pub fn display() -> Option<Display> {
     if find_in_path("Xvfb").is_none() {
         return None;
     }
+    new_xvfb()
+}
+
+/// A display for a browser that must not show on the user's desktop (Min,
+/// which always has a window): `CU_DISPLAY` when set, else an Xvfb this
+/// daemon starts, and the inherited `DISPLAY` only when no Xvfb can run.
+pub fn private_display() -> Option<Display> {
+    if let Ok(display) = std::env::var("CU_DISPLAY") {
+        let display = display.trim().to_string();
+        if !display.is_empty() {
+            return Some(Display {
+                name: display,
+                server: None,
+            });
+        }
+    }
+    if find_in_path("Xvfb").is_some()
+        && let Some(found) = new_xvfb()
+    {
+        return Some(found);
+    }
+    std::env::var("DISPLAY")
+        .ok()
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .map(|name| Display { name, server: None })
+}
+
+/// An Xvfb on the first free display number.
+fn new_xvfb() -> Option<Display> {
     (1..=64).map(|n| format!(":{n}")).find_map(|name| {
         if socket(&name).exists() {
             return None;
