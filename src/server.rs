@@ -578,7 +578,17 @@ pub fn launch_browser(data: &Path, cdp_port: u16, policy: &BrowserPolicy) -> Res
         )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        // `CU_BROWSER_LOG=<file>` keeps what the browser says (Electron's own
+        // warnings live there and nowhere else); /dev/null by default.
+        .stderr(match std::env::var("CU_BROWSER_LOG") {
+            Ok(path) if !path.trim().is_empty() => std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path.trim())
+                .map(Stdio::from)
+                .unwrap_or_else(|_| Stdio::null()),
+            _ => Stdio::null(),
+        })
         .spawn()
         .map_err(|e| {
             format!(
