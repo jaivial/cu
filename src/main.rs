@@ -219,6 +219,34 @@ fn main() {
                 .map(|s| println!("{s}"))
             })
         }
+        // The escape hatch: run JavaScript in the page. One eval action, so
+        // the daemon's own gate (live viewer, challenge, origin budget) still
+        // applies as it does to every other page command.
+        Some("eval") => {
+            let read_stdin = || -> Result<String, String> {
+                let mut input = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut input)
+                    .map(|_| input)
+                    .map_err(|e| e.to_string())
+            };
+            let js = match args.get(1) {
+                Some(a) if a != "-" => Ok(a.clone()),
+                _ => read_stdin(),
+            };
+            js.and_then(|js| {
+                let actions = format!(
+                    "[{{\"do\":\"eval\",\"js\":{}}}]",
+                    server::json_string(js.trim())
+                );
+                page_request(
+                    "POST",
+                    &on_tab("/v1/act"),
+                    Some(&format!("{{\"actions\":{actions},\"snapshot\":false}}")),
+                )
+                .map(|s| println!("{s}"))
+            })
+        }
         Some("login") => {
             println!(
                 "Open {} in a browser. Passwords go directly to the server.",

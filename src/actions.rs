@@ -80,6 +80,12 @@ pub enum Action {
         scale: f64,
         ms: u64,
     },
+    /// Run JavaScript in the page and return its value when it is a string
+    /// (`Runtime.evaluate`, `returnByValue`). The escape hatch for what no
+    /// ref does: injecting a bridge, reading a global the page keeps in JS.
+    Eval {
+        js: String,
+    },
     /// Device emulation: `mobile` (390x844 touch), `tablet`, `desktop` (clears it),
     /// or explicit `width`/`height`.
     Emulate {
@@ -146,6 +152,11 @@ pub fn parse_action(object: &str) -> Result<Action, String> {
             value: text("value")?,
         },
         "navigate" => Action::Navigate { url: text("url")? },
+        "eval" | "js" | "script" => Action::Eval {
+            js: json_string_value(object, "js")
+                .or_else(|| json_string_value(object, "code"))
+                .ok_or("eval needs \"js\"")?,
+        },
         "scroll" => {
             let num = |k: &str| crate::server::json_number(object, k);
             let to = json_string_value(object, "to");
@@ -394,6 +405,8 @@ pub struct Outcome {
     pub popup: bool,
     /// What the network saw of the main document of a `navigate` action.
     pub document: Option<crate::scheduler::DocumentResponse>,
+    /// The value an `eval` action returned, when it is a string.
+    pub value: Option<String>,
     pub ms: u128,
 }
 
@@ -468,6 +481,9 @@ pub fn run_batch(tab: &Tab, batch: &Batch) -> Result<String, String> {
                 }
                 if outcome.popup {
                     line.push_str(",\"popup\":true");
+                }
+                if let Some(value) = &outcome.value {
+                    line.push_str(&format!(",\"value\":{}", json_string(value)));
                 }
                 results.push(line + "}");
                 if let Some(error) = stop {
@@ -590,6 +606,7 @@ impl Page {
         let started = Instant::now();
         let (mut download, mut popup) = (None, false);
         let mut document = None;
+        let mut value = None;
         let navigated = match action {
             Action::Click { reference } => {
                 let mut watch = NavWatch::new(&self.watch_frame(reference));
@@ -812,6 +829,23 @@ impl Page {
                 popup = watch.popup;
                 navigated
             }
+            Action::Eval { js } => {
+                let reply = self.conn().call(
+                    "Runtime.evaluate",
+                    &format!(
+                        "{{\"expression\":{},\"returnByValue\":true,\"awaitPromise\":true}}",
+                        json_string(js)
+                    ),
+                )?;
+                if reply.contains("\"exceptionDetails\"") {
+                    let text = evaluated_string(&reply)
+                        .or_else(|| json_string_value(&reply, "description"))
+                        .unwrap_or_else(|| "the script threw".into());
+                    return Err(format!("eval: {text}"));
+                }
+                value = evaluated_string(&reply);
+                false
+            }
             Action::Emulate {
                 mode,
                 width,
@@ -826,6 +860,7 @@ impl Page {
             download,
             popup,
             document,
+            value,
             ms: started.elapsed().as_millis(),
         })
     }
@@ -2039,6 +2074,21 @@ if (!window.__cu) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eval_takes_js_or_code() {
+        assert_eq!(
+            parse_action(r#"{"do":"eval","js":"document.title"}"#).unwrap(),
+            Action::Eval {
+                js: "document.title".into()
+            }
+        );
+        assert_eq!(
+            parse_action(r#"{"do":"script","code":"1+1"}"#).unwrap(),
+            Action::Eval { js: "1+1".into() }
+        );
+        assert!(parse_action(r#"{"do":"eval"}"#).is_err());
+    }
 
     #[test]
     fn a_batch_is_parsed_in_order_with_defaults() {

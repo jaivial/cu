@@ -598,7 +598,10 @@ const CDP_POLL_INTERVAL: Duration = Duration::from_millis(2);
 /// Longest a loopback DevTools connect may take.
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 /// How long to wait for a DevTools HTTP response before using what arrived.
-const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Read timeout of a DevTools socket. Generous on purpose: a capture of a
+/// heavy page (Figma's editor took 5.1 s) used to hit a 5 s ceiling and fail
+/// while the browser was still answering.
+const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum accepted request head and body. Guards against unbounded buffering.
 const MAX_REQUEST: usize = 64 * 1024;
 

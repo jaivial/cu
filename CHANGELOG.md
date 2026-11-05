@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.8.0] - 2026-11-05
+
+### Added
+
+- **`cu eval` / the `eval` action: JavaScript in the page.** `{"do":"eval","js":"…"}`
+  in a batch (or `cu eval 'js'`, or the script on stdin) runs
+  `Runtime.evaluate` with `returnByValue` and returns the value when it is a
+  string. It is the escape hatch for what no snapshot ref reaches: injecting
+  a bridge, reading a global the page keeps only in JS. It goes through the
+  same gate as every other page command (live viewer, challenge, origin
+  budget).
+
+### Fixed
+
+- **A slow capture no longer fails.** The DevTools socket read timeout was
+  5 s; Figma's editor takes ~5.1 s to hand back a screenshot, so `cu shot`
+  on it always failed with "Resource temporarily unavailable". It is 30 s.
+
 ## [1.7.0] - 2026-11-05
 
 ### Added

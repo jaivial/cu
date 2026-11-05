@@ -454,6 +454,15 @@ challenge state and a hand-off for a person; nothing here solves, rotates
 around or retries past a defence. Respect each site's terms and data
 protection law when crawling.
 
+## Running JavaScript in the page
+
+`cu eval '<js>'` (or `{"do":"eval","js":"…"}` inside a batch) runs the script
+through `Runtime.evaluate` and prints the value when it is a string. It is the
+escape hatch for what no snapshot ref reaches: injecting a bridge, reading a
+global that only exists in JS. It passes the same gate as every other page
+command (live viewer, challenge, origin budget), and `cu act` batches can mix
+it with clicks and types.
+
 ## MCP server
 
 `cu mcp` is a stdio [MCP](https://modelcontextprotocol.io) server in front of
