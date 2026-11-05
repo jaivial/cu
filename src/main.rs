@@ -935,7 +935,7 @@ fn mark(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), String> 
     let severity = severity
         .map(|s| format!(",\"severity\":{}", server::json_string(&s)))
         .unwrap_or_default();
-    request(
+    page_request(
         "POST",
         &on_tab("/v1/marks"),
         Some(&format!(
@@ -1924,5 +1924,6 @@ fn console_cmd(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), S
     if !json {
         q.push_str("&format=text");
     }
-    request("GET", &on_tab(&format!("/v1/console?{q}")), None).map(|s| println!("{}", s.trim_end()))
+    page_request("GET", &on_tab(&format!("/v1/console?{q}")), None)
+        .map(|s| println!("{}", s.trim_end()))
 }

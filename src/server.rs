@@ -990,6 +990,7 @@ fn route_with(
             | ("POST", "/v1/act")
             | ("POST", "/v1/click")
             | ("POST", "/v1/type")
+            | ("POST", "/v1/upload")
             | ("GET", "/v1/contexts")
             | ("GET", "/v1/tabs")
             | ("GET", "/v1/text")
