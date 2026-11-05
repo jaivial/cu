@@ -240,14 +240,14 @@ impl BrowserPolicy {
     /// `CU_HEADLESS`). Fails, rather than quietly downgrading, when
     /// `Compatibility` would end up on a headless-shell build.
     pub fn resolve(mode: BrowserMode) -> Result<Self, String> {
-        // Min Browser can be the default when asked for (`CU_MIN_DEFAULT=1`):
-        // an installed one, or an auto-install (CU_MIN_AUTOINSTALL=0 turns it
-        // off). It is NOT the default out of the box because Electron refuses
-        // `Target.createTarget`, which is how cu opens its pages: with Min the
-        // daemon starts, lists targets and then fails every navigate.
-        // `CU_BROWSER=min` reaches the same place explicitly.
-        let prefer_min = matches!(env::var("CU_MIN_DEFAULT"), Ok(v)
-            if !matches!(v.trim(), "" | "0" | "off" | "false" | "no"));
+        // Min Browser is the default when nothing else is asked for: an
+        // installed one, or an auto-install (CU_MIN_AUTOINSTALL=0 turns it
+        // off). Electron has no `Target.createTarget`, so cu opens Min's tabs
+        // through Min's own window UI instead (`crate::minbrowser`).
+        // `CU_MIN_DEFAULT=0` keeps cu on the Chromium candidates; an explicit
+        // `CU_BROWSER` wins over both.
+        let prefer_min = !matches!(env::var("CU_MIN_DEFAULT"), Ok(v)
+            if matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"));
         let min_default = || match minbrowser::find() {
             Some(path) => Some(path.display().to_string()),
             None => match minbrowser::ensure() {
@@ -298,7 +298,15 @@ impl BrowserPolicy {
         let mut display = None;
         let mut headless = true;
         if !headless_shell && asked != Some(true) {
-            match crate::stealth::display() {
+            // Min always has a window: on a private Xvfb rather than the
+            // desktop the daemon inherited, so its windows never appear on
+            // the user's screen.
+            let found = if min {
+                crate::stealth::private_display()
+            } else {
+                crate::stealth::display()
+            };
+            match found {
                 Some(found) => {
                     let name = found.name.clone();
                     crate::stealth::remember_display(found);

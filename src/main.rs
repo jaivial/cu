@@ -339,7 +339,8 @@ fn start(args: &[String]) -> Result<(), String> {
         .map(server::parse_public_url)
         .transpose()?;
     cu::scheduler::configure(cu::scheduler::Budget::for_mode(mode));
-    fs::create_dir_all(data.join("profiles/default")).map_err(|e| e.to_string())?;
+    cu::minbrowser::set_active(policy.min);
+    fs::create_dir_all(server::profile_dir(&data)).map_err(|e| e.to_string())?;
     fs::create_dir_all(data.join("sessions")).map_err(|e| e.to_string())?;
     fs::create_dir_all(data.join("downloads")).map_err(|e| e.to_string())?;
     // Chromium refuses a relative download directory, so the path handed to
@@ -1013,7 +1014,8 @@ fn daemon(args: &[String]) -> Result<(), String> {
         policy.display = None;
     }
     cu::scheduler::configure(cu::scheduler::Budget::for_mode(mode));
-    fs::create_dir_all(data.join("profiles/default")).map_err(|e| e.to_string())?;
+    cu::minbrowser::set_active(policy.min);
+    fs::create_dir_all(server::profile_dir(&data)).map_err(|e| e.to_string())?;
     fs::create_dir_all(data.join("sessions")).map_err(|e| e.to_string())?;
     fs::create_dir_all(data.join("downloads")).map_err(|e| e.to_string())?;
     // The vault must open (key file writable, schema sound) before anything

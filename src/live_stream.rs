@@ -366,6 +366,12 @@ fn push_frames(
             Ok(c) => c,
             Err(e) => return fail(shared, &e),
         };
+        // A Min tab that is not in front sends no frames: bring it forward.
+        if crate::minbrowser::active()
+            && let Some(target) = tab.resolved_target()
+        {
+            let _ = crate::minbrowser::select(tab.cdp_port, &target);
+        }
         let started = cdp.call(
             "Page.startScreencast",
             &format!(

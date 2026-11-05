@@ -454,20 +454,32 @@ sessions against a private app, with the method, the sampling, the stop rules
 and every number written out in the section, including what was **not** isolated
 from the runs.
 
-## Min Browser support (opt-in)
+## Min Browser as the default
 
-`cu` can run on **Min** (minbrowser.org) with `CU_MIN_DEFAULT=1` (or
-`CU_BROWSER=min`): same CDP endpoint, and it honours
-`--remote-debugging-port` and `--user-data-dir` like Chromium. When no Min is
-installed, the daemon downloads the official `min-<version>-amd64.deb` from
-GitHub and unpacks it into `~/.local/opt/min` (no root needed);
-`CU_MIN_AUTOINSTALL=0` turns that off.
+`cu` runs on **Min** (minbrowser.org) by default: same DevTools protocol, and
+it honours `--remote-debugging-port` and `--user-data-dir` like Chromium.
+When no Min is installed, the daemon downloads the official
+`min-<version>-amd64.deb` from GitHub and unpacks it into `~/.local/opt/min`
+(no root needed). `CU_MIN_AUTOINSTALL=0` turns the installer off,
+`CU_MIN_DEFAULT=0` keeps cu on Chrome/Chromium, and an explicit `CU_BROWSER`
+wins over both.
 
-Two Min caveats, and why it is not the default:
+How cu drives an Electron browser:
 
-- Min is Electron, so it has **no `--headless` mode**: the daemon runs it
-  windowed, on `CU_DISPLAY`, the inherited `DISPLAY`, or an Xvfb it starts
-  itself. `CU_HEADLESS=1` with Min is an error rather than a broken launch.
-- Electron refuses `Target.createTarget`, which is how cu opens its pages.
-  The daemon starts and lists targets fine, but `cu navigate` fails with
-  CDP `-32000 Not supported` until cu grows a target-reuse mode.
+- **A window, never `--headless`.** Electron has no headless mode, so Min
+  runs windowed on `CU_DISPLAY`, else on an Xvfb the daemon starts (the
+  inherited `DISPLAY` only when there is no Xvfb), so its windows never show
+  on the desktop. `CU_HEADLESS=1` with Min is an error.
+- **Tabs through Min's own UI.** Electron answers `Target.createTarget` with
+  `-32000 Not supported`, so a session tab is opened by Min's window UI (the
+  `min://app/index.html` target) exactly as a link asking for a new tab
+  would, and closed with `window.close()`, which Min turns into its own
+  close, so its tab list stays in step. Min's UI and internal pages are never
+  listed as tabs or driven.
+- **The tab in front paints.** A Min tab that is not shown produces no
+  frames, so before a screenshot or a live stream cu brings that tab to the
+  front. Two agents that capture at the same moment take turns.
+- **Its own profile.** Min keeps `profiles/min`, apart from Chrome's
+  `profiles/default`.
+- **No named contexts.** Electron has no browser contexts; `--context` needs
+  `CU_BROWSER=chromium`.
