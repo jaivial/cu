@@ -12,11 +12,6 @@
   same gate as every other page command (live viewer, challenge, origin
   budget).
 
-### Fixed
-
-- **A slow capture no longer fails.** The DevTools socket read timeout was
-  5 s; Figma's editor takes ~5.1 s to hand back a screenshot, so `cu shot`
-  on it always failed with "Resource temporarily unavailable". It is 30 s.
 
 ## [1.7.0] - 2026-11-05
 
