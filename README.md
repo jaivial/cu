@@ -406,6 +406,54 @@ GPU-less server under xvfb (Chromium 137+ needs `--enable-unsafe-swiftshader`
 to expose it to pages). It costs CPU, so leave it off unless a site needs it;
 `cu diagnostics` shows the GL renderer in use.
 
+## SEO: audits, crawls and searches from a chosen place
+
+`cu seo` and `cu serp` read pages the way a visitor's browser does, in an
+isolated browser context of their own (the session's tab is left alone):
+
+```sh
+cu seo audit https://example.com/ --keywords "pizza,pizzería sevilla" --md
+cu seo crawl https://example.com/ --max-pages 50 --depth 2 --out crawl.jsonl
+cu seo robots https://example.com/private/page   # allowed? crawl-delay, sitemaps
+
+# A location per context: country, region and town (or --lat/--lon)
+cu seo geo sevilla "Sevilla,Andalucía,ES" [--proxy http://es-exit:3128]
+cu seo geo sevilla                          # what a page there sees
+cu serp "pizzeria" --geo "Getxo,Bizkaia,ES" --engine google --target domain.es --md
+cu serp compare "pizzeria" --geo "Sevilla,ES" --geo "Bilbao,ES"
+```
+
+- **audit**: status and `X-Robots-Tag`, title / meta description lengths,
+  canonical, robots, hreflang, heading outline, word count, images without
+  alt, internal / external / nofollow links, JSON-LD types, Open Graph,
+  the most frequent words and phrases, and per keyword: count, density,
+  first position, and whether it is in the title, description, h1, h2/h3,
+  URL, alt texts and first 100 words. `issues` lists what to fix.
+- **crawl**: one host, breadth first, `robots.txt` obeyed (`Crawl-delay`
+  too), never faster than one page a second; one audit per page in the
+  JSONL file and a summary with issue counts, duplicate titles and
+  descriptions, and error pages.
+- **geo**: a location is one coherent set -- locale and `Accept-Language`,
+  time zone, `navigator.geolocation` position (permission granted), and
+  optionally a proxy, which a browser context carries by itself. A town is
+  looked up once with OpenStreetMap Nominatim (cached in
+  `<data>/geo-cache.tsv`); give `--lat/--lon` to skip it. Without a proxy
+  the requests still leave through this machine's IP, and cu says so.
+- **serp**: Google (`hl`, `gl`, `uule`, `pws=0`), Bing (`cc`, `mkt`,
+  `setlang`) or DuckDuckGo (`kl`): organic results, ads, the local pack,
+  "people also ask", related searches and the position of `--target`.
+  `compare` runs one query from several places and reports what differs.
+
+**Limits, on purpose.** Google's terms and its `robots.txt` (`Disallow:
+/search`) do not allow automated queries, and Bing's are similar: `cu serp`
+is for occasional, manual-scale checks, not rank tracking at volume -- use
+Search Console or a licensed SERP API for that. Result pages are spaced per
+engine (8 s Google, 3 s others; `CU_SERP_INTERVAL_MS`, never under 1 s). A
+CAPTCHA, Google's `/sorry/` page or a block stops the command with the
+challenge state and a hand-off for a person; nothing here solves, rotates
+around or retries past a defence. Respect each site's terms and data
+protection law when crawling.
+
 ## MCP server
 
 `cu mcp` is a stdio [MCP](https://modelcontextprotocol.io) server in front of

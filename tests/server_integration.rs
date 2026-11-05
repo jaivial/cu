@@ -1781,3 +1781,81 @@ fn a_wait_clamps_a_long_request_to_the_ceiling() {
     );
     set_wait_ceiling(None);
 }
+
+#[test]
+fn a_location_is_applied_to_its_own_context_with_its_proxy() {
+    // `POST /v1/seo/geo`: a context created behind the proxy, and locale,
+    // time zone, position, Accept-Language and the geolocation permission
+    // set for it -- with a position given, so no geocoder is asked.
+    let server = TestServer::start("seo-geo", true);
+    let response = server.post(
+        "/v1/seo/geo?context=geo-test",
+        r#"{"geo":"Getxo,Bizkaia,ES","lat":43.35,"lon":-3.01,"proxy":"http://127.0.0.1:3128"}"#,
+    );
+    assert_eq!(status_code(&response), "200", "got {response}");
+    let body = body_of(&response);
+    assert!(body.contains("\"country\":\"ES\""), "{body}");
+    assert!(body.contains("\"timezone\":\"Europe/Madrid\""), "{body}");
+    assert!(body.contains("\"source\":\"given\""), "{body}");
+    assert!(
+        body.contains("\"proxy\":\"http://127.0.0.1:3128\""),
+        "{body}"
+    );
+    // With a proxy there is no "no proxy" warning.
+    assert!(!body.contains("no proxy"), "{body}");
+    let log = server::http_get(&format!("127.0.0.1:{}", server.cdp_port), "/geo-log")
+        .expect("the fake browser's log");
+    assert!(
+        log.contains("\"proxyServer\":\"http://127.0.0.1:3128\""),
+        "the context was not created behind the proxy: {log}"
+    );
+    assert!(log.contains("\"locale\":\"es_ES\""), "{log}");
+    assert!(log.contains("\"timezoneId\":\"Europe/Madrid\""), "{log}");
+    assert!(log.contains("\"latitude\":43.35"), "{log}");
+    assert!(log.contains("\"acceptLanguage\":\"es-ES,es,en\""), "{log}");
+    // The browser's own User-Agent, minus the headless token.
+    assert!(!log.contains("HeadlessChrome"), "{log}");
+    assert!(log.contains("\"setting\":\"granted\""), "{log}");
+    // A proxy with credentials in it is refused instead of silently dropped.
+    let response = server.post(
+        "/v1/seo/geo?context=geo-bad",
+        r#"{"country":"ES","proxy":"http://user:secret@127.0.0.1:3128"}"#,
+    );
+    assert_eq!(status_code(&response), "400", "got {response}");
+    // The location is part of the context, and goes with it.
+    let request = format!(
+        "DELETE /v1/contexts/geo-test HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n",
+        server.token
+    );
+    let response = send_fragmented(
+        &server.addr,
+        request.as_bytes(),
+        4,
+        Duration::from_millis(5),
+    )
+    .expect("DELETE should get a response");
+    assert_eq!(status_code(&response), "200", "got {response}");
+    assert!(body_of(&response).contains("\"closed\":true"), "{response}");
+}
+
+#[test]
+fn an_audit_runs_in_the_context_and_reports_the_page() {
+    let server = TestServer::start("seo-audit", true);
+    let response = server.post(
+        "/v1/seo/audit?context=seo",
+        r#"{"url":"https://example.test/","keywords":["example"]}"#,
+    );
+    assert_eq!(status_code(&response), "200", "got {response}");
+    let body = body_of(&response);
+    assert!(body.contains("\"title\":\"Example\""), "{body}");
+    assert!(body.contains("missing meta description"), "{body}");
+    assert!(body.contains("\"challenge_state\""), "{body}");
+    // A search without a query is refused before anything is navigated.
+    let response = server.post("/v1/seo/serp?context=seo", r#"{"query":" "}"#);
+    assert_eq!(status_code(&response), "400", "got {response}");
+    let response = server.post(
+        "/v1/seo/serp?context=seo",
+        r#"{"query":"x","engine":"altavista"}"#,
+    );
+    assert_eq!(status_code(&response), "400", "got {response}");
+}

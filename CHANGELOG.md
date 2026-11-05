@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.7.0] - 2026-11-05
+
+### Added
+
+- **SEO: `cu seo` and `cu serp`.** Page audits (`seo audit`: status,
+  `X-Robots-Tag`, title/description, canonical, hreflang, headings, words,
+  alt texts, links, JSON-LD, Open Graph, top terms and per-keyword
+  placement and density, with an `issues` list), a polite same-host crawl
+  (`seo crawl`: `robots.txt` and `Crawl-delay` obeyed, at most one page a
+  second, JSONL per page plus a summary with duplicates and errors) and
+  `seo robots`.
+- **Locations per context (`seo geo`).** Country, region and town (looked up
+  once with Nominatim, cached) or a given position, applied to a named
+  context as one coherent set: locale and `Accept-Language`, time zone,
+  `navigator.geolocation` with the permission granted, and an optional proxy
+  -- `Target.createBrowserContext` now takes one per context. Overrides are
+  re-armed when the browser drops the session that held them. Warnings say
+  what is missing (no proxy, an estimated time zone).
+- **Location-aware result pages (`serp`, `serp compare`).** Google (`hl`,
+  `gl`, `uule`, `pws=0`), Bing (`cc`, `mkt`, `setlang`) and DuckDuckGo
+  (`kl`): organic results (Google's `/goto` links resolved from the result's
+  own URL line), ads, local pack, related questions and searches, and a
+  target domain's position; `compare` diffs several places. Spaced per
+  engine (`CU_SERP_INTERVAL_MS`).
+- **Google's `/sorry/` page is `human_required`** (vendor `google-sorry`):
+  a search that meets it stops with the hand-off instead of reading it as
+  results.
+
 ## [1.6.0] - 2026-11-05
 
 ### Added
@@ -17,6 +45,13 @@
 - **Captures bring a Min tab to the front.** A Min tab that is not shown
   paints nothing and its screenshot never returned; screenshots and the live
   stream now select the tab first.
+- **A named context is a tab of its own on Min.** Electron has no
+  `Target.createBrowserContext`, so on Min a context is a tab remembered by
+  name: the SEO commands (`cu seo audit|crawl|robots|serp`, which always run
+  in a context) and `--context` work there without landing in the session's
+  page. Cookies are shared with the other tabs, and a proxy or a location
+  (`cu seo geo`, `--geo`) is refused with a message instead of silently
+  dropped: both ride on a real browser context.
 
 ### Changed
 
