@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.7.0] - 2026-11-05
 
 ### Added
 
@@ -45,6 +45,13 @@
 - **Captures bring a Min tab to the front.** A Min tab that is not shown
   paints nothing and its screenshot never returned; screenshots and the live
   stream now select the tab first.
+- **A named context is a tab of its own on Min.** Electron has no
+  `Target.createBrowserContext`, so on Min a context is a tab remembered by
+  name: the SEO commands (`cu seo audit|crawl|robots|serp`, which always run
+  in a context) and `--context` work there without landing in the session's
+  page. Cookies are shared with the other tabs, and a proxy or a location
+  (`cu seo geo`, `--geo`) is refused with a message instead of silently
+  dropped: both ride on a real browser context.
 
 ### Changed
 

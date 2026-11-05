@@ -857,6 +857,13 @@ pub fn apply_geo(
     name: &str,
     body: &str,
 ) -> (&'static str, &'static str, String) {
+    if crate::minbrowser::active() {
+        return error(
+            "400 Bad Request",
+            "a location is held by a browser context and Min (Electron) has none; \
+             start the daemon with CU_BROWSER=chromium for `cu seo geo` and `--geo`",
+        );
+    }
     if !crate::server::valid_name(name) {
         return error(
             "400 Bad Request",

@@ -4189,6 +4189,51 @@ pub fn context_info(cdp_port: u16, name: &str) -> Option<(String, String, Option
         .map(|c| (c.browser_context.clone(), c.target.clone(), c.proxy.clone()))
 }
 
+/// Prefix of a context that is a tab rather than a browser context.
+const TAB_CONTEXT: &str = "tab:";
+
+/// A context on a browser that has none (`Target.createBrowserContext` is
+/// Electron's "Not supported"): a tab of its own, remembered by name.
+///
+/// It is what the SEO commands and `--context` need (a page that is not the
+/// session's), not what a browser context gives: cookies are shared with the
+/// other tabs and a proxy has nowhere to go, which is an error rather than a
+/// silent downgrade.
+fn min_context_tab(cdp_port: u16, name: &str, proxy: Option<&str>) -> Result<Tab, String> {
+    if proxy.is_some() {
+        return Err(
+            "a proxy rides on a browser context and Min (Electron) has none; \
+             start the daemon with CU_BROWSER=chromium for proxied contexts"
+                .into(),
+        );
+    }
+    let key = (cdp_port, name.to_string());
+    if let Some(context) = contexts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
+        return Ok(Tab {
+            cdp_port,
+            target: Some(context.target.clone()),
+        });
+    }
+    let target = crate::minbrowser::open_tab(cdp_port, "about:blank")?;
+    contexts().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        key,
+        Context {
+            browser_context: format!("{TAB_CONTEXT}{name}"),
+            target: target.clone(),
+            proxy: None,
+            downloads: None,
+        },
+    );
+    Ok(Tab {
+        cdp_port,
+        target: Some(target),
+    })
+}
+
 /// [`context_tab`], creating the context behind `proxy` when it is new: a
 /// browser context carries its own proxy (`Target.createBrowserContext`'s
 /// `proxyServer`), so contexts in different countries share one browser.
@@ -4202,11 +4247,7 @@ pub fn context_tab_with(
         return Err("invalid context name".into());
     }
     if crate::minbrowser::active() {
-        return Err(
-            "named contexts need Chrome/Chromium: Min (Electron) has no browser contexts; \
-             start the daemon with CU_BROWSER=chromium for them"
-                .into(),
-        );
+        return min_context_tab(cdp_port, name, proxy);
     }
     let mut all = contexts().lock().unwrap_or_else(|e| e.into_inner());
     let key = (cdp_port, name.to_string());
@@ -4330,8 +4371,14 @@ pub fn close_context(cdp_port: u16, name: &str) -> Result<bool, String> {
     crate::seo::forget_geo(cdp_port, name);
     forget_tab(&Tab {
         cdp_port,
-        target: Some(context.target),
+        target: Some(context.target.clone()),
     });
+    // A context that is a tab (Min) is closed like one; a real browser
+    // context takes its tab with it.
+    if context.browser_context.starts_with(TAB_CONTEXT) {
+        crate::minbrowser::close_tab(cdp_port, &context.target)?;
+        return Ok(true);
+    }
     dispose_context(cdp_port, &context.browser_context)?;
     Ok(true)
 }
