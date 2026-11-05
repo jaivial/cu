@@ -453,3 +453,17 @@ parallel-agents section is measured the same way: two rounds of real agent
 sessions against a private app, with the method, the sampling, the stop rules
 and every number written out in the section, including what was **not** isolated
 from the runs.
+
+## Min Browser as the default
+
+`cu` prefers **Min** (minbrowser.org) over its Chromium candidates: same CDP
+endpoint, and it honours `--remote-debugging-port` and `--user-data-dir` like
+Chromium does. When no Min is installed, the daemon downloads the official
+`min-<version>-amd64.deb` from GitHub and unpacks it into `~/.local/opt/min`
+(no root needed); `CU_MIN_AUTOINSTALL=0` turns that off, and an explicit
+`CU_BROWSER` still wins over the default.
+
+Min is Electron, so it has **no `--headless` mode**: the daemon always runs it
+windowed, on `CU_DISPLAY`, the inherited `DISPLAY`, or an Xvfb it starts
+itself (`Xvfb` on the `PATH`). `CU_HEADLESS=1` with Min is an error rather
+than a silently broken launch.

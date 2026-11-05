@@ -102,11 +102,15 @@ fn main() {
             page_request("GET", &on_tab(&format!("/v1/screenshot?{query}")), None)
                 .and_then(|s| write_screenshot(&s, file.as_deref()))
         }),
-        Some("snapshot") => page_request("GET", &on_tab("/v1/snapshot"), None).map(|s| println!("{s}")),
+        Some("snapshot") => {
+            page_request("GET", &on_tab("/v1/snapshot"), None).map(|s| println!("{s}"))
+        }
         // `cu inspect REF` / `cu inspect --selector CSS`: how to find an
         // element again and which component and source file render it.
         Some("inspect") => target_query(&args[1..], "usage: cu inspect REF | --selector CSS")
-            .and_then(|(query, _)| page_request("GET", &on_tab(&format!("/v1/inspect?{query}")), None))
+            .and_then(|(query, _)| {
+                page_request("GET", &on_tab(&format!("/v1/inspect?{query}")), None)
+            })
             .map(|s| println!("{s}")),
         // `cu mark REF "what is wrong" [--severity S]`: a QA note pinned to
         // an element, collected by `cu marks`.
@@ -650,9 +654,7 @@ fn page_request(method: &str, path: &str, body: Option<&str>) -> Result<String, 
     let (head, body) = request_x_lines(method, path, body, headers)?;
     if let Some(tab) = head_value(&head, "X-Cu-Tab") {
         if head_value(&head, "X-Cu-Tab-New").is_some() {
-            eprintln!(
-                "cu: working in a fresh tab ({tab}); it is collected when the session exits"
-            );
+            eprintln!("cu: working in a fresh tab ({tab}); it is collected when the session exits");
         } else {
             eprintln!(
                 "cu: working in tab ({tab}), the page this session already had; it is collected when the session exits"
@@ -993,9 +995,19 @@ fn daemon(args: &[String]) -> Result<(), String> {
     let mut policy = BrowserPolicy::resolve(mode)?;
     // `CU_HEADLESS=0` opts the daemon into a windowed browser on a virtual
     // display (`CU_DISPLAY`): closer to a real browser, fewer bot checks.
-    let windowed = std::env::var("CU_HEADLESS")
-        .map(|v| v.trim() == "0")
-        .unwrap_or(false);
+    // Min (Electron) has no headless mode at all: for it a window is not an
+    // optimisation but a requirement, so it is always windowed.
+    let windowed = policy.min
+        || std::env::var("CU_HEADLESS")
+            .map(|v| v.trim() == "0")
+            .unwrap_or(false);
+    if policy.min && !(policy.display.is_some() && !policy.headless) {
+        return Err(
+            "Min needs a display for the daemon: set CU_DISPLAY or DISPLAY, \
+             or install Xvfb so one can be started"
+                .into(),
+        );
+    }
     if !(windowed && policy.display.is_some() && !policy.headless) {
         policy.headless = true;
         policy.display = None;
@@ -1179,8 +1191,8 @@ fn otp(args: &[String], tab: Option<String>) -> Result<(), String> {
             println!("{created}");
             if wait {
                 let id = server::json_string_value(&created, "id")
-                .or_else(|| server::json_number(&created, "id").map(|n| (n as i64).to_string()))
-                .ok_or("no id in reply")?;
+                    .or_else(|| server::json_number(&created, "id").map(|n| (n as i64).to_string()))
+                    .ok_or("no id in reply")?;
                 otp_wait(&id, timeout)?;
             }
             Ok(())
@@ -1564,11 +1576,7 @@ fn otp_collect_save(id: &str, token: &str, response: Option<&str>) -> Result<(),
     // existing one is never followed or truncated) renamed over the target
     // - the rename replaces whatever was there, symlink included, and the
     // final file always carries the creation-mode permissions.
-    let tmp = dir.join(format!(
-        ".{id}.tmp-{}-{}",
-        std::process::id(),
-        now,
-    ));
+    let tmp = dir.join(format!(".{id}.tmp-{}-{}", std::process::id(), now,));
     let written = (|| -> Result<(), String> {
         let mut opts = fs::OpenOptions::new();
         opts.create_new(true).write(true);
