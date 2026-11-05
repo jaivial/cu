@@ -28,6 +28,63 @@
   a search that meets it stops with the hand-off instead of reading it as
   results.
 
+## [1.6.0] - 2026-11-05
+
+### Added
+
+- **Min Browser is the default browser.** cu prefers Min (Electron, same
+  DevTools protocol) over the Chrome/Chromium candidates, and installs it
+  when it is missing: the official amd64 `.deb` from GitHub is unpacked into
+  `~/.local/opt/min`, no root needed (`CU_MIN_AUTOINSTALL=0` opts out).
+  `CU_MIN_DEFAULT=0` keeps cu on Chrome/Chromium; `CU_BROWSER` still wins.
+- **Session tabs on an Electron browser.** Electron refuses
+  `Target.createTarget` (`-32000 Not supported`), so on Min a session tab is
+  opened through Min's own window UI, the way a link asking for a new tab is,
+  and closed with `window.close()` so Min's tab list stays in step. Min's UI
+  and internal pages are never listed as tabs or driven.
+- **Captures bring a Min tab to the front.** A Min tab that is not shown
+  paints nothing and its screenshot never returned; screenshots and the live
+  stream now select the tab first.
+
+### Changed
+
+- Min always runs windowed (Electron has no headless mode): on `CU_DISPLAY`
+  or a private Xvfb, the inherited `DISPLAY` only as a last resort, and with
+  its own profile, `profiles/min`. Named contexts need Chrome/Chromium.
+
+## [1.5.2] - 2026-10-29
+
+### Changed
+
+- **Agents may type credentials.** `cu mcp` told the model never to type a
+  password or a one-time code and to send `login_url` instead, which blocked
+  every login with a test account or a secret the person had handed over. The
+  MCP instructions and the `type` / `login_url` descriptions now say `type`
+  and `act` fill those fields like any other text, and `login_url` is for when
+  the person should type their own. The skill, README and agent notes say the
+  same.
+
+### Fixed
+
+- **The snapshot never names a field by a typed secret.** An input with no
+  label, placeholder or text was named by its value, so an unlabelled password
+  field came back in the snapshot with the password in it. Password and
+  `one-time-code` fields are no longer named by their value.
+
+## [1.5.1] - 2026-10-26
+
+### Fixed
+
+- **`cu mcp` keeps its page when it runs in a container.** The daemon resolves
+  a session's tab by the caller's pid, read in its own `/proc`; from another
+  pid namespace (mini-tui's container shares the host's network, not its pids)
+  that pid is a different process or none, so every call landed in a fresh tab:
+  `navigate`, then the `snapshot` of a blank page. The MCP server now pins the
+  tab the daemon names on the first page call (and on a `new_tab`) and sends
+  it explicitly (`?tab=`) on every later call. A pinned tab that is gone
+  (closed by hand, collected, crashed) is dropped and the call falls back to
+  the session, which opens a fresh tab and reports it.
+
 ## [1.5.0] - 2026-10-26
 
 ### Added

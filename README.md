@@ -1,9 +1,10 @@
 # cu — computer use for AI agents
 
 `cu` runs **one persistent Chromium** behind a loopback-only HTTP server.
-Agents get a small CLI, an MCP server, a Rust SDK and a skill for browser work; users enter
-credentials on a local HTML form so passwords never pass through chat or
-model-visible arguments.
+Agents get a small CLI, an MCP server, a Rust SDK and a skill for browser work. An agent
+types the credentials it was given like any other field, and cu never echoes
+them back; when the user should type their own, a local HTML form keeps them
+out of chat.
 
 An agent pays for every browser action twice: in milliseconds and in tokens.
 `cu` cuts both — a snapshot is **350 tokens and 3 ms**, ten clicks in a batch
@@ -66,9 +67,12 @@ cargo run -- marks --md     # the QA report a developer can act on
   exposes `cu` as a **native tool** next to `bash`, and `cu mcp` serves the
   same tools to any MCP client -- pi, Claude Code, Codex, Cursor -- with one
   page per connection. See [MCP server](#mcp-server).
-- **Passwords never reach the model.** `cu login` prints a local form; the
-  daemon types what the human enters. Credentials are never logged, returned
-  or passed as arguments.
+- **Credentials, either way.** An agent fills a password or a one-time code
+  it has (a test account, a secret it was handed, `cu otp code`) with `type`
+  or `act`, on the CLI or over MCP. When the human should type their own,
+  `cu login` prints a local form and the daemon types what they enter. A
+  typed secret is never logged or returned: no answer carries a field's value,
+  and the snapshot never names a password field by it.
 
 ## How `cu` compares
 
@@ -475,8 +479,9 @@ returns a password, a vault secret or a one-time code. Details:
 
 The daemon binds to loopback only. Its bearer token is generated per data
 directory and stored in `.cu/server.json`, which is gitignored and must never be
-committed or published. Credentials are typed into the page by the daemon from
-the local login form; they are never passed to the model, logged, or returned.
+committed or published. Credentials reach the page either through `type`/`act`
+(the agent's own) or through the local login form (the human's); the daemon
+never logs or returns them.
 To reach that form from another device, publish only `/login` behind a TLS
 reverse proxy and start the daemon with `CU_PUBLIC_URL` (`--public-url`); other
 `Host` headers are refused. See *Public login URL* in [docs/README.md](docs/README.md).
@@ -496,3 +501,33 @@ parallel-agents section is measured the same way: two rounds of real agent
 sessions against a private app, with the method, the sampling, the stop rules
 and every number written out in the section, including what was **not** isolated
 from the runs.
+
+## Min Browser as the default
+
+`cu` runs on **Min** (minbrowser.org) by default: same DevTools protocol, and
+it honours `--remote-debugging-port` and `--user-data-dir` like Chromium.
+When no Min is installed, the daemon downloads the official
+`min-<version>-amd64.deb` from GitHub and unpacks it into `~/.local/opt/min`
+(no root needed). `CU_MIN_AUTOINSTALL=0` turns the installer off,
+`CU_MIN_DEFAULT=0` keeps cu on Chrome/Chromium, and an explicit `CU_BROWSER`
+wins over both.
+
+How cu drives an Electron browser:
+
+- **A window, never `--headless`.** Electron has no headless mode, so Min
+  runs windowed on `CU_DISPLAY`, else on an Xvfb the daemon starts (the
+  inherited `DISPLAY` only when there is no Xvfb), so its windows never show
+  on the desktop. `CU_HEADLESS=1` with Min is an error.
+- **Tabs through Min's own UI.** Electron answers `Target.createTarget` with
+  `-32000 Not supported`, so a session tab is opened by Min's window UI (the
+  `min://app/index.html` target) exactly as a link asking for a new tab
+  would, and closed with `window.close()`, which Min turns into its own
+  close, so its tab list stays in step. Min's UI and internal pages are never
+  listed as tabs or driven.
+- **The tab in front paints.** A Min tab that is not shown produces no
+  frames, so before a screenshot or a live stream cu brings that tab to the
+  front. Two agents that capture at the same moment take turns.
+- **Its own profile.** Min keeps `profiles/min`, apart from Chrome's
+  `profiles/default`.
+- **No named contexts.** Electron has no browser contexts; `--context` needs
+  `CU_BROWSER=chromium`.

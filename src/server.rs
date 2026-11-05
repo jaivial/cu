@@ -261,7 +261,7 @@ pub fn spawn_browser_thread(
                         info.as_deref(),
                         launched.elapsed(),
                     );
-                    restore_cookies(cdp_port, &data.join("profiles/default"));
+                    restore_cookies(cdp_port, &profile_dir(&data));
                     observe_identity(cdp_port);
                     harden(cdp_port, &policy);
                 }
@@ -494,13 +494,24 @@ fn process_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// The browser profile under `data`: `profiles/default` for Chrome/Chromium,
+/// `profiles/min` for Min, so the two browsers never write into each other's
+/// profile (Electron and Chrome lay theirs out differently).
+pub fn profile_dir(data: &Path) -> PathBuf {
+    data.join(if crate::minbrowser::active() {
+        "profiles/min"
+    } else {
+        "profiles/default"
+    })
+}
+
 /// Remove the per-process locks a killed browser left in a profile.
 ///
 /// Chromium exits without cleaning `Singleton*` up when it is killed, and then
 /// refuses every later start on that profile, so a daemon can never come back
 /// up after its browser was stopped.
 fn clear_stale_locks(data: &Path) {
-    let profile = data.join("profiles/default");
+    let profile = profile_dir(data);
     let Ok(entries) = fs::read_dir(&profile) else {
         return;
     };
@@ -525,7 +536,7 @@ fn clear_stale_locks(data: &Path) {
 /// else and every navigate/screenshot failed with "connection refused".
 pub fn launch_browser(data: &Path, cdp_port: u16, policy: &BrowserPolicy) -> Result<Child, String> {
     clear_stale_locks(data);
-    let profile = data.join("profiles/default");
+    let profile = profile_dir(data);
     let mut args = policy.args(&profile, cdp_port);
     // The profile's identity (locale, time zone, window), from the host and
     // stable across restarts; flags go before the start URL.
@@ -805,7 +816,10 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
 /// The CLI names its session in a header, and the daemon resolves the tab
 /// that session works in, in the same request.
 fn session_of(head: &str) -> Option<(u32, bool)> {
-    let pid = header_value(head, "x-cu-session")?.trim().parse::<u32>().ok()?;
+    let pid = header_value(head, "x-cu-session")?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
     let fresh = header_value(head, "x-cu-session-fresh")
         .map(|v| !v.trim().eq_ignore_ascii_case("0") && !v.trim().is_empty())
         .unwrap_or(false);
@@ -1435,7 +1449,7 @@ fn route_with(
             if !context.is_empty() {
                 return context_session(state, &sessions, name, &context, load);
             }
-            let profile = state.data_dir.join("profiles/default");
+            let profile = profile_dir(&state.data_dir);
             // The browser owns the live profile and rewrites it constantly, so
             // step away from the page first and let the copy settle.
             let browser_up = state.browser.is_ready();
@@ -2169,7 +2183,7 @@ pub fn tabs_json(cdp_port: u16) -> Result<String, String> {
         .or_else(|| pages.first().map(|(id, _)| id.clone()));
     let listed: Vec<String> = json_objects(&discovery)
         .into_iter()
-        .filter(|o| json_string_value(o, "type").as_deref() == Some("page"))
+        .filter(|o| is_page(o))
         .filter_map(|o| {
             let id = json_string_value(&o, "id")?;
             Some(format!(
@@ -2201,7 +2215,7 @@ pub fn close_tab(cdp_port: u16, id: &str) -> Result<(), String> {
     // then reports its tab as gone).
     let pages: Vec<String> = json_objects(&discovery)
         .into_iter()
-        .filter(|o| json_string_value(o, "type").as_deref() == Some("page"))
+        .filter(|o| is_page(o))
         .filter_map(|o| json_string_value(&o, "id"))
         .collect();
     if !pages.iter().any(|page| page == id) {
@@ -2212,13 +2226,18 @@ pub fn close_tab(cdp_port: u16, id: &str) -> Result<(), String> {
             "refusing to close the last tab; stopping cu closes the browser instead".into(),
         );
     }
-    let reply = cdp_browser_command(
-        cdp_port,
-        "Target.closeTarget",
-        &format!("{{\"targetId\":{}}}", json_string(id)),
-    )?;
-    if json_value(&reply, "success").as_deref() == Some("false") {
-        return Err("Chromium refused to close that tab".into());
+    if crate::minbrowser::active() {
+        // Min closes it like its own tab-bar does, so its tab list agrees.
+        crate::minbrowser::close_tab(cdp_port, id)?;
+    } else {
+        let reply = cdp_browser_command(
+            cdp_port,
+            "Target.closeTarget",
+            &format!("{{\"targetId\":{}}}", json_string(id)),
+        )?;
+        if json_value(&reply, "success").as_deref() == Some("false") {
+            return Err("Chromium refused to close that tab".into());
+        }
     }
     // The reply arrives before the target leaves `/json`; wait a beat so the
     // `GET /v1/tabs` that follows a close agrees with it.
@@ -3985,6 +4004,16 @@ pub fn json_objects(array: &str) -> Vec<String> {
     out
 }
 
+/// Whether a DevTools discovery entry is a web page cu may drive: a `page`
+/// target that is not the browser's own window. Under Min that excludes its
+/// window UI and internal pages ([`crate::minbrowser::is_ui_url`]); under
+/// Chromium every `page` is a web page.
+pub fn is_page(object: &str) -> bool {
+    json_string_value(object, "type").as_deref() == Some("page")
+        && !(crate::minbrowser::active()
+            && crate::minbrowser::is_ui_url(&json_string_value(object, "url").unwrap_or_default()))
+}
+
 /// WebSocket URLs of the DevTools targets that are real pages.
 ///
 /// `/json` also lists service workers and extension background pages; picking
@@ -3993,7 +4022,7 @@ pub fn json_objects(array: &str) -> Vec<String> {
 pub fn page_targets(discovery: &str) -> Vec<String> {
     json_objects(discovery)
         .into_iter()
-        .filter(|o| json_string_value(o, "type").as_deref() == Some("page"))
+        .filter(|o| is_page(o))
         .filter_map(|o| json_string_value(&o, "webSocketDebuggerUrl"))
         .collect()
 }
@@ -4016,7 +4045,34 @@ impl Tab {
 
     /// Run one command on this tab over a pooled connection.
     pub fn command(&self, method: &str, params: &str) -> Result<String, String> {
+        if crate::minbrowser::active()
+            && matches!(method, "Page.captureScreenshot" | "Page.startScreencast")
+        {
+            // A Min tab that is not in front paints nothing, and a capture
+            // of it never returns: bring it forward first.
+            if let Some(target) = self.resolved_target() {
+                if let Err(why) = crate::minbrowser::select(self.cdp_port, &target) {
+                    eprintln!("cu: min: could not bring tab {target} forward: {why}");
+                }
+            }
+        }
         tab_command(self, method, params)
+    }
+
+    /// The DevTools target this tab means: its own id, or the page the
+    /// default tab is pinned to (the first page when nothing is pinned yet).
+    pub fn resolved_target(&self) -> Option<String> {
+        if let Some(target) = &self.target {
+            return Some(target.clone());
+        }
+        if let Some(pinned) = pinned_target(self.cdp_port) {
+            return Some(pinned);
+        }
+        let discovery = http_get(&format!("127.0.0.1:{}", self.cdp_port), "/json").ok()?;
+        page_target_ids_and_sockets(&discovery, self.cdp_port)
+            .into_iter()
+            .next()
+            .map(|(id, _)| id)
     }
 }
 
@@ -4067,10 +4123,7 @@ pub fn tabs_for_target(cdp_port: u16, id: &str) -> Vec<Tab> {
 /// ordering cannot move it under the agent's feet.
 fn pin_target(cdp_port: u16, id: &str) {
     let mut pinned = pinned_targets().lock().unwrap_or_else(|e| e.into_inner());
-    let moved = pinned
-        .get(&cdp_port)
-        .map(|p| p != id)
-        .unwrap_or(false);
+    let moved = pinned.get(&cdp_port).map(|p| p != id).unwrap_or(false);
     pinned.insert(cdp_port, id.to_string());
     drop(pinned);
     // The default tab now points at another page: what cu remembered about
@@ -4108,7 +4161,7 @@ fn page_target_ids_and_sockets(discovery: &str, cdp_port: u16) -> Vec<(String, S
     let taken = context_targets(cdp_port);
     json_objects(discovery)
         .into_iter()
-        .filter(|o| json_string_value(o, "type").as_deref() == Some("page"))
+        .filter(|o| is_page(o))
         .filter(|o| json_string_value(o, "id").is_none_or(|id| !taken.contains(&id)))
         .filter_map(|o| {
             match (
@@ -4147,6 +4200,13 @@ pub fn context_tab_with(
 ) -> Result<Tab, String> {
     if !valid_name(name) {
         return Err("invalid context name".into());
+    }
+    if crate::minbrowser::active() {
+        return Err(
+            "named contexts need Chrome/Chromium: Min (Electron) has no browser contexts; \
+             start the daemon with CU_BROWSER=chromium for them"
+                .into(),
+        );
     }
     let mut all = contexts().lock().unwrap_or_else(|e| e.into_inner());
     let key = (cdp_port, name.to_string());
@@ -4246,10 +4306,9 @@ fn context_download_dir(data: &Path, name: &str) -> PathBuf {
 /// a stale id is an error an agent can act on rather than a CDP failure.
 pub fn named_tab(cdp_port: u16, id: &str) -> Result<Tab, String> {
     let discovery = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")?;
-    let known = json_objects(&discovery).into_iter().any(|o| {
-        json_string_value(&o, "type").as_deref() == Some("page")
-            && json_string_value(&o, "id").as_deref() == Some(id)
-    });
+    let known = json_objects(&discovery)
+        .into_iter()
+        .any(|o| is_page(&o) && json_string_value(&o, "id").as_deref() == Some(id));
     if !known {
         return Err("no such tab; see GET /v1/tabs".into());
     }
@@ -6369,15 +6428,22 @@ fn session_tab(
         touch_tab_lease(&id);
         return Ok((id, true));
     }
-    let reply = browser_command(
-        state.cdp_port,
-        "Target.createTarget",
-        &format!("{{\"url\":{},\"background\":true}}", json_string(url)),
-    )?;
-    let id = json_string_value(&reply, "targetId").unwrap_or_default();
-    if id.is_empty() {
-        return Err(json_string_value(&reply, "error").unwrap_or(reply));
-    }
+    // Electron has no `Target.createTarget`: Min opens the tab through its
+    // own window UI (see `crate::minbrowser`).
+    let id = if crate::minbrowser::active() {
+        crate::minbrowser::open_tab(state.cdp_port, url)?
+    } else {
+        let reply = browser_command(
+            state.cdp_port,
+            "Target.createTarget",
+            &format!("{{\"url\":{},\"background\":true}}", json_string(url)),
+        )?;
+        let id = json_string_value(&reply, "targetId").unwrap_or_default();
+        if id.is_empty() {
+            return Err(json_string_value(&reply, "error").unwrap_or(reply));
+        }
+        id
+    };
     if let Some(pid) = owner {
         register_tab_lease(&id, pid);
     }
@@ -6393,7 +6459,7 @@ fn leased_tab_of(cdp_port: u16, owner_pid: u32) -> Option<String> {
         .map(|discovery| {
             json_objects(&discovery)
                 .into_iter()
-                .filter(|o| json_string_value(o, "type").as_deref() == Some("page"))
+                .filter(|o| is_page(o))
                 .filter_map(|o| json_string_value(&o, "id"))
                 .collect()
         })
@@ -6958,7 +7024,10 @@ window.__cuSnapshot = function() {
     if (el.tagName === 'SELECT') return clean(el.selectedOptions[0]?.label);
     const img = el.querySelector('img[alt]');
     if (img) return img.alt;
-    return clean(el.textContent) || clean(el.getAttribute('placeholder')) || clean(el.value) || '';
+    // A field's value names it only when nothing else does - and never a
+    // password or one-time-code field's: a typed secret must not come back.
+    const secret = el.type === 'password' || el.autocomplete === 'one-time-code';
+    return clean(el.textContent) || clean(el.getAttribute('placeholder')) || (secret ? '' : clean(el.value)) || '';
   };
   const roleOf = (el) => el.getAttribute('role')
     || ({A:'link',BUTTON:'button',SELECT:'combobox',TEXTAREA:'textbox'})
