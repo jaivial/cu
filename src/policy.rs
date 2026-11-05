@@ -240,9 +240,14 @@ impl BrowserPolicy {
     /// `CU_HEADLESS`). Fails, rather than quietly downgrading, when
     /// `Compatibility` would end up on a headless-shell build.
     pub fn resolve(mode: BrowserMode) -> Result<Self, String> {
-        // Min Browser is the default when nothing else is asked for: an
-        // installed one, or an auto-install (CU_MIN_AUTOINSTALL=0 turns it
-        // off) that leaves cu on the Chromium candidates when it fails.
+        // Min Browser can be the default when asked for (`CU_MIN_DEFAULT=1`):
+        // an installed one, or an auto-install (CU_MIN_AUTOINSTALL=0 turns it
+        // off). It is NOT the default out of the box because Electron refuses
+        // `Target.createTarget`, which is how cu opens its pages: with Min the
+        // daemon starts, lists targets and then fails every navigate.
+        // `CU_BROWSER=min` reaches the same place explicitly.
+        let prefer_min = matches!(env::var("CU_MIN_DEFAULT"), Ok(v)
+            if !matches!(v.trim(), "" | "0" | "off" | "false" | "no"));
         let min_default = || match minbrowser::find() {
             Some(path) => Some(path.display().to_string()),
             None => match minbrowser::ensure() {
@@ -255,7 +260,7 @@ impl BrowserPolicy {
         };
         let requested = match env::var("CU_BROWSER") {
             Ok(binary) if !binary.trim().is_empty() => binary,
-            _ => min_default().unwrap_or_else(|| {
+            _ => if prefer_min { min_default() } else { None }.unwrap_or_else(|| {
                 candidates(mode)
                     .iter()
                     .find(|name| find_executable(name).is_some())

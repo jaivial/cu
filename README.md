@@ -454,16 +454,20 @@ sessions against a private app, with the method, the sampling, the stop rules
 and every number written out in the section, including what was **not** isolated
 from the runs.
 
-## Min Browser as the default
+## Min Browser support (opt-in)
 
-`cu` prefers **Min** (minbrowser.org) over its Chromium candidates: same CDP
-endpoint, and it honours `--remote-debugging-port` and `--user-data-dir` like
-Chromium does. When no Min is installed, the daemon downloads the official
-`min-<version>-amd64.deb` from GitHub and unpacks it into `~/.local/opt/min`
-(no root needed); `CU_MIN_AUTOINSTALL=0` turns that off, and an explicit
-`CU_BROWSER` still wins over the default.
+`cu` can run on **Min** (minbrowser.org) with `CU_MIN_DEFAULT=1` (or
+`CU_BROWSER=min`): same CDP endpoint, and it honours
+`--remote-debugging-port` and `--user-data-dir` like Chromium. When no Min is
+installed, the daemon downloads the official `min-<version>-amd64.deb` from
+GitHub and unpacks it into `~/.local/opt/min` (no root needed);
+`CU_MIN_AUTOINSTALL=0` turns that off.
 
-Min is Electron, so it has **no `--headless` mode**: the daemon always runs it
-windowed, on `CU_DISPLAY`, the inherited `DISPLAY`, or an Xvfb it starts
-itself (`Xvfb` on the `PATH`). `CU_HEADLESS=1` with Min is an error rather
-than a silently broken launch.
+Two Min caveats, and why it is not the default:
+
+- Min is Electron, so it has **no `--headless` mode**: the daemon runs it
+  windowed, on `CU_DISPLAY`, the inherited `DISPLAY`, or an Xvfb it starts
+  itself. `CU_HEADLESS=1` with Min is an error rather than a broken launch.
+- Electron refuses `Target.createTarget`, which is how cu opens its pages.
+  The daemon starts and lists targets fine, but `cu navigate` fails with
+  CDP `-32000 Not supported` until cu grows a target-reuse mode.
