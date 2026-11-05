@@ -1055,11 +1055,13 @@ impl Vault {
                 .first()
                 .and_then(|f| crate::server::json_string_value(f, "value"))
                 .and_then(|old_uri| crate::otp::parse(&old_uri).ok())
-                .map(|old| match (old.issuer.is_empty(), old.account.is_empty()) {
-                    (false, false) => format!("{}:{}", old.issuer, old.account),
-                    (false, true) => old.issuer,
-                    _ => old.account,
-                })
+                .map(
+                    |old| match (old.issuer.is_empty(), old.account.is_empty()) {
+                        (false, false) => format!("{}:{}", old.issuer, old.account),
+                        (false, true) => old.issuer,
+                        _ => old.account,
+                    },
+                )
                 .unwrap_or_else(|| "an unknown account".into());
             return Err(format!(
                 "this credential already holds a live TOTP seed for {account}; replacing an \

@@ -816,7 +816,10 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
 /// The CLI names its session in a header, and the daemon resolves the tab
 /// that session works in, in the same request.
 fn session_of(head: &str) -> Option<(u32, bool)> {
-    let pid = header_value(head, "x-cu-session")?.trim().parse::<u32>().ok()?;
+    let pid = header_value(head, "x-cu-session")?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
     let fresh = header_value(head, "x-cu-session-fresh")
         .map(|v| !v.trim().eq_ignore_ascii_case("0") && !v.trim().is_empty())
         .unwrap_or(false);
@@ -4083,10 +4086,7 @@ pub fn tabs_for_target(cdp_port: u16, id: &str) -> Vec<Tab> {
 /// ordering cannot move it under the agent's feet.
 fn pin_target(cdp_port: u16, id: &str) {
     let mut pinned = pinned_targets().lock().unwrap_or_else(|e| e.into_inner());
-    let moved = pinned
-        .get(&cdp_port)
-        .map(|p| p != id)
-        .unwrap_or(false);
+    let moved = pinned.get(&cdp_port).map(|p| p != id).unwrap_or(false);
     pinned.insert(cdp_port, id.to_string());
     drop(pinned);
     // The default tab now points at another page: what cu remembered about
@@ -4244,9 +4244,9 @@ fn context_download_dir(data: &Path, name: &str) -> PathBuf {
 /// a stale id is an error an agent can act on rather than a CDP failure.
 pub fn named_tab(cdp_port: u16, id: &str) -> Result<Tab, String> {
     let discovery = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")?;
-    let known = json_objects(&discovery).into_iter().any(|o| {
-        is_page(&o) && json_string_value(&o, "id").as_deref() == Some(id)
-    });
+    let known = json_objects(&discovery)
+        .into_iter()
+        .any(|o| is_page(&o) && json_string_value(&o, "id").as_deref() == Some(id));
     if !known {
         return Err("no such tab; see GET /v1/tabs".into());
     }

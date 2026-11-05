@@ -35,12 +35,11 @@
 //! Binary frame to the viewer: `0x01`, seq (u32 BE), CSS width (u16 BE), CSS
 //! height (u16 BE), then the JPEG. Everything else is a JSON text message.
 use crate::server::{
-    AppState, CdpConnection, Tab, form_value, json_string, json_string_value, json_value,
-    named_tab,
+    AppState, CdpConnection, Tab, form_value, json_string, json_string_value, json_value, named_tab,
 };
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -79,7 +78,11 @@ fn viewers() -> &'static Mutex<std::collections::HashMap<String, u64>> {
 
 /// The key of a tab in the viewer and control tables.
 fn key_of(tab: &Tab) -> String {
-    format!("{}:{}", tab.cdp_port, tab.target.as_deref().unwrap_or("default"))
+    format!(
+        "{}:{}",
+        tab.cdp_port,
+        tab.target.as_deref().unwrap_or("default")
+    )
 }
 
 /// Tabs a person holds through the viewer, with the viewer that holds each.
@@ -194,10 +197,20 @@ pub fn serve(mut stream: TcpStream, head: &str, path: &str, bearer_ok: bool, sta
     // It can never take control, and it does not push out a person who has.
     let readonly = form_value(query, "mode") == "view";
     if readonly && taken(&tab) {
-        return refuse(&mut stream, "409 Conflict", "a person is controlling this tab in another window");
+        return refuse(
+            &mut stream,
+            "409 Conflict",
+            "a person is controlling this tab in another window",
+        );
     }
-    let quality = form_value(query, "q").parse::<u32>().unwrap_or(60).clamp(20, 90);
-    let max_width = form_value(query, "w").parse::<u32>().unwrap_or(1280).clamp(320, 2560);
+    let quality = form_value(query, "q")
+        .parse::<u32>()
+        .unwrap_or(60)
+        .clamp(20, 90);
+    let max_width = form_value(query, "w")
+        .parse::<u32>()
+        .unwrap_or(1280)
+        .clamp(320, 2560);
 
     let accept = crate::server::base64_encode(&sha1(format!("{key}{GUID}").as_bytes()));
     if write!(
@@ -210,11 +223,16 @@ pub fn serve(mut stream: TcpStream, head: &str, path: &str, bearer_ok: bool, sta
     }
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(SILENT));
-    let Ok(writer) = stream.try_clone() else { return };
+    let Ok(writer) = stream.try_clone() else {
+        return;
+    };
 
     let me = VIEWER.fetch_add(1, Ordering::SeqCst) + 1;
     let tab_key = key_of(&tab);
-    viewers().lock().unwrap_or_else(|e| e.into_inner()).insert(tab_key.clone(), me);
+    viewers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(tab_key.clone(), me);
     let shared = Arc::new(Shared {
         writer: Mutex::new(writer),
         stop: AtomicBool::new(false),
@@ -230,7 +248,14 @@ pub fn serve(mut stream: TcpStream, head: &str, path: &str, bearer_ok: bool, sta
         let tab = tab.clone();
         let data_dir = state.data_dir.clone();
         std::thread::spawn(move || {
-            push_frames(&shared, &tab, quality, max_width, &data_dir, session_token.as_deref())
+            push_frames(
+                &shared,
+                &tab,
+                quality,
+                max_width,
+                &data_dir,
+                session_token.as_deref(),
+            )
         })
     };
     read_input(&mut stream, &shared, &tab);
@@ -395,7 +420,9 @@ fn push_frames(
             }
             let idle = acks
                 .front()
-                .map_or(Duration::from_millis(250), |(due, _)| due.saturating_duration_since(now))
+                .map_or(Duration::from_millis(250), |(due, _)| {
+                    due.saturating_duration_since(now)
+                })
                 .min(Duration::from_millis(250));
             match cdp.wait_event(idle, FRAME_LIMIT) {
                 Ok(Some(text)) if text.contains("\"Page.screencastFrame\"") => {
@@ -436,7 +463,10 @@ fn push_frames(
                     shared.controlling.store(false, Ordering::SeqCst);
                     give_back(shared);
                     // Closes the viewer's socket, which ends its reader too.
-                    let _ = shared.writer.lock().map(|w| w.shutdown(std::net::Shutdown::Both));
+                    let _ = shared
+                        .writer
+                        .lock()
+                        .map(|w| w.shutdown(std::net::Shutdown::Both));
                     break 'connection;
                 }
             }
@@ -456,7 +486,10 @@ fn push_frames(
 }
 
 fn fail(shared: &Shared, why: &str) {
-    shared.text(&format!("{{\"t\":\"error\",\"error\":{}}}", json_string(why)));
+    shared.text(&format!(
+        "{{\"t\":\"error\",\"error\":{}}}",
+        json_string(why)
+    ));
     shared.stop.store(true, Ordering::SeqCst);
 }
 
@@ -557,7 +590,11 @@ fn handle_message(msg: &str, shared: &Shared, tab: &Tab, focused: &mut bool) {
             if !*focused {
                 // A tab nobody is looking at ignores input; this one is being looked at.
                 dispatch(tab, "Page.bringToFront", "{}");
-                dispatch(tab, "Emulation.setFocusEmulationEnabled", "{\"enabled\":true}");
+                dispatch(
+                    tab,
+                    "Emulation.setFocusEmulationEnabled",
+                    "{\"enabled\":true}",
+                );
                 *focused = true;
             }
             let (w, h) = *shared.size.lock().unwrap_or_else(|e| e.into_inner());
@@ -626,7 +663,11 @@ fn handle_message(msg: &str, shared: &Shared, tab: &Tab, focused: &mut bool) {
                     // Whole strings (mobile keyboards, IME, paste) go in as inserted text.
                     let text = json_string_value(msg, "text").unwrap_or_default();
                     if !text.is_empty() && text.len() <= 4096 {
-                        dispatch(tab, "Input.insertText", &format!("{{\"text\":{}}}", json_string(&text)));
+                        dispatch(
+                            tab,
+                            "Input.insertText",
+                            &format!("{{\"text\":{}}}", json_string(&text)),
+                        );
                     }
                 }
             }
@@ -686,7 +727,12 @@ fn sha1(data: &[u8]) -> [u8; 20] {
     for chunk in msg.chunks(64) {
         let mut w = [0u32; 80];
         for i in 0..16 {
-            w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
+            w[i] = u32::from_be_bytes([
+                chunk[4 * i],
+                chunk[4 * i + 1],
+                chunk[4 * i + 2],
+                chunk[4 * i + 3],
+            ]);
         }
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
@@ -699,7 +745,12 @@ fn sha1(data: &[u8]) -> [u8; 20] {
                 40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
                 _ => (b ^ c ^ d, 0xCA62C1D6),
             };
-            let t = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*wi);
+            let t = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*wi);
             e = d;
             d = c;
             c = b.rotate_left(30);
@@ -730,7 +781,11 @@ pub fn frame_ancestors() -> String {
             && h.chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
     });
-    if ok { raw.to_string() } else { "'none'".to_string() }
+    if ok {
+        raw.to_string()
+    } else {
+        "'none'".to_string()
+    }
 }
 
 /// The viewer page in control mode. The HTML ships read-only

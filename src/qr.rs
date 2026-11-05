@@ -136,4 +136,3 @@ pub fn render_svg(uri: &str) -> Result<String, String> {
         .quiet_zone(true)
         .build())
 }
-

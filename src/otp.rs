@@ -227,4 +227,3 @@ fn hex(c: u8) -> Option<u8> {
         _ => None,
     }
 }
-

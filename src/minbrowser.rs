@@ -57,8 +57,7 @@ pub fn active() -> bool {
 /// loads from its install (`file://…/resources/app/…`, e.g. the history
 /// service). cu never drives these, lists them, or counts them as tabs.
 pub fn is_ui_url(url: &str) -> bool {
-    url.starts_with("min://")
-        || (url.starts_with("file://") && url.contains("/resources/app/"))
+    url.starts_with("min://") || (url.starts_with("file://") && url.contains("/resources/app/"))
 }
 
 /// CDP target id -> Min's own tab id, for the tabs cu opened. Min's ids are
