@@ -326,8 +326,15 @@ fn cdp_port_from_env() -> Option<u16> {
     env::var("CU_CDP_PORT").ok().and_then(|p| p.parse().ok())
 }
 
+/// HTTP port requested through the environment (`CU_PORT`), if it parses: a
+/// second cu (another browser, another data dir) next to the user's own one
+/// without a `--port` on every start.
+fn port_from_env() -> Option<u16> {
+    env::var("CU_PORT").ok().and_then(|p| p.parse().ok())
+}
+
 fn start(args: &[String]) -> Result<(), String> {
-    let mut port = DEFAULT_PORT;
+    let mut port = port_from_env().unwrap_or(DEFAULT_PORT);
     let mut mode = BrowserMode::from_env()?;
     let mut data = PathBuf::from(env::var_os("CU_DATA_DIR").unwrap_or_else(|| ".cu".into()));
     let mut webgl = false;
@@ -771,7 +778,10 @@ fn ensure_daemon() -> Result<(), String> {
     // On a host with the `cu.service` unit installed, systemd is the owner:
     // starting it there survives reboots and logouts, so prefer it and fall
     // back to a detached spawn only where systemctl is not usable.
-    if std::path::Path::new("/etc/systemd/system/cu.service").exists() {
+    // The unit runs the canonical daemon: a `CU_DAEMON_DIR` one is not it.
+    if env::var_os("CU_DAEMON_DIR").is_none()
+        && std::path::Path::new("/etc/systemd/system/cu.service").exists()
+    {
         let _ = Command::new("sudo")
             .args(["-n", "systemctl", "start", "cu"])
             .status();
@@ -808,7 +818,10 @@ fn ensure_daemon() -> Result<(), String> {
     }
     cmd.spawn()
         .map_err(|e| format!("could not spawn the daemon: {e}"))?;
-    eprintln!("cu: the daemon was not running; starting it (~/.cu/daemon)...");
+    eprintln!(
+        "cu: the daemon was not running; starting it ({})...",
+        dir.display()
+    );
     let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
         if let Ok(config) = fs::read_to_string(dir.join("server.json"))
@@ -992,8 +1005,8 @@ fn session(args: &[String]) -> Result<(), String> {
 /// while something else holds it; the DevTools port is picked free the same
 /// way, so two daemons (this one and any legacy instance) never collide.
 fn daemon(args: &[String]) -> Result<(), String> {
-    let mut port = DAEMON_PORT;
-    let mut cdp_port = None;
+    let mut port = port_from_env().unwrap_or(DAEMON_PORT);
+    let mut cdp_port = cdp_port_from_env();
     let mut data = daemon_dir();
     let mut i = 0;
     while i < args.len() {

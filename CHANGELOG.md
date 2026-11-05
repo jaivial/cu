@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **`CU_PORT`** sets the HTTP port of `cu start` and `cu daemon`, and
+  `CU_CDP_PORT` now applies to `cu daemon` too: with `CU_DAEMON_DIR` a second,
+  isolated daemon (e.g. `cu-slim`, on slimium's `slimium-chrome`) runs beside
+  the canonical one. A daemon auto-started for a `CU_DAEMON_DIR` no longer
+  asks systemd for the canonical `cu` unit.
+
 ## [1.9.0] - 2026-11-05
 
 ### Changed

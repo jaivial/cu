@@ -215,7 +215,7 @@ capture). The price: a page that animates is then rendered as fast as the CPU
 allows -- 2.4 cores on a host without a GPU, in a headless browser. A
 windowed browser keeps the display's rate either way.
 
-The browser executable defaults to `chromium`; set `CU_BROWSER` to an alternate binary. Browsers are launched headless, which is what an agent usually wants; set `CU_HEADLESS=0` to attach a display instead. `CU_DATA_DIR` changes the default data directory and `CU_CDP_PORT` the DevTools port (default `9222`). Do not expose this server beyond localhost without adding TLS and an access-control layer; the one supported exposure is the login form behind a reverse proxy (see *Public login URL*).
+The browser executable defaults to `chromium`; set `CU_BROWSER` to an alternate binary. Browsers are launched headless, which is what an agent usually wants; set `CU_HEADLESS=0` to attach a display instead. `CU_DATA_DIR` changes the default data directory, `CU_PORT` the HTTP port (default `8787` for `cu start`, `8810` for `cu daemon`) and `CU_CDP_PORT` the DevTools port (default `9222`; `cu daemon` otherwise picks a free one from `9362`). With `CU_DAEMON_DIR` (the daemon's data directory) plus `CU_PORT` and `CU_CDP_PORT`, a second daemon -- another browser build, such as slimium's `slimium-chrome` -- runs next to the canonical one and every CLI call made with the same environment goes to it. Do not expose this server beyond localhost without adding TLS and an access-control layer; the one supported exposure is the login form behind a reverse proxy (see *Public login URL*).
 
 ### Browser mode: fast-test and compatibility
 
