@@ -1,5 +1,114 @@
 # Changelog
 
+## [1.10.0] - 2026-11-06
+
+### Added
+
+- **`CU_PORT`** sets the HTTP port of `cu start` and `cu daemon`, and
+  `CU_CDP_PORT` now applies to `cu daemon` too: with `CU_DAEMON_DIR` a second,
+  isolated daemon (e.g. `cu-slim`, on slimium's `slimium-chrome`) runs beside
+  the canonical one. A daemon auto-started for a `CU_DAEMON_DIR` no longer
+  asks systemd for the canonical `cu` unit.
+- **JavaScript dialogs are answered, always.** cu had no dialog handling at
+  all: Instagram's story editor arms a `beforeunload` handler, and after the
+  editor was discarded the next navigation opened a "Leave site?" dialog
+  nobody answered. The tab was then stopped -- every command on it, even
+  `cu eval document.title`, failed after 5 s with "Resource temporarily
+  unavailable (os error 11)", `cu act emulate` too -- and so was every tab
+  sharing its renderer process. Now every tab cu works in has a keeper
+  session with `Page` enabled whose thread reads the tab's events and answers
+  `Page.javascriptDialogOpening` by policy as it opens, between commands too:
+  `beforeunload`=accept, `alert`=accept, `confirm`=dismiss, `prompt`=dismiss.
+  `manual` leaves a dialog open: commands on the tab fail at once (409) naming
+  it, including the one that opened it, until `cu dialog accept [TEXT]` /
+  `cu dialog dismiss`. Policy per daemon (`CU_DIALOGS="beforeunload=accept,confirm=manual"`,
+  `all=manual`) and per tab (`cu dialog policy SPEC`). Every dialog is logged
+  (bounded, message cut to 200 characters): `cu dialog` (`GET /v1/dialog`),
+  `cu console --level dialog`, and `"dialogs":[...]` in the reply of the
+  action it happened under. A dialog that opened before cu watched a tab
+  cannot be answered by any session (Chromium 156, measured); cu says so and
+  `cu tabs close` still closes the tab. New routes `GET /v1/dialog`,
+  `POST /v1/dialog/accept|dismiss|policy`, MCP tool `dialog`.
+  (`src/keeper.rs`, `src/dialogs.rs`)
+
+### Fixed
+
+- **A stopped browser no longer fills up with tabs, and an exited session's
+  tabs are collected.** While tabs were stopped by a dialog, repeated calls
+  left ~100 extra `about:blank` tabs and several old ones behind. Causes,
+  each fixed: a script's `$(cu ...)` (or pipeline) ran cu in a forked
+  subshell, which was taken for a session of its own -- a fresh tab per call,
+  and with a dialog stopping the shared renderer each of those tabs was
+  stopped too; the subshell is now seen through. A failed or cut-off `/json`
+  read (`http_get` hands back what arrived on a timeout) was taken for "no
+  tabs" and dropped every lease of the session; it is now "unknown" and
+  drops nothing. A session pid from another pid namespace (a sandboxed
+  agent) was looked up in the daemon's `/proc` -- dead (a fresh tab each
+  call) or an unrelated live process (never collected); the CLI and `cu mcp`
+  now send `X-Cu-Session-Ns` and such a session keeps its tab, collected
+  after ten idle minutes. A pid reused by a later process is no longer its
+  predecessor's owner (start time checked). Tabs of exited sessions were
+  only collected ten minutes after the last use, by a sweep every minute;
+  now after one idle minute, checked every 10 s and before any new tab is
+  opened, and even when a dialog stops them (`Target.closeTarget` needs no
+  cooperation from the page). Leases are per browser port.
+
+### Changed
+
+- **One keeper session per tab.** Emulation's keeper, the console capture's
+  registration connection and the dialog watcher are now the same DevTools
+  session (`src/keeper.rs`): one idle socket and one blocked reader thread per
+  tab instead of up to two silent connections. `desktop` resets the
+  overrides on it and leaves it open.
+
+- **`emulate` is a whole phone, and it stays on.** `{"do":"emulate","mode":"mobile"}`
+  set the viewport and touch but left `screen.orientation`
+  `landscape-primary`, the screen the desktop's and the User-Agent the
+  desktop's, so Instagram's web story editor answered "Rotate your device"
+  and its home page a tablet-app upsell. Now a phone (and a tablet) is the
+  full set: `screenWidth`/`screenHeight`, `screenOrientation` (portrait, or
+  landscape at 90 degrees when wider than tall), device pixel ratio 3 for a
+  phone and 2 for a tablet, touch with 5 points, and an Android Chrome
+  User-Agent of the running build with matching `userAgentMetadata` (an
+  override without it empties `navigator.userAgentData`). `desktop` gives
+  back the browser's own window and cu's own User-Agent exactly. New
+  optional step fields: `orientation` (`portrait` | `landscape`) and
+  `scale`; the step answers what is in force as its `value`. Existing steps
+  parse as before. (`src/emulation.rs`, `src/actions.rs`)
+- **The emulation survives the page and the daemon's connections.**
+  Chromium drops a DevTools session's overrides when its socket closes, and
+  the overrides were set on a pooled connection -- which the daemon drops
+  when a navigation outlasts the settle budget. A tab now keeps its device on
+  a connection of its own, re-applied if that connection dies, so reloads the
+  page makes itself and later `snapshot`/`click`/`eval`/`text`/`shot` keep
+  it. `cu shot --width/--scale` on an emulated tab puts the whole device back
+  afterwards instead of a measured viewport.
+- **A click on an emulated touch device is a tap** (`Input.dispatchTouchEvent`:
+  `pointerdown` of type `touch`, `touchstart`, then the click), sent after
+  bringing the tab to the front; `Emulation.setEmitTouchEventsForMouse` is
+  not used.
+
+### Tests
+
+- `tests/emulate_real_browser.sh`: an isolated daemon (ports 8795/9395) on a
+  real Chromium and a local fixture that reloads itself after a click.
+  The fake browser now drops a connection's overrides when it closes, like
+  Chromium.
+- `tests/dialog_real_browser.sh`: an isolated daemon (ports 8796/9396) on a
+  real Chromium and a local fixture (9598) whose buttons arm `beforeunload`
+  and open `alert`/`confirm`/`prompt`, plus a page that shows an alert before
+  cu watches it; it also counts tabs across failing calls and times the
+  collection of an exited session's tab.
+- The fake browser emits `Page.javascriptDialogOpening`/`Closed` to the
+  sessions that had `Page` enabled, stops renderer commands (and a fresh
+  `Page.enable`) while a dialog is open, accepts `Page.handleJavaScriptDialog`
+  only from an eligible session, and closes a target's sessions on
+  `Target.closeTarget`. Integration tests: beforeunload on navigate, the
+  alert/confirm/prompt policies, manual fast-fail and `cu dialog
+  accept|dismiss`, the console's `dialog` level, an unwatched dialog, a
+  stopped session never getting another tab, an exited session's stopped tab
+  collected, a foreign pid namespace, and `$(cu ...)` subshells sharing a tab.
+
 ## [1.9.0] - 2026-11-05
 
 ### Changed

@@ -159,6 +159,107 @@ result starts a download instead of changing the page reports
 `"download":"file.name"` with `navigated:false`, and a click that opens a
 window or tab reports `"popup":true` -- run `GET /v1/tabs` to see it.
 
+### Phone and tablet emulation
+
+`{"do":"emulate","mode":"mobile"}` turns the tab into a phone, as a site that
+checks for one sees it: a 390x844 viewport and a screen of the same size,
+`screen.orientation` `portrait-primary` (angle 0), device pixel ratio 3,
+`mobile` layout (meta viewport, overlay scrollbars), touch with
+`maxTouchPoints` 5, and an Android Chrome User-Agent built from the running
+browser's own version (`Mozilla/5.0 (Linux; Android 14; Pixel 8) ...
+Chrome/156.0.0.0 Mobile Safari/537.36`) with client hints that agree:
+`navigator.userAgentData` says `mobile: true`, platform `Android` 14.0.0,
+model `Pixel 8`, and the same `Chromium` and GREASE brands this build reports.
+The Accept-Language stays the one the browser was launched with.
+
+| step | device |
+| --- | --- |
+| `{"do":"emulate","mode":"mobile"}` | 390x844, 3x, phone UA |
+| `{"do":"emulate","mode":"tablet"}` | 820x1180, 2x, Android tablet UA (no `Mobile`) |
+| `{"do":"emulate","mode":"custom","width":412,"height":915}` | the given size; phone below 820 px wide (3x), tablet otherwise (2x) |
+| `{"do":"emulate","mode":"desktop"}` | off: the browser's own window and cu's own User-Agent |
+
+Optional fields: `"orientation":"portrait"|"landscape"` turns the device (the
+sides swap when they do not match; without it a device wider than tall is
+`landscape-primary` at 90 degrees) and `"scale"` sets the device pixel ratio
+(above 0, up to 4). The step's `value` says what is in force, e.g.
+`390x844 @3x portrait, mobile, touch, Android Chrome 156 (Pixel 8)`.
+
+The emulation stays on until `desktop`: through reloads and navigations the
+page makes itself, and through every later command of the session
+(`snapshot`, `click`, `eval`, `text`, `shot`). Chromium drops a DevTools
+session's overrides when that session's socket closes, so the device is held
+by the tab's keeper session (the one that also answers its
+[JavaScript dialogs](#javascript-dialogs)) rather than by the pooled ones
+(which the daemon drops when a navigation outlasts the settle budget); if that
+session dies anyway the device is put back before the next command.
+`cu shot --width/--height/--scale` on an emulated tab captures at its own size
+and then puts the whole device back. On an emulated tab `click` is a finger:
+a touch start and end (`pointerdown` with `pointerType` `touch`,
+`touchstart`, then the `click` a tap produces), after bringing the tab to the
+front. The emulation belongs to the tab: a popup it opens is not emulated.
+`bash tests/emulate_real_browser.sh` checks all of it against a real Chromium
+on a local fixture, with an isolated daemon.
+
+### JavaScript dialogs
+
+An unanswered `alert`, `confirm`, `prompt` or "Leave site?" (`beforeunload`)
+dialog stops the page's renderer: every later command on the tab waits out
+its read timeout (`Resource temporarily unavailable (os error 11)` after 5 s),
+and so does every other tab sharing that renderer process -- a fresh
+`about:blank` tab included (measured on Chromium 156 with one renderer). cu
+answers them as they open, whether or not a command is running: every tab cu
+works in has a *keeper*, one DevTools session with `Page` enabled whose
+thread reads the tab's events and answers `Page.javascriptDialogOpening` on
+that same session (Chromium lets only a session that was watching when the
+dialog opened answer it). The same session holds the tab's emulation and its
+console capture, so it is one idle socket and one blocked thread per tab.
+New tabs a session opens are watched from birth, and popups of watched tabs
+from the moment they exist.
+
+| dialog | default | why |
+| --- | --- | --- |
+| `beforeunload` | accept | the agent asked to leave (a `navigate` away from an editor) |
+| `alert` | accept | nothing else to do with it |
+| `confirm` | dismiss | "no" to what the page asks to do |
+| `prompt` | dismiss | no text is made up |
+
+Each dialog is logged per tab (the last 20: type, message cut to 200
+characters, URL cut to origin and path, what was done, by whom, when) and
+shown three ways: `cu dialog` (`GET /v1/dialog`), `cu console --level dialog`
+(lines `#dN ... DIALOG ...`; `--level all` and `warn+` include them), and in
+the reply of the action it happened under (`navigate`, `act`, `click`,
+`type`, `upload` answer `"dialogs":[...]`).
+
+`manual` leaves a dialog open for the agent. Commands on its tab then fail at
+once (`409`) with an error naming it -- the command that opened it too,
+instead of waiting out its timeout -- until it is answered:
+
+```sh
+cu dialog                      # the dialog waiting (if any), the policy, the log
+cu dialog accept [TEXT]        # accept; TEXT answers a prompt (never logged)
+cu dialog dismiss              # dismiss (for beforeunload: stay on the page)
+cu dialog policy confirm=manual,beforeunload=accept   # this tab's own policy
+cu dialog policy default       # back to the daemon's
+```
+
+The routes are `GET /v1/dialog`, `POST /v1/dialog/accept` (`{"text":..}`),
+`POST /v1/dialog/dismiss` and `POST /v1/dialog/policy` (`{"policy":"SPEC"}`),
+all taking `?tab=`/`?context=`; MCP has the `dialog` tool. The daemon's own
+policy is `CU_DIALOGS`, the same spec: `KIND=ANSWER` pairs with KIND `alert`,
+`confirm`, `prompt`, `beforeunload` or `all` and ANSWER `accept`, `dismiss` or
+`manual` (`CU_DIALOGS=all=manual`, `CU_DIALOGS=confirm=accept`).
+
+What cannot be done: a dialog that opened before cu watched the tab (a tab
+cu never touched, one from before the daemon started) cannot be answered by
+any DevTools session, and a fresh session's `Page.enable` blocks while it is
+up. cu notices -- the first command on such a tab waits 3 s for the watcher,
+later ones fail at once -- and says so; `cu tabs close ID` closes it
+(`Target.closeTarget` does not need the page; the tabs sharing its renderer
+answer again). A command that times out while some tab has a dialog waiting
+for an answer gets a `hint` naming it. `bash tests/dialog_real_browser.sh`
+checks all of it on a real Chromium with an isolated daemon.
+
 ### Contexts
 
 Add `?context=NAME` to navigate, snapshot, screenshot or act to work in an
@@ -189,6 +290,20 @@ just opened, for instance. `DELETE /v1/tabs/ID` (`cu tabs close ID`,
 `Client::close_tab`) closes one; the last tab is refused, because
 Chromium exits with it. Giving both `?context=` and `?tab=` is an error.
 
+A page command without `--tab` works in the tab its session already has
+(the session is the CLI's nearest ancestor that is not a one-shot shell
+(`sh -c`), a forked subshell (`$(cu ...)`, a pipeline) or a wrapper such as
+`timeout`). That tab is handed back even when it is stopped -- the command
+then fails with the reason -- never replaced by a fresh one: a fresh tab per
+failing call is how a browser stopped by a dialog used to fill up with
+`about:blank` tabs. A failed or cut-off `/json` read no longer drops a
+session's tab either. Tabs of a session that has exited are closed by the
+daemon once they have been idle a minute (checked every 10 s, and before any
+new tab is opened), even when a dialog stops them. A CLI in another pid
+namespace than the daemon (a sandbox or container) sends its namespace
+(`X-Cu-Session-Ns`): its pid cannot be looked up, so it keeps its tab and the
+tab is collected after ten idle minutes instead.
+
 ### Downloads
 
 Downloads land in `<data>/downloads`, not in the user's real Downloads
@@ -215,7 +330,7 @@ capture). The price: a page that animates is then rendered as fast as the CPU
 allows -- 2.4 cores on a host without a GPU, in a headless browser. A
 windowed browser keeps the display's rate either way.
 
-The browser executable defaults to `chromium`; set `CU_BROWSER` to an alternate binary. Browsers are launched headless, which is what an agent usually wants; set `CU_HEADLESS=0` to attach a display instead. `CU_DATA_DIR` changes the default data directory and `CU_CDP_PORT` the DevTools port (default `9222`). Do not expose this server beyond localhost without adding TLS and an access-control layer; the one supported exposure is the login form behind a reverse proxy (see *Public login URL*).
+The browser executable defaults to `chromium`; set `CU_BROWSER` to an alternate binary. Browsers are launched headless, which is what an agent usually wants; set `CU_HEADLESS=0` to attach a display instead. `CU_DATA_DIR` changes the default data directory, `CU_PORT` the HTTP port (default `8787` for `cu start`, `8810` for `cu daemon`) and `CU_CDP_PORT` the DevTools port (default `9222`; `cu daemon` otherwise picks a free one from `9362`). With `CU_DAEMON_DIR` (the daemon's data directory) plus `CU_PORT` and `CU_CDP_PORT`, a second daemon -- another browser build, such as slimium's `slimium-chrome` -- runs next to the canonical one and every CLI call made with the same environment goes to it. Do not expose this server beyond localhost without adding TLS and an access-control layer; the one supported exposure is the login form behind a reverse proxy (see *Public login URL*).
 
 ### Browser mode: fast-test and compatibility
 
@@ -480,11 +595,12 @@ is dropped and the next call opens a fresh one, and says so.
 | `screenshot` | `GET /v1/screenshot` | an image block; `path` saves it, `inline: false` only saves |
 | `tabs`, `close_tab` | `GET /v1/tabs`, `DELETE /v1/tabs/ID` | popups and extra tabs |
 | `close_context` | `DELETE /v1/contexts/NAME` | drop a context a page tool opened |
-| `console` | `GET /v1/console` | console, exceptions, CSP and network failures |
+| `console` | `GET /v1/console` | console, exceptions, CSP and network failures, and (level `dialog`) the JavaScript dialogs cu answered |
 | `inspect`, `mark`, `marks` | `/v1/inspect`, `/v1/marks` | visual QA references and the report |
 | `upload` | `POST /v1/act` (`upload` step) | files into a file input; paths (here and in `act` upload steps) resolve against the server's working directory |
 | `downloads` | `GET /v1/downloads` | finished downloads |
 | `handoff` | `/v1/handoff`, `/v1/challenge` | hand-off state, `wait`, `release` |
+| `dialog` | `/v1/dialog` | JavaScript dialogs: the log and policy, `answer` (accept/dismiss, `text`), `policy` |
 | `session_save`, `session_load` | `POST /v1/session/NAME` | saved logins |
 | `login_url` | (none) | the login form's link for the person |
 

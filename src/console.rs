@@ -16,8 +16,8 @@
 //! turns the capture off for a session that must not touch the page's console.
 
 use crate::server::{Tab, json_string};
-use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 /// Levels, in the order `warn+` expands from.
 pub const LEVELS: &[&str] = &[
@@ -30,6 +30,7 @@ pub const LEVELS: &[&str] = &[
     "exception",
     "csp",
     "network",
+    "dialog",
 ];
 
 /// `--level` as the list of levels it names. `all` and empty mean every
@@ -177,81 +178,60 @@ pub const CONSOLE_JS: &str = r##"(function () {
   } });
 })();"##;
 
-fn registered() -> &'static Mutex<HashSet<Tab>> {
-    static SET: OnceLock<Mutex<HashSet<Tab>>> = OnceLock::new();
-    SET.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
 pub fn disabled() -> bool {
     std::env::var("CU_CONSOLE").is_ok_and(|v| v.eq_ignore_ascii_case("off"))
 }
 
 /// Register the capture for every document this tab loads from now on, once
-/// per tab. Best effort: a navigation must never fail over console capture.
+/// per keeper session. Best effort: a navigation must never fail over console
+/// capture.
+///
+/// `addScriptToEvaluateOnNewDocument` lives and dies with the DevTools
+/// session that registered it, and the pooled connections come and go. So
+/// it is registered on the tab's keeper ([`crate::keeper`]), the session held
+/// open for as long as the tab lives (which also watches it for dialogs);
+/// a new keeper registers it again.
 pub fn ensure(tab: &Tab) {
     if disabled() {
         return;
     }
-    {
-        let mut set = registered().lock().unwrap_or_else(|e| e.into_inner());
-        if !set.insert(tab.clone()) {
-            return;
-        }
+    let Ok(keeper) = crate::keeper::ensure(tab) else {
+        return;
+    };
+    if keeper.console.swap(true, Ordering::SeqCst) {
+        return;
     }
-    // `addScriptToEvaluateOnNewDocument` lives and dies with the DevTools
-    // connection that registered it, and the pooled connections come and go.
-    // So a connection of its own holds the registration open for as long as
-    // the tab lives, and the entry is dropped when that connection ends.
-    let tab = tab.clone();
     let params = format!(
         "{{\"source\":{},\"runImmediately\":true}}",
         json_string(CONSOLE_JS)
     );
-    let (tx, rx) = std::sync::mpsc::channel::<bool>();
-    let owner = tab.clone();
-    std::thread::spawn(move || {
-        let mut connection = match crate::server::CdpConnection::open(&owner) {
-            Ok(c) => c,
-            Err(_) => {
-                let _ = tx.send(false);
-                return;
-            }
-        };
-        // Chromium registers the script only for a session with the Page
-        // agent enabled (`Page.enable` is not `Runtime.enable`: nothing in
-        // the page can see it).
-        let _ = connection.call("Page.enable", "{}");
-        if connection
-            .call("Page.addScriptToEvaluateOnNewDocument", &params)
-            .is_err()
-        {
-            let _ = tx.send(false);
-            return;
-        }
-        let _ = tx.send(true);
-        loop {
-            let started = std::time::Instant::now();
-            let deadline = started + std::time::Duration::from_secs(300);
-            let _ = connection.pump_events(deadline, &mut |_| false);
-            // A read that ends at once is a closed socket, not a quiet page.
-            if started.elapsed() < std::time::Duration::from_secs(2) {
-                break;
-            }
-        }
-        registered()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&owner);
-    });
-    if !rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .unwrap_or(false)
-    {
-        registered()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&tab);
+    let registered = keeper
+        .call(
+            "Page.addScriptToEvaluateOnNewDocument",
+            &params,
+            Duration::from_secs(5),
+        )
+        .is_ok_and(|reply| !reply.contains("\"error\":{"));
+    if !registered {
+        keeper.console.store(false, Ordering::SeqCst);
     }
+}
+
+/// The tab's dialogs (see [`crate::dialogs`]) that the level and grep
+/// filters let through: the `dialog` level of `cu console`.
+fn dialog_entries(tab: &Tab, levels: &[String], grep: &str) -> Vec<crate::dialogs::Entry> {
+    if !levels.is_empty() && !levels.iter().any(|l| l == "dialog") {
+        return Vec::new();
+    }
+    let grep = grep.to_lowercase();
+    crate::dialogs::entries(tab)
+        .into_iter()
+        .filter(|e| {
+            grep.is_empty()
+                || e.message.to_lowercase().contains(&grep)
+                || e.kind.name().contains(&grep)
+        })
+        .collect()
 }
 
 /// Read (and optionally clear) the buffer. `text` gives lines, otherwise JSON.
@@ -270,6 +250,33 @@ pub fn read(
             "application/json",
             "{\"error\":\"console capture is off (CU_CONSOLE=off)\"}".into(),
         );
+    }
+    let dialogs = dialog_entries(tab, levels, grep);
+    // A page stopped by a dialog cannot be read: answer from what the
+    // daemon knows, the dialogs.
+    if let Some(why) = crate::dialogs::blocked(tab) {
+        return if text {
+            let mut out = format!("(the page cannot be read: {why})\n");
+            for entry in &dialogs {
+                out.push_str(&entry.line());
+                out.push('\n');
+            }
+            ("200 OK", "text/plain; charset=utf-8", out)
+        } else {
+            (
+                "200 OK",
+                "application/json",
+                format!(
+                    "{{\"entries\":[],\"blocked\":{},\"dialogs\":[{}]}}",
+                    json_string(&why),
+                    dialogs
+                        .iter()
+                        .map(|e| e.json())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            )
+        };
     }
     ensure(tab);
     let lv = format!(
@@ -299,8 +306,20 @@ pub fn read(
     );
     match tab.command("Runtime.evaluate", &params) {
         Ok(reply) => match crate::server::evaluated_string(&reply) {
-            Some(v) if text => ("200 OK", "text/plain; charset=utf-8", v),
-            Some(v) => ("200 OK", "application/json", v),
+            Some(mut v) if text => {
+                for entry in &dialogs {
+                    v.push('\n');
+                    v.push_str(&entry.line());
+                }
+                ("200 OK", "text/plain; charset=utf-8", v)
+            }
+            Some(mut v) => {
+                if !dialogs.is_empty() && v.ends_with('}') {
+                    let list: Vec<String> = dialogs.iter().map(|e| e.json()).collect();
+                    v.insert_str(v.len() - 1, &format!(",\"dialogs\":[{}]", list.join(",")));
+                }
+                ("200 OK", "application/json", v)
+            }
             None => (
                 "502 Bad Gateway",
                 "application/json",

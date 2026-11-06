@@ -56,9 +56,12 @@ pub enum Action {
     },
     /// Put local files on a file input. `reference` is the input or the
     /// visible control that opens the picker (the input itself is usually
-    /// `display:none`); `None` means the page's only file input.
+    /// `display:none`); `selector` names it (or such a control) by CSS
+    /// instead, for pages with several hidden inputs and no ref near them;
+    /// neither means the page's only file input.
     Upload {
         reference: Option<String>,
+        selector: Option<String>,
         files: Vec<String>,
     },
     /// Mouse-wheel scroll by `dx`/`dy` CSS px at the viewport centre (or over `ref`),
@@ -86,12 +89,16 @@ pub enum Action {
     Eval {
         js: String,
     },
-    /// Device emulation: `mobile` (390x844 touch), `tablet`, `desktop` (clears it),
-    /// or explicit `width`/`height`.
+    /// Device emulation: `mobile` (390x844 at 3x, portrait, touch, Android
+    /// Chrome UA), `tablet` (820x1180 at 2x), `desktop` (turns it off) or
+    /// `custom` `width`/`height`; `orientation` (portrait | landscape) and
+    /// `scale` (device pixel ratio) are optional. See [`crate::emulation`].
     Emulate {
         mode: String,
-        width: u32,
-        height: u32,
+        width: Option<u32>,
+        height: Option<u32>,
+        orientation: Option<String>,
+        scale: Option<f64>,
     },
 }
 
@@ -210,18 +217,26 @@ pub fn parse_action(object: &str) -> Result<Action, String> {
         }
         "emulate" => {
             let mode = json_string_value(object, "mode").unwrap_or_else(|| "mobile".into());
-            if !["mobile", "tablet", "desktop", "custom"].contains(&mode.as_str()) {
-                return Err("emulate \"mode\" must be mobile, tablet, desktop or custom".into());
-            }
-            let n = |k: &str, d: u32| {
-                json_value(object, k)
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(d)
+            let side = |k: &str| -> Result<Option<u32>, String> {
+                match crate::server::json_number(object, k) {
+                    None => Ok(None),
+                    Some(n) if n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64 => {
+                        Ok(Some(n as u32))
+                    }
+                    Some(n) => Err(format!("emulate \"{k}\" must be whole CSS pixels, got {n}")),
+                }
             };
+            let (width, height) = (side("width")?, side("height")?);
+            let orientation = json_string_value(object, "orientation");
+            let scale = crate::server::json_number(object, "scale");
+            // Checked here, so a bad step fails the batch before it starts.
+            crate::emulation::Device::plan(&mode, width, height, orientation.as_deref(), scale)?;
             Action::Emulate {
                 mode,
-                width: n("width", 390),
-                height: n("height", 844),
+                width,
+                height,
+                orientation,
+                scale,
             }
         }
         "wait" => Action::Wait {
@@ -259,7 +274,15 @@ pub fn parse_action(object: &str) -> Result<Action, String> {
                         .map_err(|_| format!("{f}: path is not UTF-8"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Action::Upload { reference, files }
+            let selector = json_string_value(object, "selector").filter(|s| !s.trim().is_empty());
+            if reference.is_some() && selector.is_some() {
+                return Err("upload takes \"ref\" or \"selector\", not both".into());
+            }
+            Action::Upload {
+                reference,
+                selector,
+                files,
+            }
         }
         other => return Err(format!("unknown action \"{other}\"")),
     })
@@ -764,8 +787,12 @@ impl Page {
                 std::thread::sleep(Duration::from_millis(*ms).min(MAX_WAIT));
                 false
             }
-            Action::Upload { reference, files } => {
-                self.upload(reference.as_deref(), files)?;
+            Action::Upload {
+                reference,
+                selector,
+                files,
+            } => {
+                self.upload(reference.as_deref(), selector.as_deref(), files)?;
                 false
             }
             Action::Scroll {
@@ -850,8 +877,10 @@ impl Page {
                 mode,
                 width,
                 height,
+                orientation,
+                scale,
             } => {
-                self.emulate(mode, *width, *height)?;
+                value = self.emulate(mode, *width, *height, orientation.as_deref(), *scale)?;
                 false
             }
         };
@@ -917,30 +946,36 @@ impl Page {
         Ok(())
     }
 
-    fn emulate(&mut self, mode: &str, width: u32, height: u32) -> Result<(), String> {
-        if mode == "desktop" {
-            self.conn()
-                .call("Emulation.clearDeviceMetricsOverride", "{}")?;
-            self.conn()
-                .call("Emulation.setTouchEmulationEnabled", "{\"enabled\":false}")?;
-            return Ok(());
+    /// Emulate a device on this tab, or turn emulation off (`desktop`).
+    ///
+    /// The device is held by a DevTools connection of its own (see
+    /// [`crate::emulation`]), not by this batch's pooled one: Chromium drops
+    /// a session's overrides when its socket closes, and a pooled socket is
+    /// dropped whenever a navigation outlasts the settle budget. Answers a
+    /// line saying what is in force, as the step's `value`.
+    fn emulate(
+        &mut self,
+        mode: &str,
+        width: Option<u32>,
+        height: Option<u32>,
+        orientation: Option<&str>,
+        scale: Option<f64>,
+    ) -> Result<Option<String>, String> {
+        match crate::emulation::Device::plan(mode, width, height, orientation, scale)? {
+            Some(device) => crate::emulation::apply(&self.tab, device).map(Some),
+            None => {
+                crate::emulation::clear(&self.tab);
+                // An override some other session set (an older cu, another
+                // tool) is cleared too, as `desktop` always did.
+                self.conn()
+                    .call("Emulation.clearDeviceMetricsOverride", "{}")?;
+                self.conn()
+                    .call("Emulation.setTouchEmulationEnabled", "{\"enabled\":false}")?;
+                Ok(Some(
+                    "desktop: the browser's own window and User-Agent".into(),
+                ))
+            }
         }
-        let (w, h, mobile) = match mode {
-            "mobile" => (390, 844, true),
-            "tablet" => (820, 1180, true),
-            _ => (width, height, width < 820),
-        };
-        self.conn().call(
-            "Emulation.setDeviceMetricsOverride",
-            &format!(
-                "{{\"width\":{w},\"height\":{h},\"deviceScaleFactor\":2,\"mobile\":{mobile}}}"
-            ),
-        )?;
-        self.conn().call(
-            "Emulation.setTouchEmulationEnabled",
-            &format!("{{\"enabled\":true,\"maxTouchPoints\":5}}"),
-        )?;
-        Ok(())
     }
 
     fn registry_for(&mut self, reference: &str, call: &str) -> Result<String, String> {
@@ -959,10 +994,16 @@ impl Page {
     /// fires the `input` and `change` events a real pick does. The input is
     /// resolved in cu's isolated world to a remote object; the world shares
     /// the DOM with the page, so the node is the page's own.
-    fn upload(&mut self, reference: Option<&str>, files: &[String]) -> Result<(), String> {
+    fn upload(
+        &mut self,
+        reference: Option<&str>,
+        selector: Option<&str>,
+        files: &[String],
+    ) -> Result<(), String> {
         let call = format!(
-            "fileInput({})",
-            reference.map(json_string).unwrap_or_else(|| "null".into())
+            "fileInput({},{})",
+            reference.map(json_string).unwrap_or_else(|| "null".into()),
+            selector.map(json_string).unwrap_or_else(|| "null".into())
         );
         let expression = format!(
             "{REGISTRY}?{REGISTRY}.{call}:JSON.stringify({{error:'this page has no refs yet; take a snapshot first'}})"
@@ -1602,6 +1643,9 @@ impl Page {
                 if kind == "mouseMoved" { 0 } else { 1 }
             )
         };
+        if crate::emulation::touches(&self.tab) {
+            return self.tap_at(target, watch);
+        }
         if self.input_policy == InputPolicy::Instant {
             // The press, the release and the barrier that follows them go
             // out together: the browser answers them in order, and the
@@ -1662,6 +1706,53 @@ impl Page {
             watch,
         )?;
         crate::input::set_pointer(&self.tab, plan.point);
+        Ok(())
+    }
+
+    /// A click on a tab that emulates a touch device: a finger, not a mouse.
+    ///
+    /// A phone has no mouse, and a page laid out for one listens for
+    /// `pointerdown` with `pointerType` `touch` and for `touchstart`; a
+    /// touch start and end through `Input.dispatchTouchEvent` produce those
+    /// and then the `mousedown` and `click` a real tap does (measured on
+    /// Chromium 156). `Emulation.setEmitTouchEventsForMouse` is not used: it
+    /// makes `Input.dispatchMouseEvent` hang.
+    fn tap_at(&mut self, target: Target, watch: &mut NavWatch) -> Result<(), String> {
+        // Touch goes through the compositor, and a tab in the background
+        // (every session tab starts there) produces no frames: the touch
+        // would be accepted and never reach the page.
+        let _ = self.conn().call("Page.bringToFront", "{}");
+        let (point, hold) = if self.input_policy == InputPolicy::Paced {
+            let from = crate::input::pointer(&self.tab).unwrap_or(target.at);
+            let plan = crate::input::plan_click(&self.tab, from, target.at, target.w, target.h);
+            (plan.point, Some(plan.hold))
+        } else {
+            (target.at, None)
+        };
+        let start = format!(
+            "{{\"type\":\"touchStart\",\"touchPoints\":[{{\"x\":{:.1},\"y\":{:.1},\"radiusX\":4,\"radiusY\":4,\"force\":1,\"id\":0}}]}}",
+            point.0, point.1
+        );
+        let end = "{\"type\":\"touchEnd\",\"touchPoints\":[]}";
+        match hold {
+            None => {
+                self.input_batch(
+                    &[
+                        ("Input.dispatchTouchEvent", start.as_str()),
+                        ("Input.dispatchTouchEvent", end),
+                        ("Runtime.evaluate", BARRIER),
+                    ],
+                    watch,
+                )?;
+                watch.barrier = true;
+            }
+            Some(hold) => {
+                self.input("Input.dispatchTouchEvent", &start, watch)?;
+                std::thread::sleep(hold);
+                self.input("Input.dispatchTouchEvent", end, watch)?;
+                crate::input::set_pointer(&self.tab, point);
+            }
+        }
         Ok(())
     }
 
@@ -2030,21 +2121,29 @@ if (!window.__cu) {
       }
       return JSON.stringify({ len });
     },
-    fileInput(ref) {
-      // The file input a ref stands for: the input itself, the control a
-      // label points at, one inside the element, or the nearest one around
-      // it (a "Select from computer" button and its display:none input share
-      // a form or wrapper). Without a ref: the document's only file input.
+    fileInput(ref, selector) {
+      // The file input a ref (or a CSS selector) stands for: the input
+      // itself, the control a label points at, one inside the element, or
+      // the nearest one around it (a "Select from computer" button and its
+      // display:none input share a form or wrapper). Neither: the
+      // document's only file input.
       const isFile = (e) => e && e.tagName === 'INPUT' && e.type === 'file';
       const inputs = (root) => [...root.querySelectorAll('input[type=file]')];
-      if (ref === null) {
+      if (ref === null && selector === null) {
         const all = inputs(document);
         if (all.length === 1) return all[0];
-        return err(all.length ? all.length + ' file inputs on the page; pass the ref of the control next to the one you want'
+        return err(all.length ? all.length + ' file inputs on the page; pass the ref of the control next to the one you want, or a selector'
           : 'no file input on the page');
       }
-      const el = get(ref);
-      if (!el) return err(ref + ' is not on the page any more; take a new snapshot');
+      let el;
+      if (selector !== null) {
+        try { el = document.querySelector(selector); } catch (e) { return err('bad selector ' + selector); }
+        if (!el) return err('no element matches ' + selector);
+        ref = selector;
+      } else {
+        el = get(ref);
+        if (!el) return err(ref + ' is not on the page any more; take a new snapshot');
+      }
       if (isFile(el)) return el;
       if (isFile(el.control)) return el.control;
       const label = el.closest('label');
@@ -2118,10 +2217,89 @@ mod tests {
     }
 
     #[test]
+    fn emulate_keeps_its_old_shape_and_takes_orientation_and_scale() {
+        // The step as it always was: still parses, mode defaults to mobile.
+        assert_eq!(
+            parse_action(r#"{"do":"emulate","mode":"custom","width":600,"height":900}"#).unwrap(),
+            Action::Emulate {
+                mode: "custom".into(),
+                width: Some(600),
+                height: Some(900),
+                orientation: None,
+                scale: None,
+            }
+        );
+        assert_eq!(
+            parse_action(r#"{"do":"emulate"}"#).unwrap(),
+            Action::Emulate {
+                mode: "mobile".into(),
+                width: None,
+                height: None,
+                orientation: None,
+                scale: None,
+            }
+        );
+        // The optional fields.
+        assert_eq!(
+            parse_action(
+                r#"{"do":"emulate","mode":"mobile","orientation":"landscape","scale":2.5}"#
+            )
+            .unwrap(),
+            Action::Emulate {
+                mode: "mobile".into(),
+                width: None,
+                height: None,
+                orientation: Some("landscape".into()),
+                scale: Some(2.5),
+            }
+        );
+        // Refused before the batch runs, not half way through it.
+        for bad in [
+            r#"{"do":"emulate","mode":"phone"}"#,
+            r#"{"do":"emulate","orientation":"upside"}"#,
+            r#"{"do":"emulate","scale":9}"#,
+            r#"{"do":"emulate","mode":"custom","width":390.5,"height":844}"#,
+            r#"{"do":"emulate","mode":"custom","width":0,"height":844}"#,
+        ] {
+            assert!(parse_action(bad).is_err(), "{bad} parsed");
+        }
+    }
+
+    #[test]
     fn the_closing_snapshot_can_be_turned_off() {
         let batch = parse_batch(r#"{"actions":[{"do":"click","ref":"e1"}],"snapshot":false}"#)
             .expect("parses");
         assert!(!batch.snapshot);
+    }
+
+    #[test]
+    fn an_upload_names_its_input_by_ref_or_by_selector_not_both() {
+        let file = std::env::current_exe().expect("test binary");
+        let file = json_string(&file.to_string_lossy());
+        let by_selector = parse_action(&format!(
+            r#"{{"do":"upload","selector":"input[type=file]","files":[{file}]}}"#
+        ))
+        .expect("parses");
+        match by_selector {
+            Action::Upload {
+                reference: None,
+                selector: Some(s),
+                files,
+            } => {
+                assert_eq!(s, "input[type=file]");
+                assert_eq!(files.len(), 1);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let both = parse_action(&format!(
+            r#"{{"do":"upload","ref":"e1","selector":"input","files":[{file}]}}"#
+        ));
+        assert!(both.unwrap_err().contains("not both"));
+        let blank = parse_action(&format!(
+            r#"{{"do":"upload","selector":" ","files":[{file}]}}"#
+        ))
+        .expect("a blank selector is no selector");
+        assert!(matches!(blank, Action::Upload { selector: None, .. }));
     }
 
     #[test]

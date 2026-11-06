@@ -543,7 +543,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "act",
         title: "Batch of actions",
-        description: "Run several steps on one connection and get the resulting page back, e.g. [{\"do\":\"type\",\"ref\":\"e2\",\"text\":\"Ada\"},{\"do\":\"click\",\"ref\":\"e5\"}]. Steps: click (ref); type or fill (ref, text, clear default true, submit); press (key: Enter, Tab, Escape, arrows...); select (ref, value or label); navigate (url); scroll (dy/dx px or to: top|bottom, optional ref); tap, longpress, swipe, pinch (ref or x and y; dx, dy, scale, ms); emulate (mode: mobile|tablet|desktop|custom, width, height); wait (ms); upload (files, relative to the server's working directory; optional ref). `\"ok\":false` names the step that failed and why; a stale ref means take a new snapshot.",
+        description: "Run several steps on one connection and get the resulting page back, e.g. [{\"do\":\"type\",\"ref\":\"e2\",\"text\":\"Ada\"},{\"do\":\"click\",\"ref\":\"e5\"}]. Steps: click (ref); type or fill (ref, text, clear default true, submit); press (key: Enter, Tab, Escape, arrows...); select (ref, value or label); navigate (url); scroll (dy/dx px or to: top|bottom, optional ref); tap, longpress, swipe, pinch (ref or x and y; dx, dy, scale, ms); emulate (mode: mobile|tablet|desktop|custom, width, height, optional orientation: portrait|landscape and scale: device pixel ratio; mobile is a 390x844 portrait phone at 3x with touch and an Android Chrome User-Agent, held through reloads until desktop; a click on an emulated tab is a touch tap); wait (ms); upload (files, relative to the server's working directory; optional ref). `\"ok\":false` names the step that failed and why; a stale ref means take a new snapshot.",
         properties: r#""actions":{"type":"array","items":{"type":"object"},"description":"The steps, in order. Each is an object with \"do\" and that step's fields."},"snapshot":{"type":"boolean","description":"End with a fresh snapshot (default true)."}"#,
         required: &["actions"],
         target: Target::Page,
@@ -604,7 +604,7 @@ const TOOLS: &[Tool] = &[
         name: "console",
         title: "Page console",
         description: "What the page wrote to its console, plus uncaught exceptions, CSP violations and network failures, as text lines (or JSON).",
-        properties: r#""level":{"type":"string","description":"debug, log, info, trace, warn, error, exception, csp or network; a comma list; LEVEL+ for that level and above (warn+); or all (default)."},"grep":{"type":"string","description":"Only entries containing this text."},"limit":{"type":"number","description":"At most this many entries (default 200)."},"since":{"type":"number","description":"Only entries after this sequence number."},"clear":{"type":"boolean","description":"Empty the buffer after reading."},"json":{"type":"boolean","description":"Answer JSON instead of text lines."}"#,
+        properties: r#""level":{"type":"string","description":"debug, log, info, trace, warn, error, exception, csp, network or dialog (the JavaScript dialogs cu answered); a comma list; LEVEL+ for that level and above (warn+); or all (default)."},"grep":{"type":"string","description":"Only entries containing this text."},"limit":{"type":"number","description":"At most this many entries (default 200)."},"since":{"type":"number","description":"Only entries after this sequence number."},"clear":{"type":"boolean","description":"Empty the buffer after reading."},"json":{"type":"boolean","description":"Answer JSON instead of text lines."}"#,
         required: &[],
         target: Target::Page,
         read_only: false,
@@ -651,8 +651,8 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "upload",
         title: "Upload files",
-        description: "Put files into a file input. `ref` is the input or the control that opens the picker (file inputs are usually hidden and have no ref); without it, the page's only file input. Paths are resolved against the server's working directory.",
-        properties: r#""files":{"type":"array","items":{"type":"string"},"description":"Paths of the files to upload."},"ref":{"type":"string","description":"The file input, or the button that opens the picker."}"#,
+        description: "Put files into a file input. `ref` is the input or the control that opens the picker (file inputs are usually hidden and have no ref); `selector` names it by CSS instead, for pages with several hidden inputs; without either, the page's only file input. Paths are resolved against the server's working directory.",
+        properties: r#""files":{"type":"array","items":{"type":"string"},"description":"Paths of the files to upload."},"ref":{"type":"string","description":"The file input, or the button that opens the picker."},"selector":{"type":"string","description":"CSS selector of the file input (or its control), instead of a ref."}"#,
         required: &["files"],
         target: Target::Page,
         read_only: false,
@@ -670,6 +670,18 @@ const TOOLS: &[Tool] = &[
         read_only: true,
         destructive: false,
         idempotent: true,
+        open_world: false,
+    },
+    Tool {
+        name: "dialog",
+        title: "JavaScript dialogs",
+        description: "JavaScript dialogs (alert, confirm, prompt, the \"Leave site?\" of beforeunload) on the page. cu answers each one by policy the moment it opens -- beforeunload and alert accepted, confirm and prompt dismissed by default -- and logs it; an action's reply lists the dialogs it caused. With policy manual a dialog stays open and page tools on its tab fail at once naming it, until you answer it here. No arguments: the dialog waiting (if any), the policy and the log. `answer`: accept or dismiss the waiting dialog (`text` answers a prompt). `policy`: this tab's own, e.g. \"confirm=manual\" or \"all=accept\"; \"default\" goes back to the daemon's.",
+        properties: r#""answer":{"type":"string","enum":["accept","dismiss"],"description":"Answer the dialog waiting on the tab."},"text":{"type":"string","description":"The text to answer a prompt with (with answer accept)."},"policy":{"type":"string","description":"KIND=ANSWER list for this tab: KIND alert, confirm, prompt, beforeunload or all; ANSWER accept, dismiss or manual; or default."}"#,
+        required: &[],
+        target: Target::Page,
+        read_only: false,
+        destructive: false,
+        idempotent: false,
         open_world: false,
     },
     Tool {
@@ -971,9 +983,10 @@ fn plan(name: &str, args: &Args) -> Result<Call, String> {
                 .iter()
                 .map(|f| absolute_file(f).map(|p| json_string(&p)))
                 .collect::<Result<Vec<_>, _>>()?;
-            let reference = match args.reference("ref")? {
-                Some(r) => format!(",\"ref\":{}", json_string(r)),
-                None => String::new(),
+            let reference = match (args.reference("ref")?, args.str("selector")) {
+                (Some(r), _) => format!(",\"ref\":{}", json_string(r)),
+                (None, Some(s)) => format!(",\"selector\":{}", json_string(s)),
+                (None, None) => String::new(),
             };
             // Through a batch, which works in the session's page like every
             // other page command.
@@ -1075,6 +1088,33 @@ fn plan(name: &str, args: &Args) -> Result<Call, String> {
             };
             page(args, "GET", "/v1/marks", query, None)
         }
+        "dialog" => match (args.str("answer"), args.str("policy")) {
+            (Some(_), Some(_)) => Err("give either `answer` or `policy`, not both".into()),
+            (Some(answer @ ("accept" | "dismiss")), None) => {
+                let body = match args.str("text") {
+                    Some(text) if answer == "accept" => {
+                        format!("{{\"text\":{}}}", json_string(text))
+                    }
+                    _ => "{}".to_string(),
+                };
+                page(
+                    args,
+                    "POST",
+                    &format!("/v1/dialog/{answer}"),
+                    Vec::new(),
+                    Some(body),
+                )
+            }
+            (Some(other), None) => Err(format!("`answer` is accept or dismiss, not {other:?}")),
+            (None, Some(spec)) => page(
+                args,
+                "POST",
+                "/v1/dialog/policy",
+                Vec::new(),
+                Some(format!("{{\"policy\":{}}}", json_string(spec))),
+            ),
+            (None, None) => page(args, "GET", "/v1/dialog", Vec::new(), None),
+        },
         "handoff" => {
             if args.flag("release")? == Some(true) {
                 return page(
@@ -1607,5 +1647,38 @@ impl Parser<'_> {
             self.at = resume;
             Ok('\u{fffd}')
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan_of(args: &str) -> Result<Call, String> {
+        let json = Json::parse(args).expect("args parse");
+        plan("dialog", &Args(&json))
+    }
+
+    #[test]
+    fn the_dialog_tool_reads_answers_and_sets_the_policy() {
+        let read = plan_of("{}").unwrap();
+        assert_eq!((read.method, read.path.as_str()), ("GET", "/v1/dialog"));
+        assert!(read.session);
+        let accept = plan_of(r#"{"answer":"accept","text":"Ada","tab":"T1"}"#).unwrap();
+        assert_eq!(accept.method, "POST");
+        assert_eq!(accept.path, "/v1/dialog/accept?tab=T1");
+        assert_eq!(accept.body.as_deref(), Some(r#"{"text":"Ada"}"#));
+        let dismiss = plan_of(r#"{"answer":"dismiss","text":"ignored"}"#).unwrap();
+        assert_eq!(dismiss.path, "/v1/dialog/dismiss");
+        assert_eq!(dismiss.body.as_deref(), Some("{}"));
+        let policy = plan_of(r#"{"policy":"confirm=manual"}"#).unwrap();
+        assert_eq!(policy.path, "/v1/dialog/policy");
+        assert_eq!(
+            policy.body.as_deref(),
+            Some(r#"{"policy":"confirm=manual"}"#)
+        );
+        assert!(plan_of(r#"{"answer":"maybe"}"#).is_err());
+        assert!(plan_of(r#"{"answer":"accept","policy":"all=accept"}"#).is_err());
+        assert!(tools_list().unwrap().contains("\"name\":\"dialog\""));
     }
 }

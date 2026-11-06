@@ -173,7 +173,7 @@ dependencies = [
 
 [[package]]
 name = "cu"
-version = "1.9.0"
+version = "1.10.0"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",

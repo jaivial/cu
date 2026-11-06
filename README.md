@@ -385,7 +385,8 @@ cu click e3 · cu type e2 "text" [--submit] · cu upload e5 photo.jpg
 cu act '[{"do":"type","ref":"e2","text":"Ada"},{"do":"click","ref":"e5"}]'
 cu batch 'snapshot --tab t1' 'click e3 --tab t1'   # many commands, one call
 cu shot [FILE.jpg] [--annotate REFS|all] [--marks] · cu downloads · cu login
-cu console [--level warn+|error,warn|all] [--grep S] [--clear]   # page console, all levels
+cu console [--level warn+|error,warn|dialog|all] [--grep S] [--clear]   # page console, all levels
+cu dialog [accept [TEXT] | dismiss | policy SPEC]   # JavaScript dialogs, answered by policy
 cu inspect e3 · cu mark e3 "what is wrong" [--severity major] · cu marks [--md|clear]
 cu session save NAME · cu session load NAME
 cu mcp                       # the same tools for an MCP client, over stdio
@@ -464,13 +465,34 @@ global that only exists in JS. It passes the same gate as every other page
 command (live viewer, challenge, origin budget), and `cu act` batches can mix
 it with clicks and types.
 
+## Phones and tablets
+
+`cu act '[{"do":"emulate","mode":"mobile"}]'` makes the session's tab a phone the
+way a site checks for one: 390x844 at 3x, portrait `screen.orientation`, touch,
+and an Android Chrome User-Agent and client hints of the running build. It
+holds through the page's own reloads and every later command until
+`{"do":"emulate","mode":"desktop"}`; a click on it is a touch tap. `tablet`,
+`custom` (`width`, `height`), `orientation` and `scale` are in
+[docs](docs/README.md#phone-and-tablet-emulation).
+
+## JavaScript dialogs
+
+A dialog nobody answers stops the page -- and every tab sharing its renderer.
+cu answers them the moment they open, from a session it holds on every tab it
+works in: `beforeunload` and `alert` accepted, `confirm` and `prompt`
+dismissed, each one logged (`cu dialog`, `cu console --level dialog`, and the
+`"dialogs"` of the action's reply). `CU_DIALOGS=confirm=manual` (daemon) or
+`cu dialog policy confirm=manual` (tab) leaves one open: commands on the tab
+then fail at once naming it until `cu dialog accept [TEXT]` or `cu dialog
+dismiss`. Details: [docs](docs/README.md#javascript-dialogs).
+
 ## MCP server
 
 `cu mcp` is a stdio [MCP](https://modelcontextprotocol.io) server in front of
 the daemon, for agents whose harness speaks MCP rather than bash:
 
 ```sh
-pi mcp add cu -- cu mcp          # pi; `pi mcp list` shows the 21 tools
+pi mcp add cu -- cu mcp          # pi; `pi mcp list` shows the 22 tools
 claude mcp add cu -- cu mcp      # Claude Code
 codex mcp add cu -- cu mcp       # Codex
 ```
@@ -478,7 +500,7 @@ codex mcp add cu -- cu mcp       # Codex
 or `{"mcpServers":{"cu":{"command":"cu","args":["mcp"]}}}` in a client's JSON
 config. The tools mirror the CLI -- `navigate`, `snapshot`, `text`, `click`,
 `type`, `act`, `screenshot` (an image block), `tabs`, `console`, `inspect`,
-`mark`/`marks`, `upload`, `downloads`, `handoff`, `session_save`/`session_load`,
+`mark`/`marks`, `upload`, `downloads`, `handoff`, `dialog`, `session_save`/`session_load`,
 `login_url` -- and each is one request to the running daemon. The `cu mcp`
 process is the session: its page tools share one tab, another connection never
 lands in it, and the tab is closed when the connection ends. No tool takes or
