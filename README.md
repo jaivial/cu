@@ -14,7 +14,8 @@ leased tab each. Every tool was measured again, before and after, in the
 **5-7x** faster, a click and a batch **1.5-1.7x**, a snapshot **1.5x**.
 
 Landing page: <https://jaivial.github.io/cu/> · API: [docs/README.md](docs/README.md) ·
-Benchmarks: [docs/BENCHMARKS.md](docs/BENCHMARKS.md) · Skill: [SKILL.md](SKILL.md)
+Benchmarks: [docs/BENCHMARKS.md](docs/BENCHMARKS.md) · Skill: [SKILL.md](SKILL.md) ·
+Task skills: [Instagram Story](skills/instagram-story/SKILL.md)
 
 ## Quick start
 
