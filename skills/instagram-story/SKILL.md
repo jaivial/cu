@@ -20,7 +20,7 @@ editor's "leave page?" (beforeunload) dialog instead of freezing the tab.
 - `slimium` >= 0.3.0 on PATH (or `SLIMIUM=/path/to/slimium`), and `ffmpeg` for text stories.
 - A slimium user profile that is already logged in to Instagram (below).
 - `python3`.
-- For `--driver cu`, a cu with three things: whole-phone `emulate mobile` (portrait, DPR 3, Android UA, kept
+- For `--driver cu`: cu >= 1.10.0, which has three things: whole-phone `emulate mobile` (portrait, DPR 3, Android UA, kept
   across reloads), `upload --selector`, and JavaScript dialog handling (the editor's "leave page?").
   Use cu-slim (cu on slimium). The script exports `SLIM_USER_PROFILE`, so a cu-slim daemon it starts opens the
   profile. Every cu call names the script's own tab (`--tab`): cu gives each calling process its own page.
