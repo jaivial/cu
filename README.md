@@ -464,6 +464,16 @@ global that only exists in JS. It passes the same gate as every other page
 command (live viewer, challenge, origin budget), and `cu act` batches can mix
 it with clicks and types.
 
+## Phones and tablets
+
+`cu act '[{"do":"emulate","mode":"mobile"}]'` makes the session's tab a phone the
+way a site checks for one: 390x844 at 3x, portrait `screen.orientation`, touch,
+and an Android Chrome User-Agent and client hints of the running build. It
+holds through the page's own reloads and every later command until
+`{"do":"emulate","mode":"desktop"}`; a click on it is a touch tap. `tablet`,
+`custom` (`width`, `height`), `orientation` and `scale` are in
+[docs](docs/README.md#phone-and-tablet-emulation).
+
 ## MCP server
 
 `cu mcp` is a stdio [MCP](https://modelcontextprotocol.io) server in front of

@@ -3,6 +3,7 @@ pub mod actions;
 pub mod challenge;
 pub mod console;
 pub mod diagnostics;
+pub mod emulation;
 pub mod execution;
 pub mod geo;
 pub mod human;

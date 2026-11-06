@@ -41,6 +41,12 @@ Use `cu` when an agent needs a persistent local browser session.
    that starts a download answers `"download":"name"` (list finished files
    with `cu downloads`), and one that opens a window answers `"popup":true`
    (see `cu tabs`).
+   To see a site as a phone, start the batch with
+   `{"do":"emulate","mode":"mobile"}` (390x844, 3x, portrait, touch, Android
+   Chrome UA; `tablet`, `custom` with `width`/`height`, optional
+   `orientation` and `scale`). It stays on through the page's reloads and
+   your later commands until `{"do":"emulate","mode":"desktop"}`, and clicks
+   on the tab become touch taps.
 6. Credentials. When you have them (a test account, a secret the user gave you, a vault entry, `cu otp code`), type them like any field: `cu type e4 "$PASSWORD"` or a `type` step in `cu act`. Read them from a `chmod 600` secrets file into a variable rather than writing the literal on the command line, and never repeat one in your answer; cu never echoes it back (no reply carries a field's value). When the user should type their own, run `cu login`, navigate to the site's sign-in page, then direct them to the printed `/login` page; the daemon types what they enter.
 7. Popups and extra tabs: `cu tabs` lists them (the default is flagged);
    any page command takes `--tab ID` to run there, and `cu tabs close ID`

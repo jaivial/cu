@@ -159,6 +159,47 @@ result starts a download instead of changing the page reports
 `"download":"file.name"` with `navigated:false`, and a click that opens a
 window or tab reports `"popup":true` -- run `GET /v1/tabs` to see it.
 
+### Phone and tablet emulation
+
+`{"do":"emulate","mode":"mobile"}` turns the tab into a phone, as a site that
+checks for one sees it: a 390x844 viewport and a screen of the same size,
+`screen.orientation` `portrait-primary` (angle 0), device pixel ratio 3,
+`mobile` layout (meta viewport, overlay scrollbars), touch with
+`maxTouchPoints` 5, and an Android Chrome User-Agent built from the running
+browser's own version (`Mozilla/5.0 (Linux; Android 14; Pixel 8) ...
+Chrome/156.0.0.0 Mobile Safari/537.36`) with client hints that agree:
+`navigator.userAgentData` says `mobile: true`, platform `Android` 14.0.0,
+model `Pixel 8`, and the same `Chromium` and GREASE brands this build reports.
+The Accept-Language stays the one the browser was launched with.
+
+| step | device |
+| --- | --- |
+| `{"do":"emulate","mode":"mobile"}` | 390x844, 3x, phone UA |
+| `{"do":"emulate","mode":"tablet"}` | 820x1180, 2x, Android tablet UA (no `Mobile`) |
+| `{"do":"emulate","mode":"custom","width":412,"height":915}` | the given size; phone below 820 px wide (3x), tablet otherwise (2x) |
+| `{"do":"emulate","mode":"desktop"}` | off: the browser's own window and cu's own User-Agent |
+
+Optional fields: `"orientation":"portrait"|"landscape"` turns the device (the
+sides swap when they do not match; without it a device wider than tall is
+`landscape-primary` at 90 degrees) and `"scale"` sets the device pixel ratio
+(above 0, up to 4). The step's `value` says what is in force, e.g.
+`390x844 @3x portrait, mobile, touch, Android Chrome 156 (Pixel 8)`.
+
+The emulation stays on until `desktop`: through reloads and navigations the
+page makes itself, and through every later command of the session
+(`snapshot`, `click`, `eval`, `text`, `shot`). Chromium drops a DevTools
+session's overrides when that session's socket closes, so the device is held
+by a connection of its own per tab rather than by the pooled ones (which the
+daemon drops when a navigation outlasts the settle budget); if that
+connection dies anyway the device is put back before the next command.
+`cu shot --width/--height/--scale` on an emulated tab captures at its own size
+and then puts the whole device back. On an emulated tab `click` is a finger:
+a touch start and end (`pointerdown` with `pointerType` `touch`,
+`touchstart`, then the `click` a tap produces), after bringing the tab to the
+front. The emulation belongs to the tab: a popup it opens is not emulated.
+`bash tests/emulate_real_browser.sh` checks all of it against a real Chromium
+on a local fixture, with an isolated daemon.
+
 ### Contexts
 
 Add `?context=NAME` to navigate, snapshot, screenshot or act to work in an

@@ -10,6 +10,42 @@
   the canonical one. A daemon auto-started for a `CU_DAEMON_DIR` no longer
   asks systemd for the canonical `cu` unit.
 
+### Changed
+
+- **`emulate` is a whole phone, and it stays on.** `{"do":"emulate","mode":"mobile"}`
+  set the viewport and touch but left `screen.orientation`
+  `landscape-primary`, the screen the desktop's and the User-Agent the
+  desktop's, so Instagram's web story editor answered "Rotate your device"
+  and its home page a tablet-app upsell. Now a phone (and a tablet) is the
+  full set: `screenWidth`/`screenHeight`, `screenOrientation` (portrait, or
+  landscape at 90 degrees when wider than tall), device pixel ratio 3 for a
+  phone and 2 for a tablet, touch with 5 points, and an Android Chrome
+  User-Agent of the running build with matching `userAgentMetadata` (an
+  override without it empties `navigator.userAgentData`). `desktop` gives
+  back the browser's own window and cu's own User-Agent exactly. New
+  optional step fields: `orientation` (`portrait` | `landscape`) and
+  `scale`; the step answers what is in force as its `value`. Existing steps
+  parse as before. (`src/emulation.rs`, `src/actions.rs`)
+- **The emulation survives the page and the daemon's connections.**
+  Chromium drops a DevTools session's overrides when its socket closes, and
+  the overrides were set on a pooled connection -- which the daemon drops
+  when a navigation outlasts the settle budget. A tab now keeps its device on
+  a connection of its own, re-applied if that connection dies, so reloads the
+  page makes itself and later `snapshot`/`click`/`eval`/`text`/`shot` keep
+  it. `cu shot --width/--scale` on an emulated tab puts the whole device back
+  afterwards instead of a measured viewport.
+- **A click on an emulated touch device is a tap** (`Input.dispatchTouchEvent`:
+  `pointerdown` of type `touch`, `touchstart`, then the click), sent after
+  bringing the tab to the front; `Emulation.setEmitTouchEventsForMouse` is
+  not used.
+
+### Tests
+
+- `tests/emulate_real_browser.sh`: an isolated daemon (ports 8795/9395) on a
+  real Chromium and a local fixture that reloads itself after a click.
+  The fake browser now drops a connection's overrides when it closes, like
+  Chromium.
+
 ## [1.9.0] - 2026-11-05
 
 ### Changed

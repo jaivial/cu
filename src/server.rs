@@ -1079,6 +1079,12 @@ fn route_with(
     } else {
         Tab::default_for(state.cdp_port)
     };
+    // An emulated tab whose keeper connection died (the browser restarted,
+    // the socket was cut) gets its device back before the command runs, so
+    // no command ever sees the tab as a desktop it was not asked to be.
+    if needs_browser {
+        crate::emulation::ensure(&tab);
+    }
     // A person holds this tab in the live viewer: no automatic interaction
     // until they give it back (reads stay allowed).
     if matches!(
@@ -2280,6 +2286,10 @@ pub fn close_tab(cdp_port: u16, id: &str) -> Result<(), String> {
         cdp_port,
         target: Some(id.to_string()),
     });
+    crate::emulation::forget(&Tab {
+        cdp_port,
+        target: Some(id.to_string()),
+    });
     unpin_target(cdp_port, id);
     Ok(())
 }
@@ -2698,7 +2708,12 @@ fn screenshot(tab: &Tab, query: &str) -> (&'static str, &'static str, String) {
     // now is the caller's, not the viewport this capture is about to set.
     // Only an emulated capture changes the viewport, so only it has to
     // remember the old one.
-    let was = if options.emulates() {
+    //
+    // A tab cu emulates a device on (`emulate` step) needs nothing read: its
+    // device is known, and it goes back on whole -- screen, orientation,
+    // mobile flag and all -- which a measured viewport could not say.
+    let emulated = options.emulates() && crate::emulation::device(tab).is_some();
+    let was = if options.emulates() && !emulated {
         Viewport::read(tab)
     } else {
         None
@@ -2706,7 +2721,11 @@ fn screenshot(tab: &Tab, query: &str) -> (&'static str, &'static str, String) {
     crate::server::trace("shot.after_viewport_read", span);
     let result = capture_annotated(tab, &options);
     crate::server::trace("shot.after_capture", span);
-    if options.emulates() {
+    if emulated {
+        // The capture's override is cleared, and the device put back on.
+        let _ = tab.command("Emulation.clearDeviceMetricsOverride", "{}");
+        crate::emulation::reassert(tab);
+    } else if options.emulates() {
         // Put the tab back the way this capture found it, even if it failed.
         restore_viewport(was, tab);
     }

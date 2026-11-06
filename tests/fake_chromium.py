@@ -33,6 +33,19 @@ COMMANDS = []
 # own window size applies. Like Chromium, `clearDeviceMetricsOverride` puts it
 # back to None and the metrics change back.
 EMULATED = [None]
+# The device overrides in force, as the params that set them, and the
+# connection that owns each one. Like Chromium, an override belongs to the
+# DevTools session that set it and is dropped when that session's socket
+# closes; a clear from any session clears it. Served at /emulation.
+EMULATION = {"metrics": None, "touch": None, "ua": None}
+EMULATION_OWNER = {"metrics": None, "touch": None, "ua": None}
+# Open websocket connections, so /hangup can cut them all (a browser restart,
+# as far as the daemon can tell).
+SOCKETS = set()
+SOCKETS_LOCK = threading.Lock()
+# An eval of this expression answers and then closes the connection it came
+# on: a pooled connection the daemon loses mid-batch.
+HANGUP_EXPRESSION = "__fake_hangup__"
 # The browser's own window size, in CSS pixels: what an un-emulated tab is
 # shown at, and what a cleared override falls back to.
 WINDOW = [1280, 720]
@@ -175,6 +188,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(COMMANDS)
         elif self.path == "/download-behaviour":
             self.send_json(DOWNLOAD_BEHAVIOUR)
+        elif self.path == "/emulation":
+            self.send_raw(json.dumps(EMULATION, separators=(",", ":")))
+        elif self.path == "/hangup":
+            with SOCKETS_LOCK:
+                sockets = list(SOCKETS)
+            for sock in sockets:
+                try:
+                    sock.shutdown(2)
+                except OSError:
+                    pass
+            self.send_raw(json.dumps(len(sockets)))
         elif self.path == "/viewport":
             self.send_raw(json.dumps(EMULATED[0], separators=(",", ":")))
         elif self.path.startswith("/emulate"):
@@ -270,6 +294,40 @@ class Handler(BaseHTTPRequestHandler):
     def serve_websocket(self):
         if not self.handshake():
             return
+        with SOCKETS_LOCK:
+            SOCKETS.add(self.connection)
+        try:
+            self.serve_commands()
+        finally:
+            # A websocket that ends is a closed socket, never a keep-alive.
+            self.close_connection = True
+            with SOCKETS_LOCK:
+                SOCKETS.discard(self.connection)
+            # The session is gone, and the overrides it set go with it.
+            for key, owner in EMULATION_OWNER.items():
+                if owner is self:
+                    EMULATION[key] = None
+                    EMULATION_OWNER[key] = None
+                    if key == "metrics":
+                        EMULATED[0] = None
+
+    def track_emulation(self, method, params):
+        """Who set which device override, as Chromium keeps it per session."""
+        params = params or {}
+        if method == "Emulation.setDeviceMetricsOverride":
+            EMULATION["metrics"], EMULATION_OWNER["metrics"] = params, self
+        elif method == "Emulation.clearDeviceMetricsOverride":
+            EMULATION["metrics"], EMULATION_OWNER["metrics"] = None, None
+        elif method == "Emulation.setTouchEmulationEnabled":
+            on = bool(params.get("enabled"))
+            EMULATION["touch"] = params if on else None
+            EMULATION_OWNER["touch"] = self if on else None
+        elif method in ("Emulation.setUserAgentOverride", "Network.setUserAgentOverride"):
+            on = bool(params.get("userAgent"))
+            EMULATION["ua"] = params if on else None
+            EMULATION_OWNER["ua"] = self if on else None
+
+    def serve_commands(self):
         while True:
             frame = self.read_frame()
             if frame is None:
@@ -282,6 +340,7 @@ class Handler(BaseHTTPRequestHandler):
             COMMANDS.append(method)
             if method in GEO_METHODS:
                 GEO_LOG.append({"method": method, "params": message.get("params") or {}})
+            self.track_emulation(method, message.get("params"))
             reply = self.result_for(method, message.get("params"))
             reply["id"] = message.get("id", 1)
             self.reply(reply)
@@ -289,6 +348,8 @@ class Handler(BaseHTTPRequestHandler):
                 if CLOSED_MARKER:
                     open(CLOSED_MARKER, "w").write("closed\n")
                 os._exit(0)
+            if (message.get("params") or {}).get("expression") == HANGUP_EXPRESSION:
+                break
 
     def handshake(self):
         key = (self.headers.get("Sec-WebSocket-Key") or "").strip()
@@ -453,7 +514,12 @@ class Handler(BaseHTTPRequestHandler):
                     "result": {"type": "string", "value": '{"x":10,"y":20}'}
                 }
             }
-        if method in ("Input.dispatchMouseEvent", "Input.insertText", "Input.dispatchKeyEvent"):
+        if method in (
+            "Input.dispatchMouseEvent",
+            "Input.dispatchTouchEvent",
+            "Input.insertText",
+            "Input.dispatchKeyEvent",
+        ):
             INPUT_LOG.append(method)
             return {"result": {}}
         if method == "Page.captureScreenshot":

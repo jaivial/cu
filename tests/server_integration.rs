@@ -1001,6 +1001,153 @@ fn a_capture_leaves_an_unemulated_tab_to_the_browser() {
     );
 }
 
+/// The device overrides the fake browser has in force, as
+/// `{"metrics":..,"touch":..,"ua":..}` with each the params that set it, or
+/// null. Like Chromium, an override dies with the connection that set it.
+fn emulation_state(server: &TestServer) -> String {
+    server::http_get(&format!("127.0.0.1:{}", server.cdp_port), "/emulation")
+        .expect("emulation state")
+}
+
+/// Whether the fake shows the whole phone `emulate mobile` asks for: the
+/// viewport and a screen of its size, portrait, 3x, mobile, five touch
+/// points and an Android Chrome User-Agent with client hints that agree.
+fn assert_phone(state: &str) {
+    for part in [
+        "\"width\":390,\"height\":844,\"deviceScaleFactor\":3,\"mobile\":true",
+        "\"screenWidth\":390,\"screenHeight\":844",
+        "\"screenOrientation\":{\"type\":\"portraitPrimary\",\"angle\":0}",
+        "\"maxTouchPoints\":5",
+        "(Linux; Android 14; Pixel 8)",
+        "Mobile Safari/537.36",
+        "\"platform\":\"Android\"",
+        "\"model\":\"Pixel 8\"",
+    ] {
+        assert!(state.contains(part), "{part} is not in force: {state}");
+    }
+}
+
+/// `emulate mobile` is a whole phone, and it is not lost with the batch's
+/// connection: Chromium drops a session's overrides when its socket closes,
+/// and the daemon drops a pooled socket whenever a navigation outlasts the
+/// settle budget. Here the batch's connection is cut right after the step,
+/// which used to leave the tab a desktop again.
+#[test]
+fn an_emulated_phone_outlives_the_connection_of_its_batch() {
+    let server = TestServer::start("emulate-keeper", true);
+    let response = server.post(
+        "/v1/act",
+        r#"{"actions":[{"do":"emulate","mode":"mobile"},{"do":"eval","js":"__fake_hangup__"}],"snapshot":false}"#,
+    );
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let body = body_of(&response);
+    assert!(
+        body.contains("390x844 @3x portrait, mobile, touch, Android Chrome 1 (Pixel 8)"),
+        "the step does not say what is in force: {body}"
+    );
+    assert_phone(&emulation_state(&server));
+    // Later commands on other connections leave it alone.
+    let snapshot = server.get("/v1/snapshot");
+    assert_eq!(status_code(&snapshot), "200", "got {}", body_of(&snapshot));
+    assert_phone(&emulation_state(&server));
+}
+
+/// A capture at another size puts the device back afterwards -- the whole
+/// device, not just a viewport measured from the page.
+#[test]
+fn a_capture_puts_the_emulated_device_back() {
+    let server = TestServer::start("emulate-shot", true);
+    let response = server.post(
+        "/v1/act",
+        r#"{"actions":[{"do":"emulate","mode":"mobile"}],"snapshot":false}"#,
+    );
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    let shot = server.get("/v1/screenshot?width=800&height=600");
+    assert_eq!(status_code(&shot), "200", "{}", body_of(&shot));
+    assert_eq!(emulated_viewport(&server), Some((390.0, 844.0, 3.0)));
+    assert_phone(&emulation_state(&server));
+}
+
+/// A keeper that dies (the browser cut every DevTools socket) is replaced
+/// before the next command, and the device goes back on.
+#[test]
+fn a_lost_keeper_is_replaced_before_the_next_command() {
+    let server = TestServer::start("emulate-ensure", true);
+    let response = server.post(
+        "/v1/act",
+        r#"{"actions":[{"do":"emulate","mode":"tablet"}],"snapshot":false}"#,
+    );
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    server::http_get(&format!("127.0.0.1:{}", server.cdp_port), "/hangup").expect("hang up");
+    // Every override died with the sockets.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        emulation_state(&server),
+        r#"{"metrics":null,"touch":null,"ua":null}"#
+    );
+    let text = server.get("/v1/text");
+    assert_eq!(status_code(&text), "200", "got {}", body_of(&text));
+    let state = emulation_state(&server);
+    assert!(
+        state.contains("\"width\":820,\"height\":1180,\"deviceScaleFactor\":2"),
+        "{state}"
+    );
+    assert!(state.contains("Pixel Tablet"), "{state}");
+}
+
+/// On an emulated touch device a click is a finger: a touch start and end,
+/// no mouse. `desktop` then turns all of it off, and clicks are a mouse again.
+#[test]
+fn a_click_on_an_emulated_phone_is_a_tap_until_desktop() {
+    let server = TestServer::start("emulate-tap", true);
+    let response = server.post(
+        "/v1/act",
+        r#"{"actions":[{"do":"emulate","mode":"mobile"},{"do":"click","ref":"e1"}],"snapshot":false}"#,
+    );
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    assert!(
+        body_of(&response).contains("\"ok\":true"),
+        "{}",
+        body_of(&response)
+    );
+    // The tab is brought forward first: a background tab gets no frames,
+    // and touch input without frames never reaches the page.
+    assert_eq!(
+        input_log(&server),
+        r#"["Page.bringToFront", "Input.dispatchTouchEvent", "Input.dispatchTouchEvent"]"#
+    );
+    let response = server.post(
+        "/v1/act",
+        r#"{"actions":[{"do":"emulate","mode":"desktop"},{"do":"click","ref":"e1"}],"snapshot":false}"#,
+    );
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    assert_eq!(
+        emulation_state(&server),
+        r#"{"metrics":null,"touch":null,"ua":null}"#,
+        "desktop left an override behind"
+    );
+    assert_eq!(
+        input_log(&server),
+        r#"["Page.bringToFront", "Input.dispatchTouchEvent", "Input.dispatchTouchEvent", "Input.dispatchMouseEvent", "Input.dispatchMouseEvent"]"#
+    );
+}
+
+/// A bad emulate step is refused before anything runs.
+#[test]
+fn a_bad_emulate_step_is_a_bad_request() {
+    let server = TestServer::start("emulate-bad", true);
+    let response = server.post(
+        "/v1/act",
+        r#"{"actions":[{"do":"emulate","mode":"mobile","orientation":"sideways"}]}"#,
+    );
+    assert_eq!(status_code(&response), "400", "got {}", body_of(&response));
+    assert!(
+        body_of(&response).contains("orientation"),
+        "{}",
+        body_of(&response)
+    );
+}
+
 #[test]
 fn a_click_by_ref_is_a_real_mouse_click() {
     let server = TestServer::start("click-ref", true);
