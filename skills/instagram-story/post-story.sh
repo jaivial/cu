@@ -89,7 +89,16 @@ want=sys.argv[1]
 for line in raw.splitlines():
     m=re.search(r"ref=(e\d+) \S+ \"([^\"]*)\"",line)
     if m and m.group(2).strip()==want: print(m.group(1)); break' "$1"; }
-  d_click() { local r; r=$(d_ref "$1"); [ -n "$r" ] && T click "$r" >/dev/null 2>&1; }
+  # By accessible name first; some controls (the editor's share button) have none in cu's snapshot,
+  # so tag the one whose visible text matches and ask cu for its ref.
+  d_click() { local r; r=$(d_ref "$1")
+    if [ -z "$r" ]; then
+      [ "$(d_js "(()=>{document.querySelectorAll('[data-ps-target]').forEach(e=>e.removeAttribute('data-ps-target'));const b=[...document.querySelectorAll('button,[role=button],a')].find(e=>(e.innerText||'').trim()==='$1');if(!b)return '';b.setAttribute('data-ps-target','1');return '1'})()")" = 1 ] || return 1
+      r=$(T inspect --selector '[data-ps-target="1"]' 2>/dev/null | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("ref",""))
+except Exception: pass')
+    fi
+    [ -n "$r" ] && T click "$r" >/dev/null 2>&1; }
   # A tap on our avatar opens the viewer when a story is already up, so the image goes straight into
   # the page's story file input (the first one; cu >= upload --selector).
   d_upload() { T snapshot >/dev/null 2>&1; T upload --selector 'input[type=file]' "$2" >/dev/null 2>&1; }
