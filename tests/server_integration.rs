@@ -2006,3 +2006,516 @@ fn an_audit_runs_in_the_context_and_reports_the_page() {
     );
     assert_eq!(status_code(&response), "400", "got {response}");
 }
+
+// ── JavaScript dialogs ──────────────────────────────────────────────────────
+
+/// What the fake browser knows about dialogs: open ones, armed
+/// beforeunload handlers and how each dialog was answered.
+fn dialog_state(server: &TestServer) -> String {
+    server::http_get(&format!("127.0.0.1:{}", server.cdp_port), "/dialog-state")
+        .expect("dialog state")
+}
+
+/// Open a dialog on a tab from the page's side (a timer), as the fake does.
+fn open_dialog(server: &TestServer, target: &str, kind: &str, message: &str) {
+    server::http_get(
+        &format!("127.0.0.1:{}", server.cdp_port),
+        &format!("/dialog-open?target={target}&type={kind}&message={message}"),
+    )
+    .expect("open dialog");
+}
+
+/// The value of the first step of an act reply.
+fn first_value(body: &str) -> Option<String> {
+    server::json_string_value(body, "value")
+}
+
+/// A GET as session `pid` (the header the CLI sends).
+fn get_as(server: &TestServer, path: &str, pid: u32) -> String {
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nX-Cu-Session: {pid}\r\nContent-Length: 0\r\n\r\n",
+        server.token
+    );
+    send_fragmented(
+        &server.addr,
+        request.as_bytes(),
+        64,
+        Duration::from_millis(1),
+    )
+    .expect("GET should get a response")
+}
+
+/// Navigating away from a page that armed `beforeunload` used to leave the
+/// "Leave site?" dialog open: the navigation never returned and every later
+/// command on the tab timed out. Under the default policy cu accepts it --
+/// the agent asked to leave -- and the reply says so.
+#[test]
+fn navigating_away_from_a_beforeunload_page_is_accepted_by_policy() {
+    let server = TestServer::start("dialog-beforeunload", true);
+    let armed = server.post(
+        "/v1/act",
+        r#"{"actions":[{"do":"eval","js":"window.onbeforeunload = e => { e.preventDefault(); return 'unsaved'; }"}],"snapshot":false}"#,
+    );
+    assert_eq!(status_code(&armed), "200", "got {}", body_of(&armed));
+    assert!(
+        dialog_state(&server).contains("\"armed\": [\"PAGE1\"]"),
+        "{}",
+        dialog_state(&server)
+    );
+    let started = std::time::Instant::now();
+    let response = server.post("/v1/navigate", r#"{"url":"https://example.test/next"}"#);
+    let took = started.elapsed();
+    assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+    assert!(took < Duration::from_secs(3), "navigate took {took:?}");
+    let body = body_of(&response);
+    assert!(
+        body.contains("\"dialogs\":[{"),
+        "the reply does not say: {body}"
+    );
+    assert!(body.contains("\"type\":\"beforeunload\""), "{body}");
+    assert!(
+        body.contains("\"action\":\"accepted\",\"by\":\"policy\""),
+        "{body}"
+    );
+    let state = dialog_state(&server);
+    assert!(state.contains("\"result\": \"accepted\""), "{state}");
+    assert!(state.contains("\"open\": {}"), "{state}");
+    // The page answers again.
+    let snapshot = server.get("/v1/snapshot");
+    assert_eq!(status_code(&snapshot), "200", "got {}", body_of(&snapshot));
+}
+
+/// alert is accepted, confirm and prompt are dismissed; a tab's own policy
+/// changes that; each dialog is logged with its message, trimmed.
+#[test]
+fn alert_confirm_and_prompt_follow_the_policy() {
+    let server = TestServer::start("dialog-policy", true);
+    let eval = |js: &str| {
+        let response = server.post(
+            "/v1/act",
+            &format!(
+                "{{\"actions\":[{{\"do\":\"eval\",\"js\":{}}}],\"snapshot\":false}}",
+                server::json_string(js)
+            ),
+        );
+        assert_eq!(status_code(&response), "200", "got {}", body_of(&response));
+        body_of(&response).to_string()
+    };
+    let alert = eval("String(alert('hello there'))");
+    assert_eq!(first_value(&alert).as_deref(), Some("undefined"), "{alert}");
+    assert!(
+        alert.contains("\"type\":\"alert\",\"message\":\"hello there\""),
+        "{alert}"
+    );
+    assert!(alert.contains("\"action\":\"accepted\""), "{alert}");
+    let confirm = eval("String(confirm('delete everything?'))");
+    assert_eq!(first_value(&confirm).as_deref(), Some("false"), "{confirm}");
+    assert!(confirm.contains("\"action\":\"dismissed\""), "{confirm}");
+    let prompt = eval("String(prompt('your name?', 'nobody'))");
+    assert_eq!(first_value(&prompt).as_deref(), Some("null"), "{prompt}");
+
+    // The tab's own policy, on top of the daemon's.
+    let set = server.post(
+        "/v1/dialog/policy",
+        r#"{"policy":"confirm=accept,prompt=accept"}"#,
+    );
+    assert_eq!(status_code(&set), "200", "got {}", body_of(&set));
+    assert!(
+        body_of(&set).contains("\"confirm\":\"accept\""),
+        "{}",
+        body_of(&set)
+    );
+    assert!(
+        body_of(&set).contains("\"policy_from\":\"tab\""),
+        "{}",
+        body_of(&set)
+    );
+    let confirm = eval("String(confirm('really?'))");
+    assert_eq!(first_value(&confirm).as_deref(), Some("true"), "{confirm}");
+    let prompt = eval("String(prompt('your name?', 'nobody'))");
+    assert_eq!(first_value(&prompt).as_deref(), Some("nobody"), "{prompt}");
+    let bad = server.post("/v1/dialog/policy", r#"{"policy":"confirm=maybe"}"#);
+    assert_eq!(status_code(&bad), "400", "got {}", body_of(&bad));
+    let back = server.post("/v1/dialog/policy", r#"{"policy":"default"}"#);
+    assert!(
+        body_of(&back).contains("\"policy_from\":\"daemon\""),
+        "{}",
+        body_of(&back)
+    );
+
+    // The log: five dialogs, oldest first, a long message cut.
+    eval(&format!("String(alert('{}'))", "x".repeat(300)));
+    let log = server.get("/v1/dialog");
+    assert_eq!(status_code(&log), "200", "got {}", body_of(&log));
+    let log = body_of(&log);
+    assert!(log.contains("\"watching\":true"), "{log}");
+    assert!(log.contains("\"pending\":null"), "{log}");
+    assert_eq!(log.matches("\"seq\":").count(), 6, "{log}");
+    assert!(
+        log.contains(&format!("\"message\":\"{}...\"", "x".repeat(200))),
+        "{log}"
+    );
+    // URLs are cut to origin and path, like everywhere else in cu.
+    assert!(
+        log.contains("\"url\":\"https://example.test/page\""),
+        "{log}"
+    );
+    assert!(!log.contains("secret"), "{log}");
+}
+
+/// With policy manual a dialog stays open for the agent: commands on its tab
+/// fail at once, naming it, until `cu dialog accept|dismiss` answers it --
+/// including the command that opened it, which used to wait out its read
+/// timeout.
+#[test]
+fn a_manual_dialog_fails_commands_fast_until_answered() {
+    let server = TestServer::start("dialog-manual", true);
+    let set = server.post("/v1/dialog/policy", r#"{"policy":"all=manual"}"#);
+    assert_eq!(status_code(&set), "200", "got {}", body_of(&set));
+    // A prompt from the command itself: cut short, named.
+    let started = std::time::Instant::now();
+    let response = server.post(
+        "/v1/act",
+        r#"{"actions":[{"do":"eval","js":"String(prompt('who are you?', 'x'))"}],"snapshot":false}"#,
+    );
+    let took = started.elapsed();
+    assert_eq!(status_code(&response), "409", "got {}", body_of(&response));
+    assert!(took < Duration::from_secs(2), "the command waited {took:?}");
+    let body = body_of(&response);
+    assert!(body.contains("prompt dialog"), "{body}");
+    assert!(body.contains("who are you?"), "{body}");
+    assert!(body.contains("cu dialog accept"), "{body}");
+    // Later commands: refused before they reach the page.
+    for path in ["/v1/snapshot", "/v1/text", "/v1/screenshot"] {
+        let started = std::time::Instant::now();
+        let response = server.get(path);
+        assert_eq!(
+            status_code(&response),
+            "409",
+            "{path}: {}",
+            body_of(&response)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{path} took {:?}",
+            started.elapsed()
+        );
+    }
+    let state = server.get("/v1/dialog");
+    assert!(
+        body_of(&state).contains("\"pending\":{\"seq\":"),
+        "{}",
+        body_of(&state)
+    );
+    // The answer, with the prompt's text (which is never logged).
+    let answered = server.post("/v1/dialog/accept", r#"{"text":"Ada"}"#);
+    assert_eq!(status_code(&answered), "200", "got {}", body_of(&answered));
+    assert!(
+        body_of(&answered).contains("\"action\":\"accepted\""),
+        "{}",
+        body_of(&answered)
+    );
+    assert!(
+        dialog_state(&server).contains("\"text\": \"Ada\""),
+        "{}",
+        dialog_state(&server)
+    );
+    assert!(!body_of(&server.get("/v1/dialog")).contains("Ada"));
+    let snapshot = server.get("/v1/snapshot");
+    assert_eq!(status_code(&snapshot), "200", "got {}", body_of(&snapshot));
+    // Nothing waiting: answering is an error that says so.
+    let none = server.post("/v1/dialog/dismiss", "{}");
+    assert_eq!(status_code(&none), "409", "got {}", body_of(&none));
+    assert!(
+        body_of(&none).contains("no JavaScript dialog is waiting"),
+        "{}",
+        body_of(&none)
+    );
+    // A dialog the page opens on its own, between commands, is held too,
+    // and dismissed on request.
+    open_dialog(&server, "PAGE1", "confirm", "stay%3F");
+    let refused = server.get("/v1/snapshot");
+    assert_eq!(status_code(&refused), "409", "got {}", body_of(&refused));
+    assert!(
+        body_of(&refused).contains("confirm dialog"),
+        "{}",
+        body_of(&refused)
+    );
+    let dismissed = server.post("/v1/dialog/dismiss", "{}");
+    assert_eq!(
+        status_code(&dismissed),
+        "200",
+        "got {}",
+        body_of(&dismissed)
+    );
+    assert!(dialog_state(&server).contains("\"result\": \"dismissed\""));
+    assert_eq!(status_code(&server.get("/v1/snapshot")), "200");
+}
+
+/// `cu console` shows the dialogs as their own level, and a page stopped by
+/// one is answered from the daemon instead of hanging.
+#[test]
+fn the_dialog_log_is_in_the_console() {
+    let server = TestServer::start("dialog-console", true);
+    server.post(
+        "/v1/act",
+        r#"{"actions":[{"do":"eval","js":"String(alert('saved!'))"}],"snapshot":false}"#,
+    );
+    let text = server.get("/v1/console?level=dialog&format=text");
+    assert_eq!(status_code(&text), "200", "got {}", body_of(&text));
+    let text = body_of(&text);
+    assert!(text.contains("DIALOG"), "{text}");
+    assert!(text.contains("alert \"saved!\""), "{text}");
+    assert!(text.contains("accepted (policy)"), "{text}");
+    let json = server.get("/v1/console?level=all");
+    assert!(
+        body_of(&json).contains("\"dialogs\":[{"),
+        "{}",
+        body_of(&json)
+    );
+    // Other levels leave them out.
+    let errors = server.get("/v1/console?level=error&format=text");
+    assert!(!body_of(&errors).contains("DIALOG"), "{}", body_of(&errors));
+    // A page held by a manual dialog: the console still answers, at once.
+    server.post("/v1/dialog/policy", r#"{"policy":"alert=manual"}"#);
+    open_dialog(&server, "PAGE1", "alert", "held");
+    let started = std::time::Instant::now();
+    let held = server.get("/v1/console?format=text");
+    assert_eq!(status_code(&held), "200", "got {}", body_of(&held));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(
+        body_of(&held).contains("the page cannot be read"),
+        "{}",
+        body_of(&held)
+    );
+    assert!(body_of(&held).contains("\"held\""), "{}", body_of(&held));
+    server.post("/v1/dialog/accept", "{}");
+}
+
+/// A dialog that opened before cu watched the tab cannot be answered by any
+/// session (Chromium tells a late one "No dialog is showing"). cu says so,
+/// fast after the first try, and the tab can still be closed.
+#[test]
+fn a_dialog_nobody_watched_is_named_and_its_tab_can_be_closed() {
+    let server = TestServer::start("dialog-unwatched", true);
+    let created = server::browser_command(
+        server.cdp_port,
+        "Target.createTarget",
+        r#"{"url":"about:blank"}"#,
+    )
+    .expect("create target");
+    let id = server::json_string_value(&created, "targetId").expect("target id");
+    open_dialog(&server, &id, "alert", "too%20early");
+    let first = server.get(&format!("/v1/snapshot?tab={id}"));
+    assert_eq!(status_code(&first), "409", "got {}", body_of(&first));
+    assert!(
+        body_of(&first).contains("is not answering"),
+        "{}",
+        body_of(&first)
+    );
+    assert!(
+        body_of(&first).contains(&format!("cu tabs close {id}")),
+        "{}",
+        body_of(&first)
+    );
+    let started = std::time::Instant::now();
+    let again = server.get(&format!("/v1/text?tab={id}"));
+    assert_eq!(status_code(&again), "409", "got {}", body_of(&again));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    let answer = server.post(&format!("/v1/dialog/accept?tab={id}"), "{}");
+    assert_eq!(status_code(&answer), "409", "got {}", body_of(&answer));
+    let closed = server.fragmented(&format!(
+        "DELETE /v1/tabs/{id} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n",
+        server.token
+    ));
+    assert_eq!(body_of(&closed), r#"{"closed":true}"#, "{closed}");
+    assert!(!body_of(&server.get("/v1/tabs")).contains(&id));
+}
+
+/// The tab leak: while a session's tab was stopped by a dialog, every call
+/// of that session failed after a read timeout -- and calls that came to the
+/// daemon without a usable lease opened a fresh tab each, which the stopped
+/// renderer then stopped too. A session whose tab is stopped now gets that
+/// tab back, with the reason, and never another one.
+#[test]
+fn a_session_with_a_stopped_tab_never_gets_another() {
+    let server = TestServer::start("dialog-no-leak", true);
+    let (mut owner, pid) = live_pid();
+    let first = server.post("/v1/tabs", &format!("{{\"owner_pid\":{pid}}}"));
+    let id = server::json_value(body_of(&first), "id").expect("tab id");
+    let set = server.post(
+        &format!("/v1/dialog/policy?tab={id}"),
+        r#"{"policy":"beforeunload=manual"}"#,
+    );
+    assert_eq!(status_code(&set), "200", "got {}", body_of(&set));
+    open_dialog(&server, &id, "beforeunload", "");
+    let tabs_before = body_of(&server.get("/v1/tabs")).matches("\"id\":").count();
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        let response = get_as(&server, "/v1/snapshot", pid);
+        assert_eq!(status_code(&response), "409", "got {}", body_of(&response));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(response.contains(&format!("X-Cu-Tab: {id}")), "{response}");
+        assert!(
+            !response.contains("X-Cu-Tab-New"),
+            "a new tab was opened: {response}"
+        );
+        assert!(
+            body_of(&response).contains("beforeunload dialog"),
+            "{}",
+            body_of(&response)
+        );
+    }
+    let tabs_after = body_of(&server.get("/v1/tabs")).matches("\"id\":").count();
+    assert_eq!(
+        tabs_before,
+        tabs_after,
+        "{}",
+        body_of(&server.get("/v1/tabs"))
+    );
+    let _ = owner.kill();
+    let _ = owner.wait();
+}
+
+/// "It is collected when the session exits": a tab whose owner has exited
+/// is closed by the collector -- also when a dialog stops it, since closing
+/// a target does not need the page -- and its watcher and log go with it.
+#[test]
+fn the_tab_of_an_exited_session_is_collected_even_when_stopped() {
+    let server = TestServer::start("dialog-reap", true);
+    let (mut owner, pid) = live_pid();
+    let first = server.post("/v1/tabs", &format!("{{\"owner_pid\":{pid}}}"));
+    let id = server::json_value(body_of(&first), "id").expect("tab id");
+    server.post(
+        &format!("/v1/dialog/policy?tab={id}"),
+        r#"{"policy":"all=manual"}"#,
+    );
+    open_dialog(&server, &id, "confirm", "leave%3F");
+    // The owner is alive: nothing is collected.
+    assert!(server::reap_orphan_tabs(server.cdp_port, Duration::ZERO).is_empty());
+    owner.kill().expect("kill owner");
+    owner.wait().expect("reap owner");
+    for _ in 0..100 {
+        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Within the grace a tab is left alone (a --tab user may still come).
+    assert!(server::reap_orphan_tabs(server.cdp_port, Duration::from_secs(3600)).is_empty());
+    let collected = server::reap_orphan_tabs(server.cdp_port, Duration::ZERO);
+    assert_eq!(collected, vec![id.clone()]);
+    let state = dialog_state(&server);
+    assert!(state.contains(&format!("\"closed\": [\"{id}\"")), "{state}");
+    assert!(state.contains("\"result\": \"closed\""), "{state}");
+    assert!(!body_of(&server.get("/v1/tabs")).contains(&id));
+    // The default collection grace is short: a minute, not ten.
+    assert!(server::TAB_GC_IDLE <= Duration::from_secs(60));
+}
+
+/// A session in another pid namespace (a sandbox, a container) names a pid
+/// the daemon cannot look up. It used to be taken for dead -- a fresh tab
+/// on every call -- or for some unrelated live process. Its tab is kept
+/// for it, and collected only after the long idle.
+#[test]
+fn a_session_in_another_pid_namespace_keeps_its_tab() {
+    let server = TestServer::start("tabs-foreign-ns", true);
+    let body = r#"{"owner_pid":4000000,"owner_ns":1}"#;
+    let first = server.post("/v1/tabs", body);
+    assert_eq!(status_code(&first), "200", "got {}", body_of(&first));
+    assert!(
+        body_of(&first).contains("\"reused\":false"),
+        "{}",
+        body_of(&first)
+    );
+    let second = server.post("/v1/tabs", body);
+    assert!(
+        body_of(&second).contains("\"reused\":true"),
+        "{}",
+        body_of(&second)
+    );
+    assert_eq!(
+        server::json_value(body_of(&first), "id"),
+        server::json_value(body_of(&second), "id")
+    );
+    assert!(server::reap_orphan_tabs(server.cdp_port, Duration::ZERO).is_empty());
+    // The same pid in the daemon's own namespace is a dead process.
+    let local = server.post("/v1/tabs", r#"{"owner_pid":4000000}"#);
+    assert!(
+        body_of(&local).contains("\"reused\":false"),
+        "{}",
+        body_of(&local)
+    );
+}
+
+/// A script's `$(cu ...)` runs cu in a forked subshell. Taking that subshell
+/// for the session gave each substitution a session -- and a fresh tab -- of
+/// its own, so a script polling a page with `x=$(cu eval ...)` opened a tab
+/// per call. The subshell is now seen through: one script, one tab.
+#[test]
+fn a_scripts_command_substitutions_share_its_tab() {
+    let dir = std::env::temp_dir().join(format!("cu-it-subshell-{}", std::process::id()));
+    let _ = remove_dir(&dir);
+    std::fs::create_dir_all(&dir).expect("data dir");
+    let (port, cdp_port) = (free_port(), free_port());
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_cu"))
+        .args(["daemon", "--port", &port.to_string(), "--cdp-port"])
+        .arg(cdp_port.to_string())
+        .arg("--data")
+        .arg(&dir)
+        .env(
+            "CU_BROWSER",
+            env!("CARGO_MANIFEST_DIR").to_owned() + "/tests/fake_chromium.py",
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn cu daemon");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if std::fs::read_to_string(dir.join("server.json")).is_ok()
+            && TcpStream::connect(("127.0.0.1", port)).is_ok()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let script = dir.join("poll.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "for i in 1 2 3; do x=$('{}' snapshot 2>&1 >/dev/null | grep -o 'tab ([A-Z0-9]*)'); echo \"$x\"; done\n",
+            env!("CARGO_BIN_EXE_cu")
+        ),
+    )
+    .expect("script");
+    let out = Command::new("bash")
+        .arg(&script)
+        .env("CU_DAEMON_DIR", &dir)
+        .env_remove("CU_DATA_DIR")
+        .output()
+        .expect("run script");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let tabs: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        tabs.len(),
+        3,
+        "{stdout} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        tabs.iter().all(|t| *t == tabs[0]),
+        "each substitution got a tab of its own: {stdout}"
+    );
+    let _ = Command::new("kill").arg(daemon.id().to_string()).status();
+    let _ = daemon.wait();
+    let _ = remove_dir(&dir);
+}

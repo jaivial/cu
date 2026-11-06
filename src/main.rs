@@ -130,6 +130,10 @@ fn main() {
         },
         // `cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]`
         Some("console") => console_cmd(&args[1..], &on_tab),
+        // `cu dialog [accept [TEXT] | dismiss | policy [SPEC]]`: JavaScript
+        // dialogs on the tab -- the one waiting for an answer, the log, the
+        // policy that answers them.
+        Some("dialog") => dialog_cmd(&args[1..], &on_tab),
         Some("text") => page_request("GET", &on_tab("/v1/text"), None).map(|s| println!("{s}")),
         Some("downloads") => request("GET", "/v1/downloads", None).map(|s| println!("{s}")),
         Some("tabs") => match args.get(1).map(String::as_str) {
@@ -325,7 +329,7 @@ fn wait_for_handoff(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<
 
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release|wait [--timeout S]]\n  cu handoff [wait [--timeout S]]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]\n          levels: debug|verbose log info trace warn error exception csp network, all, LEVEL+\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF | --selector CSS] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu mcp   the daemon's tools as an MCP server on stdio (pi, Claude Code, Codex, Cursor)\n  cu seo audit URL [--keywords \"k1,k2\"] [--context C] [--geo LOC] [--md]\n  cu seo crawl URL [--max-pages N] [--depth N] [--delay-ms MS] [--keywords K] [--out FILE.jsonl]\n  cu seo geo CONTEXT \"Town,Region,Country\" [--proxy URL] [--lat N --lon N] [--lang L] [--tz Z]\n  cu seo geo CONTEXT            what a page in CONTEXT sees (language, zone, position)\n  cu seo robots URL\n  cu serp QUERY [--geo LOC | --context C] [--engine google|bing|duckduckgo] [--num N]\n          [--target DOMAIN] [--proxy URL] [--md]\n  cu serp compare QUERY --geo LOC1 --geo LOC2 [...] [--engine E] [--md]\n          LOC: \"ES\", \"Sevilla,ES\", \"Getxo,Bizkaia,ES\" (town, region, country)\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n  cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup]\n          [--wait] [--timeout S]\n  cu otp wait ID [--timeout S] | cancel ID | list\n  cu otp capture --tab T [--domain D] [--request ID] [--credential ID] [--replace]\n  cu otp code DOMAIN | --credential ID\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release|wait [--timeout S]]\n  cu handoff [wait [--timeout S]]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]\n          levels: debug|verbose log info trace warn error exception csp network dialog, all, LEVEL+\n  cu dialog [accept [TEXT] | dismiss | policy [SPEC]]   JavaScript dialogs (CU_DIALOGS sets the daemon's policy)\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF | --selector CSS] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu mcp   the daemon's tools as an MCP server on stdio (pi, Claude Code, Codex, Cursor)\n  cu seo audit URL [--keywords \"k1,k2\"] [--context C] [--geo LOC] [--md]\n  cu seo crawl URL [--max-pages N] [--depth N] [--delay-ms MS] [--keywords K] [--out FILE.jsonl]\n  cu seo geo CONTEXT \"Town,Region,Country\" [--proxy URL] [--lat N --lon N] [--lang L] [--tz Z]\n  cu seo geo CONTEXT            what a page in CONTEXT sees (language, zone, position)\n  cu seo robots URL\n  cu serp QUERY [--geo LOC | --context C] [--engine google|bing|duckduckgo] [--num N]\n          [--target DOMAIN] [--proxy URL] [--md]\n  cu serp compare QUERY --geo LOC1 --geo LOC2 [...] [--engine E] [--md]\n          LOC: \"ES\", \"Sevilla,ES\", \"Getxo,Bizkaia,ES\" (town, region, country)\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n  cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup]\n          [--wait] [--timeout S]\n  cu otp wait ID [--timeout S] | cancel ID | list\n  cu otp capture --tab T [--domain D] [--request ID] [--credential ID] [--replace]\n  cu otp code DOMAIN | --credential ID\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
     );
 }
 
@@ -686,6 +690,12 @@ fn session_headers(new_tab: bool) -> Vec<(&'static str, String)> {
     }
     let owner = session_pid().to_string();
     let mut headers = vec![("X-Cu-Session", owner)];
+    // The pid means something to the daemon only in the same pid namespace:
+    // it says which one, so a session in a sandbox or container is not taken
+    // for a dead (or an unrelated) process.
+    if let Some(ns) = server::pid_ns_of("self") {
+        headers.push(("X-Cu-Session-Ns", ns.to_string()));
+    }
     if new_tab {
         headers.push(("X-Cu-Session-Fresh", "1".to_string()));
     }
@@ -736,7 +746,7 @@ fn session_pid() -> u32 {
         if parent <= 1 {
             break;
         }
-        if !is_transient_shell(parent) {
+        if !is_transient_shell(parent) && !is_subshell(parent) {
             return parent;
         }
         pid = parent;
@@ -771,6 +781,25 @@ fn is_transient_shell(pid: u32) -> bool {
             .unwrap_or(false),
         false => WRAPPERS.contains(&comm),
     }
+}
+
+/// A forked copy of a shell: the subshell a script runs a `$(cu ...)`, a
+/// pipeline or a `( ... )` in. It has its parent's name and command line
+/// and lives for one command, so the session is the shell it was forked
+/// from. Taking it for the session gave every `ref=$(cu snapshot | grep ..)`
+/// of a script a session -- and a fresh tab -- of its own: a loop polling a
+/// page that way opened one tab per iteration.
+fn is_subshell(pid: u32) -> bool {
+    let comm = |pid: u32| fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+    let cmdline = |pid: u32| fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    let own = comm(pid);
+    if !SHELLS.contains(&own.trim()) {
+        return false;
+    }
+    let Some(parent) = parent_of(pid) else {
+        return false;
+    };
+    parent > 1 && comm(parent) == own && cmdline(parent) == cmdline(pid)
 }
 
 /// Shells and one-shot wrappers an agent (or a person) runs a command through.
@@ -1161,6 +1190,9 @@ fn mcp(args: &[String]) -> Result<(), String> {
             if call.session && daemon_config().is_some() {
                 // This process is the session: one MCP connection, one page.
                 headers.push(("X-Cu-Session", std::process::id().to_string()));
+                if let Some(ns) = server::pid_ns_of("self") {
+                    headers.push(("X-Cu-Session-Ns", ns.to_string()));
+                }
                 if call.fresh {
                     headers.push(("X-Cu-Session-Fresh", "1".to_string()));
                 }
@@ -1892,6 +1924,37 @@ mod tests {
 }
 
 /// `cu console`: the page's console output, filtered by level.
+/// `cu dialog`: the tab's JavaScript dialogs. Without arguments, the one
+/// waiting for an answer (if any), the policy and the log; `accept [TEXT]`
+/// and `dismiss` answer a dialog the policy left open (`manual`); `policy
+/// SPEC` sets the tab's own policy (`confirm=manual`, `all=accept`,
+/// `default` for the daemon's).
+fn dialog_cmd(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), String> {
+    const USAGE: &str = "usage: cu dialog [accept [TEXT] | dismiss | policy [KIND=accept|dismiss|manual,... | default]]";
+    let reply = match args.first().map(String::as_str) {
+        None => page_request("GET", &on_tab("/v1/dialog"), None)?,
+        Some("accept") => {
+            let body = match args.get(1) {
+                Some(text) => format!("{{\"text\":{}}}", server::json_string(text)),
+                None => "{}".to_string(),
+            };
+            page_request("POST", &on_tab("/v1/dialog/accept"), Some(&body))?
+        }
+        Some("dismiss") => page_request("POST", &on_tab("/v1/dialog/dismiss"), Some("{}"))?,
+        Some("policy") => match args.get(1) {
+            None => page_request("GET", &on_tab("/v1/dialog"), None)?,
+            Some(spec) => page_request(
+                "POST",
+                &on_tab("/v1/dialog/policy"),
+                Some(&format!("{{\"policy\":{}}}", server::json_string(spec))),
+            )?,
+        },
+        Some(other) => return Err(format!("unknown dialog command {other}; {USAGE}")),
+    };
+    println!("{reply}");
+    Ok(())
+}
+
 fn console_cmd(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), String> {
     let usage = "usage: cu console [--level L[,L]|warn+|all] [--grep TEXT] [--limit N] [--since N] [--clear] [--json]";
     let (mut level, mut grep, mut limit, mut since) =

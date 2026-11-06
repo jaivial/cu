@@ -604,7 +604,7 @@ const TOOLS: &[Tool] = &[
         name: "console",
         title: "Page console",
         description: "What the page wrote to its console, plus uncaught exceptions, CSP violations and network failures, as text lines (or JSON).",
-        properties: r#""level":{"type":"string","description":"debug, log, info, trace, warn, error, exception, csp or network; a comma list; LEVEL+ for that level and above (warn+); or all (default)."},"grep":{"type":"string","description":"Only entries containing this text."},"limit":{"type":"number","description":"At most this many entries (default 200)."},"since":{"type":"number","description":"Only entries after this sequence number."},"clear":{"type":"boolean","description":"Empty the buffer after reading."},"json":{"type":"boolean","description":"Answer JSON instead of text lines."}"#,
+        properties: r#""level":{"type":"string","description":"debug, log, info, trace, warn, error, exception, csp, network or dialog (the JavaScript dialogs cu answered); a comma list; LEVEL+ for that level and above (warn+); or all (default)."},"grep":{"type":"string","description":"Only entries containing this text."},"limit":{"type":"number","description":"At most this many entries (default 200)."},"since":{"type":"number","description":"Only entries after this sequence number."},"clear":{"type":"boolean","description":"Empty the buffer after reading."},"json":{"type":"boolean","description":"Answer JSON instead of text lines."}"#,
         required: &[],
         target: Target::Page,
         read_only: false,
@@ -670,6 +670,18 @@ const TOOLS: &[Tool] = &[
         read_only: true,
         destructive: false,
         idempotent: true,
+        open_world: false,
+    },
+    Tool {
+        name: "dialog",
+        title: "JavaScript dialogs",
+        description: "JavaScript dialogs (alert, confirm, prompt, the \"Leave site?\" of beforeunload) on the page. cu answers each one by policy the moment it opens -- beforeunload and alert accepted, confirm and prompt dismissed by default -- and logs it; an action's reply lists the dialogs it caused. With policy manual a dialog stays open and page tools on its tab fail at once naming it, until you answer it here. No arguments: the dialog waiting (if any), the policy and the log. `answer`: accept or dismiss the waiting dialog (`text` answers a prompt). `policy`: this tab's own, e.g. \"confirm=manual\" or \"all=accept\"; \"default\" goes back to the daemon's.",
+        properties: r#""answer":{"type":"string","enum":["accept","dismiss"],"description":"Answer the dialog waiting on the tab."},"text":{"type":"string","description":"The text to answer a prompt with (with answer accept)."},"policy":{"type":"string","description":"KIND=ANSWER list for this tab: KIND alert, confirm, prompt, beforeunload or all; ANSWER accept, dismiss or manual; or default."}"#,
+        required: &[],
+        target: Target::Page,
+        read_only: false,
+        destructive: false,
+        idempotent: false,
         open_world: false,
     },
     Tool {
@@ -1076,6 +1088,33 @@ fn plan(name: &str, args: &Args) -> Result<Call, String> {
             };
             page(args, "GET", "/v1/marks", query, None)
         }
+        "dialog" => match (args.str("answer"), args.str("policy")) {
+            (Some(_), Some(_)) => Err("give either `answer` or `policy`, not both".into()),
+            (Some(answer @ ("accept" | "dismiss")), None) => {
+                let body = match args.str("text") {
+                    Some(text) if answer == "accept" => {
+                        format!("{{\"text\":{}}}", json_string(text))
+                    }
+                    _ => "{}".to_string(),
+                };
+                page(
+                    args,
+                    "POST",
+                    &format!("/v1/dialog/{answer}"),
+                    Vec::new(),
+                    Some(body),
+                )
+            }
+            (Some(other), None) => Err(format!("`answer` is accept or dismiss, not {other:?}")),
+            (None, Some(spec)) => page(
+                args,
+                "POST",
+                "/v1/dialog/policy",
+                Vec::new(),
+                Some(format!("{{\"policy\":{}}}", json_string(spec))),
+            ),
+            (None, None) => page(args, "GET", "/v1/dialog", Vec::new(), None),
+        },
         "handoff" => {
             if args.flag("release")? == Some(true) {
                 return page(
@@ -1608,5 +1647,38 @@ impl Parser<'_> {
             self.at = resume;
             Ok('\u{fffd}')
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan_of(args: &str) -> Result<Call, String> {
+        let json = Json::parse(args).expect("args parse");
+        plan("dialog", &Args(&json))
+    }
+
+    #[test]
+    fn the_dialog_tool_reads_answers_and_sets_the_policy() {
+        let read = plan_of("{}").unwrap();
+        assert_eq!((read.method, read.path.as_str()), ("GET", "/v1/dialog"));
+        assert!(read.session);
+        let accept = plan_of(r#"{"answer":"accept","text":"Ada","tab":"T1"}"#).unwrap();
+        assert_eq!(accept.method, "POST");
+        assert_eq!(accept.path, "/v1/dialog/accept?tab=T1");
+        assert_eq!(accept.body.as_deref(), Some(r#"{"text":"Ada"}"#));
+        let dismiss = plan_of(r#"{"answer":"dismiss","text":"ignored"}"#).unwrap();
+        assert_eq!(dismiss.path, "/v1/dialog/dismiss");
+        assert_eq!(dismiss.body.as_deref(), Some("{}"));
+        let policy = plan_of(r#"{"policy":"confirm=manual"}"#).unwrap();
+        assert_eq!(policy.path, "/v1/dialog/policy");
+        assert_eq!(
+            policy.body.as_deref(),
+            Some(r#"{"policy":"confirm=manual"}"#)
+        );
+        assert!(plan_of(r#"{"answer":"maybe"}"#).is_err());
+        assert!(plan_of(r#"{"answer":"accept","policy":"all=accept"}"#).is_err());
+        assert!(tools_list().unwrap().contains("\"name\":\"dialog\""));
     }
 }

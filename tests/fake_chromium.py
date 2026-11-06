@@ -12,7 +12,10 @@ import json
 import os
 import struct
 import sys
+import re
 import threading
+import time
+from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Started by the tests with the port as the first argument, or by the daemon
@@ -118,6 +121,126 @@ CHILD_CONTEXT = 7
 GENERATION = [0]
 # (frame id, generation) -> execution context id.
 CONTEXTS = {}
+# JavaScript dialogs, as Chromium 156 handles them (measured):
+# - Page.javascriptDialogOpening goes only to the sessions of the tab that
+#   had Page enabled when the dialog opened, and only those may answer it
+#   with Page.handleJavaScriptDialog; any other session is told "No dialog
+#   is showing";
+# - while a dialog is open the page's renderer is stopped: an evaluation,
+#   an input event, a navigation -- and a fresh session's Page.enable --
+#   wait until it closes;
+# - Target.closeTarget closes a tab whatever dialog it shows.
+# A dialog opens from an evaluation that calls alert('..') / confirm('..') /
+# prompt('..', '..'), from a navigation away from a page whose
+# onbeforeunload was armed (an evaluation mentioning onbeforeunload arms
+# it), or from GET /dialog-open?target=T&type=K&message=M (the page's own
+# timer). GET /dialog-state shows what is open, armed and how each dialog
+# was answered.
+DIALOG_COND = threading.Condition()
+# target -> {"type", "message", "default", "eligible": set of handlers}
+DIALOGS = {}
+# targets whose page has a beforeunload handler armed
+ARMED = set()
+# Every dialog, in order: {"target", "type", "message", "result", "text"}
+# (result None while it is open, "closed" when its tab went).
+DIALOG_LOG = []
+# target -> the websocket handlers attached to it
+HANDLERS = {}
+# Commands a stopped renderer cannot answer until its dialog closes.
+RENDERER_METHODS = (
+    "Runtime.evaluate",
+    "Runtime.callFunctionOn",
+    "Page.getFrameTree",
+    "Page.createIsolatedWorld",
+    "Page.captureScreenshot",
+    "Page.navigate",
+    "Page.reload",
+    "Input.dispatchMouseEvent",
+    "Input.dispatchTouchEvent",
+    "Input.dispatchKeyEvent",
+    "Input.insertText",
+    "DOM.getFrameOwner",
+    "DOM.resolveNode",
+)
+DIALOG_CALL = re.compile(r"\b(alert|confirm|prompt)\(\s*'([^']*)'(?:\s*,\s*'([^']*)')?\s*\)")
+
+
+def open_dialog(target, kind, message, default=""):
+    """Open a dialog on target and tell the sessions watching it."""
+    with DIALOG_COND:
+        handlers = list(HANDLERS.get(target, ()))
+        eligible = {h for h in handlers if h.page_enabled}
+        DIALOGS[target] = {
+            "type": kind,
+            "message": message,
+            "default": default,
+            "eligible": eligible,
+            "log": len(DIALOG_LOG),
+        }
+        DIALOG_LOG.append(
+            {"target": target, "type": kind, "message": message, "result": None, "text": None}
+        )
+    event = {
+        "method": "Page.javascriptDialogOpening",
+        "params": {
+            "url": "https://example.test/page?token=secret",
+            "frameId": "MAINFRAME",
+            "message": message,
+            "type": kind,
+            "hasBrowserHandler": True,
+            "defaultPrompt": default,
+        },
+    }
+    for handler in eligible:
+        handler.reply(event)
+
+
+def close_dialog(target, accept, text=None, result=None):
+    """Close the dialog of target; returns what the page got from it."""
+    with DIALOG_COND:
+        dialog = DIALOGS.pop(target, None)
+        if dialog is None:
+            return None
+        entry = DIALOG_LOG[dialog["log"]]
+        entry["result"] = result or ("accepted" if accept else "dismissed")
+        entry["text"] = text
+        dialog["accepted"] = accept
+        dialog["text"] = text
+        handlers = [h for h in HANDLERS.get(target, ()) if h.page_enabled]
+        DIALOG_COND.notify_all()
+    event = {
+        "method": "Page.javascriptDialogClosed",
+        "params": {"frameId": "MAINFRAME", "result": bool(accept), "userInput": text or ""},
+    }
+    for handler in handlers:
+        handler.reply(event)
+    return dialog
+
+
+def wait_closed(target, timeout=30.0):
+    """Block while target shows a dialog: what a stopped renderer does."""
+    deadline = time.time() + timeout
+    with DIALOG_COND:
+        while target in DIALOGS and time.time() < deadline:
+            DIALOG_COND.wait(0.05)
+        return target not in DIALOGS
+
+
+def run_dialog(target, kind, message, default=""):
+    """Open a dialog and wait for its answer: (accepted, text) or None."""
+    open_dialog(target, kind, message, default)
+    deadline = time.time() + 30.0
+    with DIALOG_COND:
+        while target in DIALOGS and time.time() < deadline:
+            DIALOG_COND.wait(0.05)
+        entry = [e for e in DIALOG_LOG if e["target"] == target][-1]
+    if entry["result"] in ("accepted",):
+        return True, entry["text"]
+    if entry["result"] == "dismissed":
+        return False, None
+    return None
+
+
 FAKE_SNAPSHOT = json.dumps(
     {
         "url": "https://example.test/",
@@ -199,6 +322,25 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
             self.send_raw(json.dumps(len(sockets)))
+        elif self.path.startswith("/dialog-open"):
+            q = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+            threading.Thread(
+                target=open_dialog,
+                args=(q.get("target", "PAGE1"), q.get("type", "alert"), q.get("message", ""), q.get("default", "")),
+                daemon=True,
+            ).start()
+            # Long enough for the event to reach whoever watches the tab.
+            time.sleep(0.25)
+            self.send_json({"opened": True})
+        elif self.path == "/dialog-state":
+            with DIALOG_COND:
+                state = {
+                    "open": {t: {"type": d["type"], "message": d["message"]} for t, d in DIALOGS.items()},
+                    "armed": sorted(ARMED),
+                    "log": list(DIALOG_LOG),
+                    "closed": sorted(CLOSED),
+                }
+            self.send_json(state)
         elif self.path == "/viewport":
             self.send_raw(json.dumps(EMULATED[0], separators=(",", ":")))
         elif self.path.startswith("/emulate"):
@@ -294,11 +436,18 @@ class Handler(BaseHTTPRequestHandler):
     def serve_websocket(self):
         if not self.handshake():
             return
+        self.target = self.path.rstrip("/").rsplit("/", 1)[-1]
+        self.page_enabled = False
+        self.send_lock = threading.Lock()
         with SOCKETS_LOCK:
             SOCKETS.add(self.connection)
+        with DIALOG_COND:
+            HANDLERS.setdefault(self.target, set()).add(self)
         try:
             self.serve_commands()
         finally:
+            with DIALOG_COND:
+                HANDLERS.get(self.target, set()).discard(self)
             # A websocket that ends is a closed socket, never a keep-alive.
             self.close_connection = True
             with SOCKETS_LOCK:
@@ -341,15 +490,79 @@ class Handler(BaseHTTPRequestHandler):
             if method in GEO_METHODS:
                 GEO_LOG.append({"method": method, "params": message.get("params") or {}})
             self.track_emulation(method, message.get("params"))
-            reply = self.result_for(method, message.get("params"))
+            reply = self.dialog_result(method, message.get("params") or {})
+            if reply is None:
+                reply = self.result_for(method, message.get("params"))
             reply["id"] = message.get("id", 1)
             self.reply(reply)
+            if method == "Target.closeTarget":
+                self.kill_target((message.get("params") or {}).get("targetId"))
             if method == "Browser.close":
                 if CLOSED_MARKER:
                     open(CLOSED_MARKER, "w").write("closed\n")
                 os._exit(0)
             if (message.get("params") or {}).get("expression") == HANGUP_EXPRESSION:
                 break
+
+    def kill_target(self, target):
+        """Chromium closes a tab whatever it shows, and its sessions."""
+        close_dialog(target, False, result="closed")
+        ARMED.discard(target)
+        with DIALOG_COND:
+            handlers = list(HANDLERS.get(target, ()))
+        for handler in handlers:
+            try:
+                handler.connection.shutdown(2)
+            except OSError:
+                pass
+
+    def dialog_result(self, method, params):
+        """The dialog side of a command, or None to answer it as usual."""
+        target = self.target
+        if method == "Page.handleJavaScriptDialog":
+            with DIALOG_COND:
+                dialog = DIALOGS.get(target)
+                eligible = dialog is not None and self in dialog["eligible"]
+            if not eligible:
+                return {"error": {"code": -32602, "message": "No dialog is showing"}}
+            close_dialog(target, bool(params.get("accept")), params.get("promptText"))
+            return {"result": {}}
+        if method == "Page.enable":
+            if not self.page_enabled and not wait_closed(target):
+                return {"error": {"code": -32000, "message": "timed out"}}
+            self.page_enabled = True
+            return {"result": {}}
+        if method not in RENDERER_METHODS:
+            return None
+        # A stopped renderer answers nothing until its dialog closes.
+        wait_closed(target)
+        expression = params.get("expression") or ""
+        if method == "Runtime.evaluate" and "onbeforeunload" in expression:
+            ARMED.add(target)
+            return {"result": {"result": {"type": "string", "value": "armed"}}}
+        if method == "Runtime.evaluate":
+            call = DIALOG_CALL.search(expression)
+            if call:
+                kind, text, default = call.group(1), call.group(2), call.group(3) or ""
+                outcome = run_dialog(target, kind, text, default)
+                if outcome is None:
+                    return {"error": {"code": -32000, "message": "Target closed"}}
+                accepted, typed = outcome
+                value = {
+                    "alert": "undefined",
+                    "confirm": "true" if accepted else "false",
+                    "prompt": (typed if typed is not None else default) if accepted else "null",
+                }[kind]
+                return {"result": {"result": {"type": "string", "value": value}}}
+        if method == "Page.navigate" and target in ARMED:
+            outcome = run_dialog(target, "beforeunload", "")
+            if outcome is None:
+                return {"error": {"code": -32000, "message": "Target closed"}}
+            if not outcome[0]:
+                # The person chose to stay: the navigation never starts.
+                return {"result": {"frameId": "f", "errorText": "net::ERR_ABORTED"}}
+            ARMED.discard(target)
+        return None
 
     def handshake(self):
         key = (self.headers.get("Sec-WebSocket-Key") or "").strip()
@@ -636,6 +849,13 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     value = '{"x":10.5,"y":20}'
                 return {"result": {"result": {"type": "string", "value": value}}}
+            if "Symbol.for('cu.console')" in expr:
+                # The console read: an empty buffer, as text or JSON.
+                if "a.lines(o)" in expr:
+                    value = "(no matching console output)\n-- 0 of 0 matching, last #0 --"
+                else:
+                    value = '{"entries":[],"matched":0,"last":0,"page":"https://example.test/"}'
+                return {"result": {"result": {"type": "string", "value": value}}}
             if "__cu.focus(" in expr or "__cu.select(" in expr:
                 return {"result": {"result": {"type": "string", "value": "{}"}}}
             if "innerWidth" in expr and "innerHeight" in expr and "devicePixelRatio" not in expr:
@@ -668,7 +888,15 @@ class Handler(BaseHTTPRequestHandler):
             frame.append(127)
             frame += len(payload).to_bytes(8, "big")
         frame += payload
-        self.connection.sendall(bytes(frame))
+        lock = getattr(self, "send_lock", None)
+        try:
+            if lock is None:
+                self.connection.sendall(bytes(frame))
+            else:
+                with lock:
+                    self.connection.sendall(bytes(frame))
+        except OSError:
+            pass
 
 
 class Server(ThreadingHTTPServer):

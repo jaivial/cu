@@ -47,6 +47,16 @@ Use `cu` when an agent needs a persistent local browser session.
    `orientation` and `scale`). It stays on through the page's reloads and
    your later commands until `{"do":"emulate","mode":"desktop"}`, and clicks
    on the tab become touch taps.
+   JavaScript dialogs are answered for you as they open (`beforeunload` and
+   `alert` accepted, `confirm` and `prompt` dismissed); the reply of the
+   action lists them under `"dialogs"`, and `cu dialog` shows the log. So a
+   `cu navigate` away from an editor that asks "Leave site?" just leaves. To
+   decide yourself, `cu dialog policy confirm=manual` (or `all=manual`): a
+   command on the tab then fails at once naming the dialog -- answer with
+   `cu dialog accept [TEXT]` or `cu dialog dismiss`. A tab that "is not
+   answering" (a dialog opened before cu watched it) cannot be saved: close
+   it with `cu tabs close ID`. Do not open `--new-tab` after `--new-tab` to get
+   away from a stopped page; the reason is in the error.
 6. Credentials. When you have them (a test account, a secret the user gave you, a vault entry, `cu otp code`), type them like any field: `cu type e4 "$PASSWORD"` or a `type` step in `cu act`. Read them from a `chmod 600` secrets file into a variable rather than writing the literal on the command line, and never repeat one in your answer; cu never echoes it back (no reply carries a field's value). When the user should type their own, run `cu login`, navigate to the site's sign-in page, then direct them to the printed `/login` page; the daemon types what they enter.
 7. Popups and extra tabs: `cu tabs` lists them (the default is flagged);
    any page command takes `--tab ID` to run there, and `cu tabs close ID`
@@ -109,7 +119,7 @@ Use `cu` when an agent needs a persistent local browser session.
 12. Over MCP. When the harness has the `cu mcp` server configured (tools named
     like `mcp__cu__navigate`), the same flow is tools instead of commands:
     `navigate`, `snapshot`, `click`, `type`, `act`, `screenshot`, `tabs`,
-    `console`, `inspect`, `mark`/`marks`, `handoff`, `login_url`... The
+    `console`, `inspect`, `mark`/`marks`, `handoff`, `dialog`, `login_url`... The
     connection is the session: its page tools share one tab (pass `tab` for a
     popup), and the tab is closed when the connection ends. No MCP tool takes a
     password or a code: `login_url` for sign-ins, and the vault and `cu otp`

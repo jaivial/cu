@@ -21,10 +21,10 @@
 //! set them on a pooled connection, which the daemon drops whenever a
 //! navigation outlasts the settle budget, a read times out or the pool
 //! overflows -- so a page that reloads itself (Instagram's editor does) could
-//! come back as a desktop. Here each emulated tab gets a *keeper*: a
-//! dedicated connection that sets the overrides and is held open, idle, for
-//! as long as the emulation is on. Nothing is subscribed on it, so it never
-//! fills up.
+//! come back as a desktop. Here the overrides are set on the tab's *keeper*
+//! ([`crate::keeper`]): the one session cu holds open for the tab's whole
+//! life, read all the time (it also answers the tab's JavaScript dialogs and
+//! carries its console capture).
 //!
 //! The metrics are also shared state: any session's
 //! `Emulation.clearDeviceMetricsOverride` clears them for every session (a
@@ -34,13 +34,16 @@
 //! the screen, ratio and orientation do not). [`reassert`] clears on the
 //! keeper first and sets again, which puts the whole device back.
 //!
-//! `desktop` resets what the keeper set and closes it, so the tab is exactly
+//! `desktop` resets what the keeper set (the keeper stays), so the tab is exactly
 //! what an un-emulated cu tab is: the browser's own window and the same
 //! User-Agent every other cu tab answers with.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::server::{CdpConnection, Tab, json_string, json_string_value};
+use std::time::Duration;
+
+use crate::keeper::Keeper;
+use crate::server::{Tab, json_string, json_string_value};
 
 /// Largest viewport side accepted, in CSS pixels (as for `cu shot`).
 pub const MAX_SIDE: u32 = 8192;
@@ -360,14 +363,14 @@ pub fn brand_lists(engine: &Engine) -> (String, String) {
 
 // ── the keeper ──────────────────────────────────────────────────────────────
 
-/// One emulated tab: the device and the connection that holds it.
+/// One emulated tab: the device and the keeper session that holds it.
 struct Held {
     device: Device,
     /// The commands that put the device on a tab, in order.
     commands: Vec<(&'static str, String)>,
-    /// The keeper connection; `None` after it died, until [`ensure`] opens
-    /// another.
-    connection: Option<CdpConnection>,
+    /// The generation of the keeper the device was put on: a different (or
+    /// no) keeper means the session holding the overrides is gone.
+    generation: Option<u64>,
 }
 
 type Registry = Mutex<HashMap<Tab, Arc<Mutex<Held>>>>;
@@ -415,6 +418,9 @@ pub const RESET: [(&str, &str); 3] = [
     ("Emulation.setUserAgentOverride", "{\"userAgent\":\"\"}"),
 ];
 
+/// How long the browser gets to take the overrides.
+const SEND_WAIT: Duration = Duration::from_secs(5);
+
 /// What went wrong sending the device: the socket (worth a fresh keeper) or
 /// the browser refusing a command (not).
 enum Failure {
@@ -422,10 +428,10 @@ enum Failure {
     Refused(String),
 }
 
-/// Send `commands` on `connection` in one round trip; the first refusal is
+/// Send `commands` on the keeper in one round trip; the first refusal is
 /// the error.
-fn send_all(connection: &mut CdpConnection, commands: &[(&str, &str)]) -> Result<(), Failure> {
-    let replies = connection.call_many(commands, &mut |_| {});
+fn send_all(keeper: &Keeper, commands: &[(&str, &str)]) -> Result<(), Failure> {
+    let replies = keeper.call_many(commands, SEND_WAIT);
     for (index, reply) in replies.into_iter().enumerate() {
         let reply = reply.map_err(Failure::Socket)?;
         if reply.contains("\"error\":{") {
@@ -445,9 +451,9 @@ fn accept_language() -> Option<String> {
     crate::session::identity().map(|i| crate::session::accept_languages(&i.locale))
 }
 
-/// Emulate `device` on `tab` from a keeper connection of its own, replacing
-/// any emulation the tab had. Returns a one-line description of what is now
-/// in force.
+/// Emulate `device` on `tab` from the tab's keeper session, replacing any
+/// emulation the tab had. Returns a one-line description of what is now in
+/// force.
 pub fn apply(tab: &Tab, device: Device) -> Result<String, String> {
     let engine = Engine::of_browser(tab.cdp_port)?;
     let commands = commands(&device, &engine, accept_language().as_deref());
@@ -458,7 +464,7 @@ pub fn apply(tab: &Tab, device: Device) -> Result<String, String> {
                 Arc::new(Mutex::new(Held {
                     device: device.clone(),
                     commands: Vec::new(),
-                    connection: None,
+                    generation: None,
                 }))
             })
             .clone()
@@ -468,8 +474,8 @@ pub fn apply(tab: &Tab, device: Device) -> Result<String, String> {
     held.commands = commands;
     if let Err(error) = put_on(&mut held, tab) {
         // Nothing holds the device: do not pretend it is in force.
-        if let Some(mut connection) = held.connection.take() {
-            let _ = send_all(&mut connection, &RESET);
+        if let Some(keeper) = current_keeper(tab) {
+            let _ = send_all(&keeper, &RESET);
         }
         drop(held);
         let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
@@ -481,45 +487,47 @@ pub fn apply(tab: &Tab, device: Device) -> Result<String, String> {
     Ok(device.describe(&engine))
 }
 
-/// Put the remembered device on the tab over the keeper, opening a keeper
+/// Put the remembered device on the tab over its keeper, opening a keeper
 /// when there is none or the one there was has died. A socket that breaks
-/// under the commands gets one retry on a fresh connection.
+/// under the commands gets one retry on a fresh keeper.
 fn put_on(held: &mut Held, tab: &Tab) -> Result<(), String> {
     let commands: Vec<(&str, String)> = held.commands.clone();
     let commands: Vec<(&str, &str)> = commands.iter().map(|(m, p)| (*m, p.as_str())).collect();
     for attempt in 0..2 {
-        let alive = held.connection.as_mut().is_some_and(|c| c.drain_events());
-        if !alive {
-            held.connection = Some(CdpConnection::open(tab)?);
-        }
-        let Some(connection) = held.connection.as_mut() else {
-            continue;
-        };
-        match send_all(connection, &commands) {
-            Ok(()) => return Ok(()),
-            Err(Failure::Socket(_)) if attempt == 0 => held.connection = None,
+        let keeper = crate::keeper::ensure(tab)?;
+        match send_all(&keeper, &commands) {
+            Ok(()) => {
+                held.generation = Some(keeper.generation);
+                return Ok(());
+            }
+            Err(Failure::Socket(_)) if attempt == 0 && !keeper.alive() => continue,
             Err(Failure::Socket(error) | Failure::Refused(error)) => return Err(error),
         }
     }
     Err("the browser did not take the emulation".into())
 }
 
-/// Turn emulation off on `tab` (`desktop`): reset what the keeper set and
-/// close it, so the tab is back to the browser's own window and cu's own
-/// User-Agent. Returns whether the tab had been emulated.
+/// The keeper of `tab`, if one is open.
+fn current_keeper(tab: &Tab) -> Option<Arc<Keeper>> {
+    tab.resolved_target()
+        .and_then(|target| crate::keeper::existing(tab.cdp_port, &target))
+}
+
+/// Turn emulation off on `tab` (`desktop`): reset what the keeper set, so
+/// the tab is back to the browser's own window and cu's own User-Agent. The
+/// keeper itself stays: it also watches the tab for dialogs. Returns whether
+/// the tab had been emulated.
 pub fn clear(tab: &Tab) -> bool {
     let slot = registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(tab);
     let Some(slot) = slot else { return false };
-    let mut held = slot.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(mut connection) = held.connection.take()
-        && connection.drain_events()
+    let held = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(keeper) = current_keeper(tab)
+        && Some(keeper.generation) == held.generation
     {
-        // Closing the keeper alone drops its overrides; resetting them first
-        // makes the change land before the socket is gone.
-        let _ = send_all(&mut connection, &RESET);
+        let _ = send_all(&keeper, &RESET);
     }
     true
 }
@@ -540,16 +548,16 @@ pub fn touches(tab: &Tab) -> bool {
     entry(tab).is_some()
 }
 
-/// Before a command on `tab`: if the tab is emulated and its keeper has
-/// died (the browser restarted, the socket was cut), open a new one and put
-/// the device back. Otherwise it costs a map lookup and a non-blocking peek.
+/// Before a command on `tab`: if the tab is emulated and the keeper the
+/// device was put on has died (the browser restarted, the socket was cut),
+/// put the device back on the tab's new keeper. Otherwise it costs a map
+/// lookup.
 pub fn ensure(tab: &Tab) {
     let Some(slot) = entry(tab) else { return };
     let mut held = slot.lock().unwrap_or_else(|e| e.into_inner());
-    if held.connection.as_mut().is_some_and(|c| c.drain_events()) {
+    if current_keeper(tab).is_some_and(|k| Some(k.generation) == held.generation) {
         return;
     }
-    held.connection = None;
     match put_on(&mut held, tab) {
         Ok(()) => eprintln!("cu: emulation: the keeper had gone; the device is back on the tab"),
         Err(error) => eprintln!("cu: emulation: could not put the device back on the tab: {error}"),
@@ -568,7 +576,7 @@ pub fn reassert(tab: &Tab) -> bool {
     true
 }
 
-/// The tab is gone: drop its keeper (closing the socket is all it takes).
+/// The tab is gone: forget its device (its keeper goes with the tab).
 pub fn forget(tab: &Tab) {
     registry()
         .lock()

@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
@@ -405,6 +405,7 @@ fn spawn_browser_control(cdp_port: u16, data: &Path) {
         let _ = connection.stream.set_read_timeout(None);
         while let Ok(event) = connection.next_message(MAX_CDP_MESSAGE) {
             crate::targets::see(&event);
+            crate::keeper::see_target_event(cdp_port, &event);
             crate::challenge::see_target_event(cdp_port, &event);
         }
     });
@@ -831,7 +832,7 @@ pub fn handle(mut stream: TcpStream, state: Arc<AppState>) {
 ///
 /// The CLI names its session in a header, and the daemon resolves the tab
 /// that session works in, in the same request.
-fn session_of(head: &str) -> Option<(u32, bool)> {
+fn session_of(head: &str) -> Option<(Owner, bool)> {
     let pid = header_value(head, "x-cu-session")?
         .trim()
         .parse::<u32>()
@@ -839,7 +840,10 @@ fn session_of(head: &str) -> Option<(u32, bool)> {
     let fresh = header_value(head, "x-cu-session-fresh")
         .map(|v| !v.trim().eq_ignore_ascii_case("0") && !v.trim().is_empty())
         .unwrap_or(false);
-    Some((pid, fresh))
+    // The pid namespace the session lives in (`X-Cu-Session-Ns`): a pid
+    // from another one cannot be looked up here.
+    let ns = header_value(head, "x-cu-session-ns").and_then(|v| v.trim().parse::<u64>().ok());
+    Some((Owner::in_ns(pid, ns), fresh))
 }
 
 /// Whether a request's `Host` header is one this daemon answers.
@@ -959,7 +963,7 @@ fn route_with(
     body: &str,
     state: &AppState,
     collect_token: Option<&str>,
-    session: Option<(u32, bool)>,
+    session: Option<(Owner, bool)>,
     tab_used: &mut Option<(String, bool)>,
 ) -> (&'static str, &'static str, String) {
     // A query string selects options (`?format=png`), never a different
@@ -968,7 +972,7 @@ fn route_with(
     // A CLI-created tab stays owned as long as its agent keeps using it.
     let wanted_tab = form_value(query(full_path), "tab");
     if !wanted_tab.is_empty() {
-        touch_tab_lease(&wanted_tab);
+        touch_tab_lease(state.cdp_port, &wanted_tab);
     }
     // Only the routes that drive the page wait for the browser: `status`, the
     // login form and the 401/404 paths answer instantly whatever Chromium is
@@ -997,6 +1001,10 @@ fn route_with(
             | ("GET", "/v1/challenge")
             | ("POST", "/v1/challenge/release")
             | ("GET", "/v1/handoff")
+            | ("GET", "/v1/dialog")
+            | ("POST", "/v1/dialog/accept")
+            | ("POST", "/v1/dialog/dismiss")
+            | ("POST", "/v1/dialog/policy")
             | ("GET", "/v1/inspect")
             | ("GET", "/v1/marks")
             | ("GET", "/v1/console")
@@ -1016,11 +1024,11 @@ fn route_with(
     // the same browser; `?tab=ID` runs it in another real tab (a popup, a
     // window a click opened). They are two ways of picking a page, so giving
     // both is an error rather than a silent preference.
-    let tab = if needs_browser
+    let page_route = needs_browser
         && !path.starts_with("/v1/contexts")
         && !path.starts_with("/v1/tabs")
-        && !(method == "POST" && path == "/v1/seo/geo")
-    {
+        && !(method == "POST" && path == "/v1/seo/geo");
+    let tab = if page_route {
         let context = form_value(query(full_path), "context");
         let wanted = form_value(query(full_path), "tab");
         if !context.is_empty() && !wanted.is_empty() {
@@ -1052,12 +1060,12 @@ fn route_with(
                     );
                 }
             }
-        } else if let Some((pid, fresh)) = session {
+        } else if let Some((owner, fresh)) = session {
             // The tab of the session that sent the request: the one it had,
             // or a new one. The CLI names its session in a header, so the page
             // it works in is resolved here, in the same request -- a round
             // trip of its own cost about as much as the action.
-            match session_tab(state, Some(pid), fresh, "about:blank") {
+            match session_tab(state, Some(owner), fresh, "about:blank") {
                 Ok((id, reused)) => {
                     *tab_used = Some((id.clone(), !reused));
                     Tab {
@@ -1082,9 +1090,30 @@ fn route_with(
     // An emulated tab whose keeper connection died (the browser restarted,
     // the socket was cut) gets its device back before the command runs, so
     // no command ever sees the tab as a desktop it was not asked to be.
+    // Every tab cu works in is watched for JavaScript dialogs before the
+    // command runs, so one the command (or anything after it) opens is
+    // answered by policy instead of stopping the page (see `crate::dialogs`).
+    if page_route && let Err(error) = crate::keeper::ensure(&tab) {
+        eprintln!("cu: could not watch the tab for dialogs: {error}");
+    }
     if needs_browser {
         crate::emulation::ensure(&tab);
     }
+    // A dialog left open for the agent (or a tab stopped by one cu could not
+    // answer) fails a command at once, naming it, instead of letting it wait
+    // out a read timeout. Reading the dialog state, answering it, the
+    // console (daemon-side for a stopped page) and the hand-off stay open.
+    if page_route
+        && !path.starts_with("/v1/dialog")
+        && !matches!(
+            (method, path),
+            ("GET", "/v1/console") | ("GET", "/v1/handoff") | ("POST", "/v1/challenge/release")
+        )
+        && let Some(why) = crate::dialogs::blocked(&tab)
+    {
+        return dialog_conflict(&tab, &why, None);
+    }
+    let mark = crate::dialogs::mark();
     // A person holds this tab in the live viewer: no automatic interaction
     // until they give it back (reads stay allowed).
     if matches!(
@@ -1126,7 +1155,7 @@ fn route_with(
             ),
         );
     }
-    match (method, path) {
+    let response = match (method, path) {
         ("GET", "/v1/challenge") => {
             // `?wait=S` parks here instead of answering at once: this is
             // the call an agent makes instead of retrying its navigation in
@@ -1187,6 +1216,31 @@ fn route_with(
             ));
             ("200 OK", "application/json", body)
         }
+        // JavaScript dialogs (see `crate::dialogs`): the policy, a dialog
+        // waiting for an answer, the log; answering it; the tab's policy.
+        ("GET", "/v1/dialog") => ("200 OK", "application/json", crate::dialogs::json(&tab)),
+        ("POST", "/v1/dialog/accept") | ("POST", "/v1/dialog/dismiss") => {
+            let text = json_string_value(body, "text");
+            match crate::dialogs::answer(&tab, path.ends_with("/accept"), text.as_deref()) {
+                Ok(answered) => ("200 OK", "application/json", answered),
+                Err(e) => (
+                    "409 Conflict",
+                    "application/json",
+                    format!("{{\"error\":{}}}", json_string(&e)),
+                ),
+            }
+        }
+        ("POST", "/v1/dialog/policy") => {
+            let spec = json_string_value(body, "policy").unwrap_or_default();
+            match crate::dialogs::set_policy(&tab, &spec) {
+                Ok(policy) => ("200 OK", "application/json", policy),
+                Err(e) => (
+                    "400 Bad Request",
+                    "application/json",
+                    format!("{{\"error\":{}}}", json_string(&e)),
+                ),
+            }
+        }
         ("GET", "/v1/tabs") => match tabs_json(state.cdp_port) {
             Ok(body) => ("200 OK", "application/json", body),
             Err(e) => (
@@ -1210,7 +1264,12 @@ fn route_with(
                     asked
                 }
             };
-            let owner = json_value(body, "owner_pid").and_then(|p| p.parse::<u32>().ok());
+            let owner = json_value(body, "owner_pid")
+                .and_then(|p| p.parse::<u32>().ok())
+                .map(|pid| {
+                    let ns = json_value(body, "owner_ns").and_then(|n| n.parse::<u64>().ok());
+                    Owner::in_ns(pid, ns)
+                });
             // The string-only JSON reader cannot see a bare boolean, which is
             // what `--new-tab` sends (`"fresh":true`).
             let fresh = body.contains("\"fresh\":true") || body.contains("\"fresh\": true");
@@ -1527,7 +1586,91 @@ fn route_with(
             "application/json",
             "{\"error\":\"not found\"}".into(),
         ),
+    };
+    with_dialogs(state, &tab, page_route, (method, path), mark, response)
+}
+
+/// A command refused (or cut short) because of a dialog: 409, the reason,
+/// the tab's dialog state, and what the command did get, if anything.
+fn dialog_conflict(
+    tab: &Tab,
+    why: &str,
+    result: Option<&str>,
+) -> (&'static str, &'static str, String) {
+    let result = result
+        .map(|r| format!(",\"result\":{}", json_string(r)))
+        .unwrap_or_default();
+    (
+        "409 Conflict",
+        "application/json",
+        format!(
+            "{{\"error\":{},\"dialog\":{}{result}}}",
+            json_string(why),
+            crate::dialogs::json(tab)
+        ),
+    )
+}
+
+/// A page command's reply, with what happened to dialogs meanwhile.
+///
+/// - An action (`navigate`, `act`, `click`, `type`, `upload`) that saw
+///   dialogs answered gets them as `"dialogs":[...]`.
+/// - A command a dialog left open for the agent cut short answers 409
+///   naming the dialog, whatever the command itself made of the cut.
+/// - A command that timed out while some tab has such a dialog open gets a
+///   hint: a dialog stops every tab sharing its renderer process.
+fn with_dialogs(
+    state: &AppState,
+    tab: &Tab,
+    page_route: bool,
+    (method, path): (&str, &str),
+    mark: u64,
+    response: (&'static str, &'static str, String),
+) -> (&'static str, &'static str, String) {
+    if !page_route || path.starts_with("/v1/dialog") {
+        return response;
     }
+    let (status, kind, mut body) = response;
+    let action = matches!(
+        (method, path),
+        ("POST", "/v1/navigate")
+            | ("POST", "/v1/act")
+            | ("POST", "/v1/click")
+            | ("POST", "/v1/type")
+            | ("POST", "/v1/upload")
+    );
+    let failed = !status.starts_with('2') || (action && body.contains("\"ok\":false"));
+    if failed && let Some(why) = crate::dialogs::blocked(tab) {
+        return dialog_conflict(tab, &why, Some(&body));
+    }
+    let json = kind == "application/json" && body.starts_with('{') && body.ends_with('}');
+    if failed
+        && json
+        && [
+            "os error 11",
+            "temporarily unavailable",
+            "timed out",
+            "did not answer",
+        ]
+        .iter()
+        .any(|sign| body.contains(sign))
+    {
+        let elsewhere = crate::dialogs::pending_anywhere(state.cdp_port);
+        if !elsewhere.is_empty() {
+            let hint = format!(
+                "a JavaScript dialog left open for an answer stops every tab sharing its renderer process: {}",
+                elsewhere.join("; ")
+            );
+            body.insert_str(body.len() - 1, &format!(",\"hint\":{}", json_string(&hint)));
+        }
+    }
+    if action
+        && json
+        && let Some(dialogs) = crate::dialogs::since_json(tab, mark)
+    {
+        body.insert_str(body.len() - 1, &format!(",\"dialogs\":{dialogs}"));
+    }
+    (status, kind, body)
 }
 
 /// `POST /v1/session/NAME[/load]?context=CTX`: save the cookie jar of the
@@ -2279,7 +2422,10 @@ pub fn close_tab(cdp_port: u16, id: &str) -> Result<(), String> {
     tab_leases()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(id);
+        .remove(&(cdp_port, id.to_string()));
+    // So do its dialog watcher and what it logged.
+    crate::keeper::forget(cdp_port, id);
+    crate::dialogs::forget(cdp_port, id);
     // The pool of a closed tab is dead weight, and if it was the default the
     // next action must pick a live page instead of a vanished id.
     forget_tab(&Tab {
@@ -4483,6 +4629,62 @@ fn context_targets(cdp_port: u16) -> Vec<String> {
 pub struct CdpConnection {
     stream: TcpStream,
     next_id: u64,
+    /// The entry this connection has in the in-flight registry, so a dialog
+    /// left open for the agent can cut it (see [`interrupt_target`]).
+    watch: Option<u64>,
+}
+
+impl Drop for CdpConnection {
+    fn drop(&mut self) {
+        if let Some(id) = self.watch.take() {
+            in_flight()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+        }
+    }
+}
+
+/// Page connections by id: `(cdp_port, target, a handle on the socket)`.
+type InFlight = HashMap<u64, (u16, String, TcpStream)>;
+
+fn in_flight() -> &'static Mutex<InFlight> {
+    static IN_FLIGHT: OnceLock<Mutex<InFlight>> = OnceLock::new();
+    IN_FLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Cut every pooled or in-use page connection of `target`: a dialog was
+/// left open there for the agent, and a command waiting on the page would
+/// otherwise wait out its whole read timeout before failing. The keeper's
+/// own session is not among them. The tab's pools go too, so the next
+/// command opens fresh connections.
+pub fn interrupt_target(cdp_port: u16, target: &str) {
+    let registry = in_flight().lock().unwrap_or_else(|e| e.into_inner());
+    for (port, id, stream) in registry.values() {
+        if *port == cdp_port && id == target {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+    drop(registry);
+    for tab in tabs_for_target(cdp_port, target) {
+        forget_tab(&tab);
+    }
+}
+
+/// [`encode_client_frame`] for the keeper.
+pub(crate) fn client_frame(bytes: &[u8]) -> Vec<u8> {
+    encode_client_frame(bytes)
+}
+
+/// [`message_id`] for the keeper.
+pub(crate) fn cdp_message_id(message: &str) -> Option<u64> {
+    message_id(message)
+}
+
+/// One whole text message from a DevTools socket.
+pub(crate) fn read_cdp_message(stream: &mut TcpStream) -> Result<String, String> {
+    let payload = read_frame(stream, MAX_CDP_MESSAGE).map_err(|e| e.to_string())?;
+    String::from_utf8(payload).map_err(|e| e.to_string())
 }
 
 impl CdpConnection {
@@ -4503,12 +4705,15 @@ impl CdpConnection {
     /// Discover the tab's target and complete the websocket handshake.
     pub(crate) fn open(tab: &Tab) -> Result<Self, String> {
         let discovery = http_get(&format!("127.0.0.1:{}", tab.cdp_port), "/json")?;
-        let ws = match &tab.target {
-            Some(id) => json_objects(&discovery)
-                .into_iter()
-                .find(|o| json_string_value(o, "id").as_deref() == Some(id))
-                .and_then(|o| json_string_value(&o, "webSocketDebuggerUrl"))
-                .ok_or("no DevTools target with that id any more (see GET /v1/tabs)")?,
+        let (target, ws) = match &tab.target {
+            Some(id) => (
+                id.clone(),
+                json_objects(&discovery)
+                    .into_iter()
+                    .find(|o| json_string_value(o, "id").as_deref() == Some(id))
+                    .and_then(|o| json_string_value(&o, "webSocketDebuggerUrl"))
+                    .ok_or("no DevTools target with that id any more (see GET /v1/tabs)")?,
+            ),
             None => {
                 let pages = page_target_ids_and_sockets(&discovery, tab.cdp_port);
                 // Pin the default tab. `/json` lists a freshly opened popup
@@ -4522,10 +4727,25 @@ impl CdpConnection {
                     .or_else(|| pages.first())
                     .ok_or("Chromium did not expose a page target")?;
                 pin_target(tab.cdp_port, &chosen.0);
-                chosen.1.clone()
+                chosen.clone()
             }
         };
-        Self::connect(&ws)
+        let mut connection = Self::connect(&ws)?;
+        if let Ok(handle) = connection.stream.try_clone() {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            let id = NEXT.fetch_add(1, Ordering::SeqCst);
+            in_flight()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id, (tab.cdp_port, target, handle));
+            connection.watch = Some(id);
+        }
+        Ok(connection)
+    }
+
+    /// The socket, for a session cu holds for good (the tab's keeper).
+    pub(crate) fn into_stream(self) -> Result<TcpStream, String> {
+        self.stream.try_clone().map_err(|e| e.to_string())
     }
 
     /// Complete the websocket handshake with one DevTools endpoint.
@@ -4565,7 +4785,11 @@ impl CdpConnection {
         if !handshake.starts_with(b"HTTP/1.1 101") {
             return Err("Chromium rejected CDP websocket handshake".into());
         }
-        Ok(Self { stream, next_id: 1 })
+        Ok(Self {
+            stream,
+            next_id: 1,
+            watch: None,
+        })
     }
 
     /// Send one command and read its reply, skipping events meant for nobody.
@@ -6462,32 +6686,117 @@ pub fn url_host(url: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Tabs the CLI created for an invocation, with the pid that owns them.
+/// Who a session is: the pid the CLI (or `cu mcp`) named, and the pid
+/// namespace it lives in when that is not the daemon's own.
 ///
-/// A tab is never closed out from under a live owner: collection needs both
-/// a dead pid and a long idle time. This is what keeps two agents working in
+/// A pid from another namespace (an agent in a sandbox or container that
+/// shares the host's network but not its pids) means nothing in the
+/// daemon's `/proc`: it is some unrelated process, or none. Treating it as
+/// one made such a session look dead on every call (a fresh tab each time)
+/// or alive for ever (its tabs never collected). Its liveness is unknown,
+/// and it is handled as such.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Owner {
+    pub pid: u32,
+    /// The session's pid namespace (inode of `/proc/self/ns/pid`) when it is
+    /// not the daemon's.
+    pub foreign_ns: Option<u64>,
+}
+
+impl Owner {
+    /// A session in the daemon's own pid namespace.
+    pub fn local(pid: u32) -> Self {
+        Self {
+            pid,
+            foreign_ns: None,
+        }
+    }
+
+    /// A session that said which pid namespace it is in: foreign when that
+    /// is not the daemon's.
+    pub fn in_ns(pid: u32, ns: Option<u64>) -> Self {
+        Self {
+            pid,
+            foreign_ns: ns.filter(|ns| Some(*ns) != own_pid_ns()),
+        }
+    }
+
+    /// The process start time (clock ticks since boot, `/proc/PID/stat`
+    /// field 22) when the daemon can see the process: a pid reused by
+    /// another process has another one. `None` for a dead or foreign pid.
+    fn start(&self) -> Option<u64> {
+        if self.foreign_ns.is_some() {
+            return None;
+        }
+        process_start(self.pid)
+    }
+}
+
+/// The pid namespace inode of `/proc/PID` (`self` for this process).
+pub fn pid_ns_of(pid: &str) -> Option<u64> {
+    let link = fs::read_link(format!("/proc/{pid}/ns/pid")).ok()?;
+    let link = link.to_string_lossy();
+    link.strip_prefix("pid:[")?.strip_suffix(']')?.parse().ok()
+}
+
+fn own_pid_ns() -> Option<u64> {
+    static NS: OnceLock<Option<u64>> = OnceLock::new();
+    *NS.get_or_init(|| pid_ns_of("self"))
+}
+
+fn process_start(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+/// Tabs the CLI created for an invocation, with the session that owns them.
+///
+/// A tab is never closed out from under a live owner. Once the owner is
+/// gone, the tab is collected after a short grace ([`TAB_GC_IDLE`]) -- a
+/// tab cu cannot tell the owner of (another pid namespace) only after a long
+/// idle ([`TAB_GC_UNKNOWN_IDLE`]). This is what keeps two agents working in
 /// the same daemon from touching each other's pages.
 pub struct TabLease {
-    pub owner_pid: u32,
+    pub owner: Owner,
+    /// The owner's start time when the lease was made, if the daemon can
+    /// see it: a later process with the same pid is not the owner.
+    pub owner_start: Option<u64>,
     pub used: Instant,
 }
 
-/// Idle age after which an orphaned (owner-dead) tab is collected.
-const TAB_GC_IDLE: Duration = Duration::from_secs(10 * 60);
+/// Idle age after which a tab whose owner has exited is collected. Short: the
+/// CLI tells the agent its tab "is collected when the session exits", and a
+/// tab left behind keeps a renderer (and, under a dialog, possibly others)
+/// busy. Not zero: an agent may still reach the tab with `--tab ID` right
+/// after the process that opened it ended, and every such use renews it.
+pub const TAB_GC_IDLE: Duration = Duration::from_secs(60);
+/// Idle age after which a tab whose owner cu cannot see (another pid
+/// namespace) is collected.
+pub const TAB_GC_UNKNOWN_IDLE: Duration = Duration::from_secs(10 * 60);
+/// How often the collector looks.
+const TAB_GC_TICK: Duration = Duration::from_secs(10);
 
-fn tab_leases() -> &'static Mutex<HashMap<String, TabLease>> {
-    static LEASES: OnceLock<Mutex<HashMap<String, TabLease>>> = OnceLock::new();
+type Leases = HashMap<(u16, String), TabLease>;
+
+fn tab_leases() -> &'static Mutex<Leases> {
+    static LEASES: OnceLock<Mutex<Leases>> = OnceLock::new();
     LEASES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn register_tab_lease(id: &str, owner_pid: u32) {
+fn register_tab_lease(cdp_port: u16, id: &str, owner: Owner) {
     tab_leases()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(
-            id.to_string(),
+            (cdp_port, id.to_string()),
             TabLease {
-                owner_pid,
+                owner,
+                owner_start: owner.start(),
                 used: Instant::now(),
             },
         );
@@ -6497,20 +6806,25 @@ fn register_tab_lease(id: &str, owner_pid: u32) {
 ///
 /// `fresh` asks for a new one (the `--new-tab` flag). The owner is the
 /// process the tab belongs to: a session's tab is collected when that
-/// process is gone.
+/// process is gone. A session whose tab is stopped (a dialog) gets that tab
+/// back -- and the command's error says why -- never another one: a fresh
+/// tab per failing call is how a stopped browser used to fill up with
+/// blank tabs.
 fn session_tab(
     state: &AppState,
-    owner: Option<u32>,
+    owner: Option<Owner>,
     fresh: bool,
     url: &str,
 ) -> Result<(String, bool), String> {
     if !fresh
-        && let Some(pid) = owner
-        && let Some(id) = leased_tab_of(state.cdp_port, pid)
+        && let Some(owner) = owner
+        && let Some(id) = leased_tab_of(state.cdp_port, owner)
     {
-        touch_tab_lease(&id);
+        touch_tab_lease(state.cdp_port, &id);
         return Ok((id, true));
     }
+    // Before another tab is opened, the ones exited sessions left behind go.
+    reap_orphan_tabs(state.cdp_port, TAB_GC_IDLE);
     // Electron has no `Target.createTarget`: Min opens the tab through its
     // own window UI (see `crate::minbrowser`).
     let id = if crate::minbrowser::active() {
@@ -6527,83 +6841,151 @@ fn session_tab(
         }
         id
     };
-    if let Some(pid) = owner {
-        register_tab_lease(&id, pid);
+    if let Some(owner) = owner {
+        register_tab_lease(state.cdp_port, &id, owner);
+    }
+    // Watched from birth: a dialog the page shows before the first command
+    // reaches it is answered too.
+    if let Err(error) = crate::keeper::watch(state.cdp_port, &id) {
+        eprintln!("cu: could not watch new tab {id} for dialogs: {error}");
     }
     Ok((id, false))
 }
 
+/// The ids of the page targets the browser lists, or `None` when discovery
+/// did not answer with a whole list. `http_get` hands back what arrived
+/// when a read times out, so an empty or cut-off body is "unknown", never
+/// "no tabs": taking it for the truth dropped every lease of a session and
+/// opened a fresh tab on each call while the browser was slow.
+fn live_page_ids(cdp_port: u16) -> Option<Vec<String>> {
+    let discovery = http_get(&format!("127.0.0.1:{cdp_port}"), "/json").ok()?;
+    let body = discovery.trim();
+    if !(body.starts_with('[') && body.ends_with(']')) {
+        return None;
+    }
+    Some(
+        json_objects(body)
+            .into_iter()
+            .filter(|o| is_page(o))
+            .filter_map(|o| json_string_value(&o, "id"))
+            .collect(),
+    )
+}
+
 /// The live tab a session already works in, if any: the most recently used
-/// one leased to `owner_pid`. A leased tab the browser no longer lists (a
-/// popup closed by hand, a crashed renderer) is dropped here instead of being
+/// one leased to `owner`. A leased tab the browser no longer lists (a popup
+/// closed by hand, a crashed renderer) is dropped here instead of being
 /// handed back.
-fn leased_tab_of(cdp_port: u16, owner_pid: u32) -> Option<String> {
-    let live: Vec<String> = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")
-        .map(|discovery| {
-            json_objects(&discovery)
-                .into_iter()
-                .filter(|o| is_page(o))
-                .filter_map(|o| json_string_value(&o, "id"))
-                .collect()
-        })
-        .unwrap_or_default();
-    if !pid_alive(owner_pid) {
+fn leased_tab_of(cdp_port: u16, owner: Owner) -> Option<String> {
+    let live = live_page_ids(cdp_port);
+    let start = owner.start();
+    // A session that asks is running -- unless the daemon can see its pid
+    // and it is not there (a reaped process, a stale header).
+    if owner.foreign_ns.is_none() && start.is_none() {
         return None;
     }
     let mut leases = tab_leases().lock().unwrap_or_else(|e| e.into_inner());
-    leases.retain(|id, lease| lease.owner_pid != owner_pid || live.iter().any(|open| open == id));
-    leases
-        .iter()
-        .filter(|(_, lease)| lease.owner_pid == owner_pid)
-        .max_by_key(|(_, lease)| lease.used)
-        .map(|(id, _)| id.clone())
+    pick_lease(&mut leases, cdp_port, owner, start, live.as_deref())
 }
 
-fn touch_tab_lease(id: &str) {
+/// The lease logic of [`leased_tab_of`], without the browser: `live` is the
+/// listed page ids, or `None` when discovery failed (then nothing is
+/// dropped); `start` is the owner's current start time, if visible.
+fn pick_lease(
+    leases: &mut Leases,
+    cdp_port: u16,
+    owner: Owner,
+    start: Option<u64>,
+    live: Option<&[String]>,
+) -> Option<String> {
+    if let Some(live) = live {
+        leases.retain(|(port, id), lease| {
+            *port != cdp_port || lease.owner != owner || live.iter().any(|open| open == id)
+        });
+    }
+    leases
+        .iter()
+        .filter(|((port, _), lease)| {
+            *port == cdp_port
+                && lease.owner == owner
+                && (lease.owner_start.is_none() || start.is_none() || lease.owner_start == start)
+        })
+        .max_by_key(|(_, lease)| lease.used)
+        .map(|((_, id), _)| id.clone())
+}
+
+fn touch_tab_lease(cdp_port: u16, id: &str) {
     if let Some(lease) = tab_leases()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get_mut(id)
+        .get_mut(&(cdp_port, id.to_string()))
     {
         lease.used = Instant::now();
     }
 }
 
-fn pid_alive(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
+/// Whether the owner of a lease is still running: `Some(false)` when its
+/// pid is gone or belongs to a later process, `None` when cu cannot tell.
+fn lease_owner_alive(lease: &TabLease) -> Option<bool> {
+    if lease.owner.foreign_ns.is_some() {
+        return None;
+    }
+    let now = process_start(lease.owner.pid);
+    Some(now.is_some() && (lease.owner_start.is_none() || now == lease.owner_start))
 }
 
-/// The daemon's background collector: every minute, close tabs whose owning
-/// CLI process is gone and that have been idle past [`TAB_GC_IDLE`]. Tabs of
-/// live owners and tabs someone is still using are never touched; a tab the
-/// browser already closed just leaves the registry.
+/// Close the tabs of `cdp_port` whose owner has exited and that have been
+/// idle for `idle` (or, owner unknown, for [`TAB_GC_UNKNOWN_IDLE`]); a tab
+/// the browser already closed just leaves the registry. A tab stopped by a
+/// dialog goes too: `Target.closeTarget` does not need the page's
+/// cooperation (measured on Chromium 156 with a `beforeunload` dialog up:
+/// closed at once, and the tabs sharing its renderer answer again).
+/// Returns the ids collected.
+pub fn reap_orphan_tabs(cdp_port: u16, idle: Duration) -> Vec<String> {
+    let stale: Vec<String> = tab_leases()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|((port, _), _)| *port == cdp_port)
+        .filter(|(_, lease)| match lease_owner_alive(lease) {
+            Some(false) => lease.used.elapsed() >= idle,
+            Some(true) => false,
+            None => lease.used.elapsed() >= TAB_GC_UNKNOWN_IDLE.max(idle),
+        })
+        .map(|((_, id), _)| id.clone())
+        .collect();
+    let mut collected = Vec::new();
+    for id in stale {
+        match close_tab(cdp_port, &id) {
+            Ok(()) => {
+                eprintln!("cu: collected tab {id} of an exited session");
+                collected.push(id.clone());
+            }
+            Err(e) if e.contains("no such tab") => {}
+            Err(e) if e.contains("last tab") => {
+                // The browser needs a page; this one stays, unowned.
+                eprintln!("cu: tab {id} of an exited session is the browser's last; left open");
+            }
+            Err(e) => {
+                eprintln!("cu: could not collect tab {id}: {e}");
+                continue;
+            }
+        }
+        tab_leases()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(cdp_port, id));
+    }
+    collected
+}
+
+/// The daemon's background collector: every few seconds, close the tabs of
+/// sessions that have exited (see [`reap_orphan_tabs`]).
 pub fn spawn_tab_gc(cdp_port: u16) {
     thread::spawn(move || {
         loop {
-            thread::sleep(Duration::from_secs(60));
-            let leases = tab_leases().lock().unwrap_or_else(|e| e.into_inner());
-            let stale: Vec<String> = leases
-                .iter()
-                .filter(|(_, lease)| {
-                    !pid_alive(lease.owner_pid) && lease.used.elapsed() > TAB_GC_IDLE
-                })
-                .map(|(id, _)| id.clone())
-                .collect();
-            drop(leases);
-            for id in stale {
-                match close_tab(cdp_port, &id) {
-                    Ok(()) => eprintln!("cu: collected orphaned tab {id}"),
-                    Err(e) if e.contains("no such tab") => {}
-                    Err(e) => {
-                        eprintln!("cu: could not collect tab {id}: {e}");
-                        continue;
-                    }
-                }
-                tab_leases()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&id);
-            }
+            thread::sleep(TAB_GC_TICK);
+            reap_orphan_tabs(cdp_port, TAB_GC_IDLE);
         }
     });
 }
@@ -6687,6 +7069,66 @@ fn navigate_with_vault(
 mod tests {
 
     use super::*;
+
+    fn lease(owner: Owner, start: Option<u64>, age_s: u64) -> TabLease {
+        TabLease {
+            owner,
+            owner_start: start,
+            used: Instant::now() - Duration::from_secs(age_s),
+        }
+    }
+
+    #[test]
+    fn a_failed_discovery_drops_no_lease() {
+        let me = Owner::local(10);
+        let mut leases: Leases = HashMap::new();
+        leases.insert((9, "A".into()), lease(me, Some(5), 10));
+        leases.insert((9, "B".into()), lease(me, Some(5), 1));
+        // Discovery did not answer (an empty or cut-off body): the session
+        // keeps its tab instead of being handed a fresh one.
+        assert_eq!(
+            pick_lease(&mut leases, 9, me, Some(5), None).as_deref(),
+            Some("B")
+        );
+        assert_eq!(leases.len(), 2);
+        // Discovery answered without B: B goes, A is handed back.
+        let live = vec!["A".to_string()];
+        assert_eq!(
+            pick_lease(&mut leases, 9, me, Some(5), Some(&live)).as_deref(),
+            Some("A")
+        );
+        assert_eq!(leases.len(), 1);
+    }
+
+    #[test]
+    fn a_reused_pid_is_not_the_owner() {
+        let old = Owner::local(10);
+        let mut leases: Leases = HashMap::new();
+        leases.insert((9, "A".into()), lease(old, Some(5), 1));
+        // Same pid, another process (another start time).
+        assert_eq!(pick_lease(&mut leases, 9, old, Some(6), None), None);
+        // Another browser's lease is never handed out here.
+        leases.insert((8, "C".into()), lease(old, Some(6), 0));
+        assert_eq!(pick_lease(&mut leases, 9, old, Some(6), None), None);
+    }
+
+    #[test]
+    fn a_pid_namespace_that_is_not_the_daemons_is_foreign() {
+        let own = own_pid_ns();
+        assert!(own.is_some(), "this process has a pid namespace");
+        assert_eq!(Owner::in_ns(10, own), Owner::local(10));
+        assert_eq!(Owner::in_ns(10, None), Owner::local(10));
+        assert_eq!(Owner::in_ns(10, Some(1)).foreign_ns, Some(1));
+        // A foreign owner's liveness is unknown, never "dead".
+        let foreign = lease(Owner::in_ns(10, Some(1)), None, 0);
+        assert_eq!(lease_owner_alive(&foreign), None);
+        let me = lease(
+            Owner::local(std::process::id()),
+            process_start(std::process::id()),
+            0,
+        );
+        assert_eq!(lease_owner_alive(&me), Some(true));
+    }
 
     #[test]
     fn a_screenshot_can_ask_for_ref_labels_and_qa_marks() {
