@@ -651,8 +651,8 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "upload",
         title: "Upload files",
-        description: "Put files into a file input. `ref` is the input or the control that opens the picker (file inputs are usually hidden and have no ref); without it, the page's only file input. Paths are resolved against the server's working directory.",
-        properties: r#""files":{"type":"array","items":{"type":"string"},"description":"Paths of the files to upload."},"ref":{"type":"string","description":"The file input, or the button that opens the picker."}"#,
+        description: "Put files into a file input. `ref` is the input or the control that opens the picker (file inputs are usually hidden and have no ref); `selector` names it by CSS instead, for pages with several hidden inputs; without either, the page's only file input. Paths are resolved against the server's working directory.",
+        properties: r#""files":{"type":"array","items":{"type":"string"},"description":"Paths of the files to upload."},"ref":{"type":"string","description":"The file input, or the button that opens the picker."},"selector":{"type":"string","description":"CSS selector of the file input (or its control), instead of a ref."}"#,
         required: &["files"],
         target: Target::Page,
         read_only: false,
@@ -971,9 +971,10 @@ fn plan(name: &str, args: &Args) -> Result<Call, String> {
                 .iter()
                 .map(|f| absolute_file(f).map(|p| json_string(&p)))
                 .collect::<Result<Vec<_>, _>>()?;
-            let reference = match args.reference("ref")? {
-                Some(r) => format!(",\"ref\":{}", json_string(r)),
-                None => String::new(),
+            let reference = match (args.reference("ref")?, args.str("selector")) {
+                (Some(r), _) => format!(",\"ref\":{}", json_string(r)),
+                (None, Some(s)) => format!(",\"selector\":{}", json_string(s)),
+                (None, None) => String::new(),
             };
             // Through a batch, which works in the session's page like every
             // other page command.

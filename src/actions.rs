@@ -56,9 +56,12 @@ pub enum Action {
     },
     /// Put local files on a file input. `reference` is the input or the
     /// visible control that opens the picker (the input itself is usually
-    /// `display:none`); `None` means the page's only file input.
+    /// `display:none`); `selector` names it (or such a control) by CSS
+    /// instead, for pages with several hidden inputs and no ref near them;
+    /// neither means the page's only file input.
     Upload {
         reference: Option<String>,
+        selector: Option<String>,
         files: Vec<String>,
     },
     /// Mouse-wheel scroll by `dx`/`dy` CSS px at the viewport centre (or over `ref`),
@@ -271,7 +274,15 @@ pub fn parse_action(object: &str) -> Result<Action, String> {
                         .map_err(|_| format!("{f}: path is not UTF-8"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Action::Upload { reference, files }
+            let selector = json_string_value(object, "selector").filter(|s| !s.trim().is_empty());
+            if reference.is_some() && selector.is_some() {
+                return Err("upload takes \"ref\" or \"selector\", not both".into());
+            }
+            Action::Upload {
+                reference,
+                selector,
+                files,
+            }
         }
         other => return Err(format!("unknown action \"{other}\"")),
     })
@@ -776,8 +787,12 @@ impl Page {
                 std::thread::sleep(Duration::from_millis(*ms).min(MAX_WAIT));
                 false
             }
-            Action::Upload { reference, files } => {
-                self.upload(reference.as_deref(), files)?;
+            Action::Upload {
+                reference,
+                selector,
+                files,
+            } => {
+                self.upload(reference.as_deref(), selector.as_deref(), files)?;
                 false
             }
             Action::Scroll {
@@ -979,10 +994,16 @@ impl Page {
     /// fires the `input` and `change` events a real pick does. The input is
     /// resolved in cu's isolated world to a remote object; the world shares
     /// the DOM with the page, so the node is the page's own.
-    fn upload(&mut self, reference: Option<&str>, files: &[String]) -> Result<(), String> {
+    fn upload(
+        &mut self,
+        reference: Option<&str>,
+        selector: Option<&str>,
+        files: &[String],
+    ) -> Result<(), String> {
         let call = format!(
-            "fileInput({})",
-            reference.map(json_string).unwrap_or_else(|| "null".into())
+            "fileInput({},{})",
+            reference.map(json_string).unwrap_or_else(|| "null".into()),
+            selector.map(json_string).unwrap_or_else(|| "null".into())
         );
         let expression = format!(
             "{REGISTRY}?{REGISTRY}.{call}:JSON.stringify({{error:'this page has no refs yet; take a snapshot first'}})"
@@ -2100,21 +2121,29 @@ if (!window.__cu) {
       }
       return JSON.stringify({ len });
     },
-    fileInput(ref) {
-      // The file input a ref stands for: the input itself, the control a
-      // label points at, one inside the element, or the nearest one around
-      // it (a "Select from computer" button and its display:none input share
-      // a form or wrapper). Without a ref: the document's only file input.
+    fileInput(ref, selector) {
+      // The file input a ref (or a CSS selector) stands for: the input
+      // itself, the control a label points at, one inside the element, or
+      // the nearest one around it (a "Select from computer" button and its
+      // display:none input share a form or wrapper). Neither: the
+      // document's only file input.
       const isFile = (e) => e && e.tagName === 'INPUT' && e.type === 'file';
       const inputs = (root) => [...root.querySelectorAll('input[type=file]')];
-      if (ref === null) {
+      if (ref === null && selector === null) {
         const all = inputs(document);
         if (all.length === 1) return all[0];
-        return err(all.length ? all.length + ' file inputs on the page; pass the ref of the control next to the one you want'
+        return err(all.length ? all.length + ' file inputs on the page; pass the ref of the control next to the one you want, or a selector'
           : 'no file input on the page');
       }
-      const el = get(ref);
-      if (!el) return err(ref + ' is not on the page any more; take a new snapshot');
+      let el;
+      if (selector !== null) {
+        try { el = document.querySelector(selector); } catch (e) { return err('bad selector ' + selector); }
+        if (!el) return err('no element matches ' + selector);
+        ref = selector;
+      } else {
+        el = get(ref);
+        if (!el) return err(ref + ' is not on the page any more; take a new snapshot');
+      }
       if (isFile(el)) return el;
       if (isFile(el.control)) return el.control;
       const label = el.closest('label');
@@ -2241,6 +2270,36 @@ mod tests {
         let batch = parse_batch(r#"{"actions":[{"do":"click","ref":"e1"}],"snapshot":false}"#)
             .expect("parses");
         assert!(!batch.snapshot);
+    }
+
+    #[test]
+    fn an_upload_names_its_input_by_ref_or_by_selector_not_both() {
+        let file = std::env::current_exe().expect("test binary");
+        let file = json_string(&file.to_string_lossy());
+        let by_selector = parse_action(&format!(
+            r#"{{"do":"upload","selector":"input[type=file]","files":[{file}]}}"#
+        ))
+        .expect("parses");
+        match by_selector {
+            Action::Upload {
+                reference: None,
+                selector: Some(s),
+                files,
+            } => {
+                assert_eq!(s, "input[type=file]");
+                assert_eq!(files.len(), 1);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let both = parse_action(&format!(
+            r#"{{"do":"upload","ref":"e1","selector":"input","files":[{file}]}}"#
+        ));
+        assert!(both.unwrap_err().contains("not both"));
+        let blank = parse_action(&format!(
+            r#"{{"do":"upload","selector":" ","files":[{file}]}}"#
+        ))
+        .expect("a blank selector is no selector");
+        assert!(matches!(blank, Action::Upload { selector: None, .. }));
     }
 
     #[test]
