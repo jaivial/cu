@@ -97,7 +97,7 @@
 
   const cli = [
     ['cu start', 'un daemon por máquina; responde en ~6 ms y el navegador sube en segundo plano'],
-    ['cu status --short', 'daemon, navegador y cuántos leases hay abiertos'],
+    ['cu status --detail', 'versión de cu, motor del navegador (slimium o chromium) y cómo se aparcan las pestañas'],
     ['cu tab open URL --lease 300 --label test-1', 'pestaña para este test; el lease la cierra si el test muere'],
     ['cu tab close ID · cu tab renew ID 600', 'cierra la pestaña o alarga su lease'],
     ['cu context open NAME --lease 300', 'cookies aisladas en el mismo Chrome; se usa con --context NAME'],
@@ -107,6 +107,9 @@
     ['cu text', 'palabras visibles: prosa, respuestas de API, mensajes'],
     ['cu click e3', 'click real con test de impacto; si algo lo tapa, lo dice'],
     ['cu type e2 "Ada" --submit', 'Input.insertText y, si se pide, Enter'],
+    ['cu wait --text "Guardado"', 'vuelve en cuanto la página lo muestra; también --selector, --url y --gone'],
+    ['cu console --level error · cu net --failed', 'la consola de la página y sus llamadas fetch/XHR con estado y duración'],
+    ["cu eval 'document.querySelectorAll(\"tr\").length'", 'ejecuta en la página y devuelve el valor: cadena tal cual, lo demás en JSON'],
     ["cu act '[{\"do\":\"type\",\"ref\":\"e2\",\"text\":\"Ada\"},{\"do\":\"click\",\"ref\":\"e5\"}]'", 'lote en una conexión, termina con snapshot'],
     ["cu batch 'snapshot --tab t1' 'click e3 --tab t1'", 'muchos comandos, una llamada; una línea JSON por comando'],
     ['cu shot page.jpg · cu downloads', 'captura JPEG rápida; descargas listadas desde <data>/downloads'],
@@ -118,11 +121,13 @@
   ];
 
   const http = [
-    ['GET', '/v1/status', 'estado, navegador y leases'],
+    ['GET', '/v1/status', 'estado; ?detail=1 añade versión, motor y aparcado'],
     ['POST', '/v1/navigate', '{"url": "..."} · espera asentada'],
     ['GET', '/v1/snapshot', 'página compacta con refs'],
     ['GET', '/v1/text', 'palabras visibles, con - frame: <url>'],
     ['GET', '/v1/screenshot', '?format=png · annotate=e1,e4|all · marks=1'],
+    ['GET', '/v1/console', '?level=error|warn+ · grep · since'],
+    ['GET', '/v1/net', 'llamadas fetch/XHR: ?failed=1 · grep · since'],
     ['GET', '/v1/inspect', '?ref=eN o ?selector=CSS · cómo encontrarlo y quién lo pinta'],
     ['POST', '/v1/marks', '{"ref": "e7", "note": "...", "severity": "major"}'],
     ['GET · DELETE', '/v1/marks', 'marcas en JSON o ?format=md; DELETE las borra'],
@@ -147,7 +152,61 @@
     ['press', 'key: Enter, Tab, Escape, flechas…'],
     ['select', 'ref, value o etiqueta'],
     ['navigate', 'url'],
-    ['wait', 'ms'],
+    ['wait', 'text, selector o url; gone, timeout; o ms'],
+    ['eval', 'js: devuelve el valor'],
+    ['scroll', 'dy, dx o to: top|bottom'],
+    ['emulate', 'mode: mobile|tablet|desktop|custom'],
+  ];
+
+  // QA pass, measured: cu 1.10 + slimium 0.3.1 against cu 1.12 + slimium 0.3.2,
+  // 38 commands over three development apps, 8 s apart (CHANGELOG 1.11-1.13).
+  const qaFlow = [
+    ['CPU del navegador en el flujo', '458 s', '27,5 s'],
+    ['CPU mientras el agente piensa', '203 %', '5 %'],
+    ['tiempo dentro de comandos de cu', '6,4 s', '3,3 s'],
+    ['memoria anónima, media', '521 MB', '387 MB'],
+    ['memoria anónima, pico', '1009 MB', '475 MB'],
+  ];
+
+  const slimFeatures = [
+    {
+      k: 'flags',
+      t: 'Menos procesos',
+      d: 'El mismo motor Chromium 156 con un modelo de procesos de poca memoria. Las capturas salen idénticas a las de Chromium.',
+    },
+    {
+      k: 'gov',
+      t: 'Recoge cuando nadie mira',
+      d: 'Un gobernador pequeño pide GC y devuelve las páginas frías del motor cuando el navegador lleva 30 s quieto, y antes si la memoria crece 256 MB.',
+    },
+    {
+      k: 'park',
+      t: 'Pestañas que no pintan',
+      d: 'cu aparca detrás de una pestaña en blanco la ventana que nadie usa: una página con animaciones en bucle pasó de dos núcleos a ninguno.',
+    },
+  ];
+
+  const waitFeatures = [
+    {
+      k: 'wait',
+      t: 'Esperar lo que se espera',
+      d: 'cu wait --text "Guardado" vuelve en cuanto aparece y falla diciendo qué no llegó. Una sesión real de QA durmió 162 s en 31 sleeps.',
+    },
+    {
+      k: 'console',
+      t: 'Los errores, en la respuesta',
+      d: 'navigate y cada acción traen lo que la página registró como error, lanzó o pidió y falló desde el comando anterior.',
+    },
+    {
+      k: 'net',
+      t: 'La pestaña de red',
+      d: 'cu net lista las llamadas fetch y XHR de la página: método, ruta, estado y duración. --failed deja solo las que fallaron.',
+    },
+    {
+      k: 'mcp',
+      t: '25 herramientas MCP',
+      d: 'navigate devuelve la página, wait y eval son herramientas propias, status dice qué cu y qué navegador responden, tabs marca las tuyas.',
+    },
   ];
 
   // Comparison tables. Every number comes from docs/BENCHMARKS.md; bars are
@@ -282,6 +341,8 @@
       <a href="#que">Qué es</a>
       <a href="#api">API / CLI</a>
       <a href="#qa">QA visual</a>
+      <a href="#esperas">Sin esperas</a>
+      <a href="#slimium">slimium</a>
       <a href="#bench">Velocidad</a>
       <a href="#tokens">Tokens</a>
       <a href="#recursos">Recursos</a>
@@ -494,9 +555,100 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
     </div>
   </section>
 
-  <section class="wrap section" id="bench">
+  <section class="wrap section" id="esperas">
     <header class="sec-head">
       <p class="num">04</p>
+      <h2>Un QA sin esperas a ciegas</h2>
+      <p class="sub">
+        En una sesión real de QA el tiempo no se iba en <code>cu</code>: se iba en las vueltas del agente y en sus
+        <code>sleep</code>. Ahora el agente espera lo que quiere ver, y cada respuesta le cuenta lo que su acción rompió.
+      </p>
+    </header>
+    <div class="features">
+      {#each waitFeatures as f}
+        <article>
+          <span class="fk">{f.k}</span>
+          <h3>{f.t}</h3>
+          <p>{f.d}</p>
+        </article>
+      {/each}
+    </div>
+    <div class="api-grid qa-demo">
+      <div class="term" role="img" aria-label="Ejemplo de espera y de errores en la respuesta">
+        <div class="term-bar"><i></i><i></i><i></i><span>agente@local</span></div>
+        <pre><span class="p">$</span> cu act '[{"{"}"do":"click","ref":"e5"{"}"},{"{"}"do":"wait","text":"Guardado"{"}"}]'
+<span class="o">{"{"}"ok":true,"results":[…,{"{"}"value":"there after 1516 ms"{"}"}],
+ "console":{"{"}"new":1,"entries":[{"{"}"level":"network",
+   "text":"POST /api/save -> 501"{"}"}]{"}"}{"}"}</span>
+<span class="p">$</span> cu net --failed
+<span class="o">#2 14:57:50.341 POST   /api/save -> 501  9 ms</span>
+<span class="p">$</span> cu eval 'document.querySelectorAll("li").length'
+<span class="o">3</span></pre>
+      </div>
+      <aside class="side">
+        <div class="mini">
+          <h3>Tres interacciones, los mismos cinco hallazgos</h3>
+          <table class="kv">
+            <thead><tr><td></td><th class="r">tiempo</th><th class="r">comandos</th></tr></thead>
+            <tbody>
+              <tr><td>con <code>sleep 4</code></td><td class="r dimc">12,2 s</td><td class="r dimc">16</td></tr>
+              <tr><td>con <code>wait</code></td><th class="r"><code>2,7 s</code></th><th class="r"><code>6</code></th></tr>
+            </tbody>
+          </table>
+          <p class="foot">Sobre una página de prueba local que pinta su resultado 1,5 s después del click.</p>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <section class="wrap section" id="slimium">
+    <header class="sec-head">
+      <p class="num">05</p>
+      <h2>cu sobre slimium</h2>
+      <p class="sub">
+        slimium es un navegador para agentes escrito en C: el motor de Chromium con la mitad de memoria o menos.
+        <code>cu</code> lo usa como navegador con <code>CU_BROWSER=slimium-chrome</code>, en un daemon propio
+        (<code>cu-slim</code>) al lado del de siempre. Su repositorio todavía es privado.
+      </p>
+    </header>
+    <div class="features qa">
+      {#each slimFeatures as f}
+        <article>
+          <span class="fk">{f.k}</span>
+          <h3>{f.t}</h3>
+          <p>{f.d}</p>
+        </article>
+      {/each}
+    </div>
+    <div class="trio">
+      <article class="mini">
+        <h3>13 pestañas a través de <code>cu</code></h3>
+        <table class="kv">
+          <thead><tr><td>huella estable, mediana</td><th class="r">MB</th></tr></thead>
+          <tbody>
+            <tr><td>Chromium, modo rápido de cu</td><td class="r dimc">532</td></tr>
+            <tr><td>slimium</td><th class="r"><code>225</code></th></tr>
+          </tbody>
+        </table>
+      </article>
+      <article class="mini wide-2">
+        <h3>Un flujo de QA de 38 comandos</h3>
+        <table class="kv">
+          <thead><tr><td>cada 8 s, tres apps</td><th class="r">cu 1.10 + slimium 0.3.1</th><th class="r">cu 1.12 + slimium 0.3.2</th></tr></thead>
+          <tbody>
+            {#each qaFlow as [w, a, b]}
+              <tr><td>{w}</td><td class="r dimc">{a}</td><th class="r"><code>{b}</code></th></tr>
+            {/each}
+          </tbody>
+        </table>
+        <p class="foot">Chromium 156 headless con render por software. Detalle y método en el CHANGELOG de cu, versiones 1.11 a 1.13.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="wrap section" id="bench">
+    <header class="sec-head">
+      <p class="num">06</p>
       <h2>Velocidad contra agent-browser y Playwright MCP</h2>
       <p class="sub">
         Mismo binario (Chrome for Testing headless shell 153), mismo sitio local y las mismas seis tareas de agente.
@@ -571,7 +723,7 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
 
   <section class="wrap section" id="tokens">
     <header class="sec-head">
-      <p class="num">05</p>
+      <p class="num">07</p>
       <h2>Tokens del snapshot</h2>
       <p class="sub">
         La misma página de catálogo de 2,3 KB (12 enlaces, 10 productos con botón, buscador y pie), contada con
@@ -594,7 +746,7 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
 
   <section class="wrap section" id="recursos">
     <header class="sec-head">
-      <p class="num">06</p>
+      <p class="num">08</p>
       <h2>Recursos y concurrencia</h2>
       <p class="sub">
         El modelo que un CI quiere: <strong>un Chrome siempre abierto</strong>, y cada test abre su propia pestaña
@@ -642,7 +794,7 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
 
   <section class="wrap section" id="real">
     <header class="sec-head">
-      <p class="num">07</p>
+      <p class="num">09</p>
       <h2>Contra una app real de producción</h2>
       <p class="sub">
         Todo lo anterior corre contra páginas locales. Esto corre los flujos que un agente de QA ejecuta de verdad
@@ -770,7 +922,7 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
 
   <section class="wrap section" id="par">
     <header class="sec-head">
-      <p class="num">08</p>
+      <p class="num">10</p>
       <h2>Agentes de IA en paralelo</h2>
       <p class="sub">
         Todo lo anterior son flujos guionizados. Esto son <strong>agentes de IA de verdad</strong>: cada "agente" es una
@@ -921,7 +1073,8 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
 <footer class="wrap foot-site">
   <p><code>cu</code> corre solo en local, sin nube detrás. Datos de <code>docs/BENCHMARKS.md</code>; reproducibles con
     <code>python3 bench/compare.py --iters 10</code>. Código en
-    <a href="https://github.com/jaivial/cu">github.com/jaivial/cu</a>.</p>
+    <a href="https://github.com/jaivial/cu">github.com/jaivial/cu</a>; los números sobre slimium, en su
+    <a href="https://github.com/jaivial/cu#cu-on-slimium">README</a>.</p>
 </footer>
 
 <style>
@@ -1094,6 +1247,7 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
   .kv th code { color: var(--cu); }
   .dimc { color: var(--faint) !important; }
   .trio { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: 1rem; }
+  .trio .wide-2 { grid-column: span 2; }
 
   /* benchmarks */
   .legend { list-style: none; padding: 0; margin: 0 0 1.2rem; display: flex; gap: 1.2rem; flex-wrap: wrap; font-size: 0.85rem; color: var(--dim); }
@@ -1148,6 +1302,7 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
     .hero { grid-template-columns: 1fr; padding: 4rem 0 3.5rem; gap: 2.5rem; }
     .features, .features.qa { grid-template-columns: repeat(2, 1fr); }
     .api-grid, .trio { grid-template-columns: minmax(0, 1fr); }
+    .trio .wide-2 { grid-column: auto; }
     .sp { grid-template-columns: 9rem 1fr; }
     .sp-note { grid-column: 2; text-align: left; }
   }
