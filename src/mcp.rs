@@ -40,13 +40,15 @@ const INTERNAL_ERROR: i32 = -32603;
 
 /// What the client reads at `initialize`. pi lists the first line next to the
 /// server's name in its system prompt, so it says what `cu` is in one breath.
-const INSTRUCTIONS: &str = "cu drives one persistent local Chrome: navigate, read compact ref-addressable snapshots, act by ref, screenshots, console and QA marks.
+const INSTRUCTIONS: &str = "cu drives one persistent local Chrome: navigate, read compact ref-addressable snapshots, act by ref, wait for the page, screenshots, console, network requests, script evaluation and QA marks.
 
-- This MCP connection is one browser session: page tools without `tab` or `context` work in its own tab, opened on first use and closed when the connection ends. Another agent never lands in it.
-- Read with `snapshot` (one line per element, interactive ones carry a ref such as e3) or `text` when the answer is words. Use `screenshot` only when pixels matter.
-- Act by ref with `click` and `type`, or `act` for several steps in one call; `act` answers the resulting snapshot (`click` and `type` do with `snapshot: true`). A stale ref means: take a new snapshot.
-- Popups and extra tabs: `tabs` lists them, any page tool takes `tab`, `close_tab` dismisses one. `context` gives an isolated cookie jar.
-- Credentials: `type` (or `act`) fills a password or a one-time code like any other field when you have one to enter. cu never echoes it back; do not repeat it in your answer either. When the person should type their own, call `login_url` and send them that link; the daemon types what they enter.
+- This MCP connection is one browser session: page tools without `tab` or `context` work in its own tab, opened on first use and closed when the connection ends. Another client is another session with its own tab; `tabs` says which tabs are `yours`, and the others belong to somebody else: leave them alone. `new_tab: true` on a page tool opens one more for this session.
+- `navigate` answers the page's snapshot with its status. Read with `snapshot` (one line per element, interactive ones carry a ref such as e3) or `text` when the answer is words. Use `screenshot` only when pixels matter; give it a `path` and `inline: false` to keep the image out of the conversation.
+- Act by ref with `click` and `type`, or `act` for several steps in one call; `act` answers the resulting snapshot (`click` and `type` do with `snapshot: true`). A stale ref means the page changed: take a new snapshot.
+- Never pause to let a page finish. `wait` returns the moment a text, a selector or an address is there (or `gone`) and fails naming what never came; put it after the action whose result arrives later.
+- Every reply to `navigate`, `click`, `type`, `act` and `wait` carries `\"console\"` when the page logged an error, threw, or had a request fail or answer 4xx/5xx since your last call: read it, it is what the action broke. `console` has the rest (warnings, logs), `net` lists the API calls the page made with method, status and duration, and `eval` runs a script in the page and answers its value.
+- Popups and extra tabs: `tabs` lists them, any page tool takes `tab`, `close_tab` dismisses one of yours. `context` gives an isolated cookie jar.
+- Credentials: `type` (or `act`) fills a password or a one-time code like any other field when you have one to enter. cu never echoes it back; do not repeat it in your answers. `login_url` is for when the person should type their own.
 - A human-verification page pauses actions on its tab: `handoff` shows the state, `handoff` with `wait` parks until the person is done.";
 
 /// One daemon request a tool call turns into.
@@ -310,6 +312,16 @@ impl Server {
         let mut content = match name {
             "screenshot" => shot_content(&body, args)?,
             "text" => vec![Content::Text(readable_text(&body))],
+            "navigate" => vec![Content::Text(readable_navigate(&body))],
+            "eval" => vec![Content::Text(readable_eval(&body)?)],
+            "wait" => vec![Content::Text(readable_wait(&body))],
+            "tabs" => {
+                // This session's tabs, as this process knows them: the page
+                // the daemon gave it and the ones it asked for.
+                let mut mine = lock(&self.opened).clone();
+                mine.extend(lock(&self.pinned).clone());
+                vec![Content::Text(tabs_with_owner(&body, &mine))]
+            }
             _ => vec![Content::Text(readable(&body))],
         };
         if name == "close_tab"
@@ -471,7 +483,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "status",
         title: "Daemon status",
-        description: "Whether the cu daemon and its browser are up.",
+        description: "Whether the cu daemon and its browser are up, and what they are: cu's version, the browser's engine (slimium, chromium) and product, whether it is headless, and how idle tabs are kept.",
         properties: "",
         required: &[],
         target: Target::None,
@@ -483,8 +495,8 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "navigate",
         title: "Navigate",
-        description: "Open a URL and wait up to ~3 s for the page to settle. `\"settled\":false` means it was still loading: take a snapshot before acting. A session saved in the vault for the domain is injected first unless `inject` is false. A navigation that cannot happen is an error, not silence.",
-        properties: r#""url":{"type":"string","description":"Absolute URL to open."},"inject":{"type":"boolean","description":"Inject a vault-saved session for the domain (default true)."}"#,
+        description: "Open a URL, wait up to ~3 s for the page to settle, and answer its HTTP status and its snapshot (the page, one line per element with refs). `\"settled\":false` means it was still loading: `wait` for what you expect. `\"console\"` lists the errors and failed requests of the load. A session saved in the vault for the domain is injected first unless `inject` is false. A navigation that cannot happen is an error, not silence.",
+        properties: r#""url":{"type":"string","description":"Absolute URL to open."},"snapshot":{"type":"boolean","description":"Answer the page's snapshot too (default true)."},"inject":{"type":"boolean","description":"Inject a vault-saved session for the domain (default true)."}"#,
         required: &["url"],
         target: Target::PageOrNew,
         read_only: false,
@@ -553,6 +565,30 @@ const TOOLS: &[Tool] = &[
         open_world: true,
     },
     Tool {
+        name: "wait",
+        title: "Wait for the page",
+        description: "Wait until the page shows a text, has an element matching a selector, or is at an address (or, with `gone`, until it no longer does), then answer the snapshot. Returns the moment it is true and fails naming what never came. Use it after an action whose result arrives later, instead of pausing a guessed number of seconds. Give exactly one of `text`, `selector`, `url`; `ms` alone is a plain pause.",
+        properties: r#""text":{"type":"string","description":"Visible text to wait for."},"selector":{"type":"string","description":"CSS selector of an element to wait for (present and with a size)."},"url":{"type":"string","description":"Part of the address to wait for."},"gone":{"type":"boolean","description":"Wait for it to go away instead (a spinner, a toast)."},"timeout":{"type":"number","description":"Seconds to wait at most (default 10, at most 60; keep it under the client's tool timeout)."},"ms":{"type":"number","description":"A plain pause in milliseconds, when nothing can be waited for."},"snapshot":{"type":"boolean","description":"Answer the resulting snapshot (default true)."}"#,
+        required: &[],
+        target: Target::Page,
+        read_only: true,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+    },
+    Tool {
+        name: "eval",
+        title: "Run a script in the page",
+        description: "Evaluate JavaScript in the page, as the DevTools console would, and answer its value: a string as it is, anything else as JSON; a promise is awaited. For what no other tool reads: a computed style, a count, storage, a call to the page's own API. A script that throws is an error with its message.",
+        properties: r#""js":{"type":"string","description":"The expression or script, e.g. document.querySelectorAll('tr').length or (async () => (await fetch('/api/me')).status)()."}"#,
+        required: &["js"],
+        target: Target::Page,
+        read_only: false,
+        destructive: false,
+        idempotent: false,
+        open_world: false,
+    },
+    Tool {
         name: "screenshot",
         title: "Screenshot",
         description: "Capture the page as an image (JPEG, or PNG with format png). width/height/scale emulate a viewport for the capture (restored afterwards); ref or selector clip one element (with padding px); annotate labels snapshot refs on the image (\"all\" or \"e1,e4\"); marks boxes the QA marks numbered like the report. `path` also saves it to a file; `inline: false` then skips returning the image.",
@@ -567,7 +603,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "tabs",
         title: "List tabs",
-        description: "Every open tab: id, url, title and opener. Pass an id as `tab` to any page tool, e.g. to work in a popup a click opened.",
+        description: "Every open tab: id, url, title, opener and `yours` (whether this session opened it). Pass an id as `tab` to any page tool, e.g. to work in a popup a click opened. Tabs that are not yours belong to another agent or to the browser: do not navigate or close them.",
         properties: "",
         required: &[],
         target: Target::None,
@@ -903,7 +939,7 @@ fn url_encode(s: &str) -> String {
 /// The daemon request a tool call is.
 fn plan(name: &str, args: &Args) -> Result<Call, String> {
     match name {
-        "status" => Ok(Call::plain("GET", "/v1/status", None)),
+        "status" => Ok(Call::plain("GET", "/v1/status?detail=1", None)),
         "tabs" => Ok(Call::plain("GET", "/v1/tabs", None)),
         "downloads" => Ok(Call::plain("GET", "/v1/downloads", None)),
         "close_tab" => {
@@ -944,7 +980,12 @@ fn plan(name: &str, args: &Args) -> Result<Call, String> {
         "navigate" => {
             let url = args.required("url")?;
             let inject = args.flag("inject")?.unwrap_or(true);
-            let body = format!("{{\"url\":{},\"inject\":{inject}}}", json_string(url));
+            // The page an agent navigates to is the page it reads next.
+            let snapshot = args.flag("snapshot")?.unwrap_or(true);
+            let body = format!(
+                "{{\"url\":{},\"inject\":{inject},\"snapshot\":{snapshot}}}",
+                json_string(url)
+            );
             page(args, "POST", "/v1/navigate", Vec::new(), Some(body))
         }
         "snapshot" => page(args, "GET", "/v1/snapshot", Vec::new(), None),
@@ -969,6 +1010,50 @@ fn plan(name: &str, args: &Args) -> Result<Call, String> {
                 snapshot_flag(args)?
             );
             page(args, "POST", "/v1/type", Vec::new(), Some(body))
+        }
+        "eval" => {
+            let js = args.text("js")?;
+            let body = format!(
+                "{{\"actions\":[{{\"do\":\"eval\",\"js\":{}}}],\"snapshot\":false}}",
+                json_string(js)
+            );
+            page(args, "POST", "/v1/act", Vec::new(), Some(body))
+        }
+        "wait" => {
+            let mut step = String::from("{\"do\":\"wait\"");
+            let mut conditions = 0;
+            for key in ["text", "selector", "url"] {
+                if let Some(value) = args.str(key) {
+                    step.push_str(&format!(",\"{key}\":{}", json_string(value)));
+                    conditions += 1;
+                }
+            }
+            let pause = args.number("ms")?;
+            match (conditions, pause) {
+                (1, None) => {}
+                (0, Some(ms)) => step.push_str(&format!(",\"ms\":{ms}")),
+                (0, None) => {
+                    return Err("`wait` needs one of `text`, `selector` or `url` (or `ms` for a plain pause)".into());
+                }
+                _ => {
+                    return Err(
+                        "`wait` takes exactly one of `text`, `selector`, `url` or `ms`".into(),
+                    );
+                }
+            }
+            if args.flag("gone")? == Some(true) {
+                step.push_str(",\"gone\":true");
+            }
+            if let Some(seconds) = args.number("timeout")? {
+                step.push_str(&format!(",\"timeout\":{seconds}"));
+            }
+            step.push('}');
+            let snapshot = match args.flag("snapshot")? {
+                Some(false) => ",\"snapshot\":false",
+                _ => "",
+            };
+            let body = format!("{{\"actions\":[{step}]{snapshot}}}");
+            page(args, "POST", "/v1/act", Vec::new(), Some(body))
         }
         "act" => {
             let actions = actions(args.value("actions"))?;
@@ -1280,6 +1365,110 @@ fn readable(body: &str) -> String {
     } else {
         format!("{}\n{}", Json::Object(rest).to_json(), snapshot.trim_end())
     }
+}
+
+/// The reply of `navigate` without what only cu needs: the DevTools ids, the
+/// timings, a challenge assessment that says "ready" and a vault note that
+/// says there is nothing saved. What is left is the status, whether the page
+/// settled, what went wrong while it loaded, and the snapshot: about a fifth
+/// of the characters, on every navigation of every session.
+fn readable_navigate(body: &str) -> String {
+    let Ok(Json::Object(members)) = Json::parse(body.trim()) else {
+        return readable(body);
+    };
+    let kept: Vec<(String, Json)> = members
+        .into_iter()
+        .filter(|(key, value)| match key.as_str() {
+            "result" | "settled_ms" | "queued_ms" => false,
+            "challenge" => value.get("state").and_then(Json::as_str) != Some("ready"),
+            "vault" => {
+                value.get("session").and_then(Json::as_str) != Some("none")
+                    || value.get("credentials").is_some_and(|c| c.to_json() != "0")
+            }
+            _ => true,
+        })
+        .collect();
+    readable(&Json::Object(kept).to_json())
+}
+
+/// The reply of `eval` as the value itself; a script that threw is an error
+/// (the caller marks the tool result as one). What the page got wrong while
+/// the script ran follows on a line of its own.
+fn readable_eval(body: &str) -> Result<String, String> {
+    let reply = Json::parse(body.trim()).map_err(|_| body.trim().to_string())?;
+    let first = match reply.get("results") {
+        Some(Json::Array(results)) => results.first(),
+        _ => None,
+    };
+    let failed = reply.get("ok") != Some(&Json::Bool(true));
+    if failed {
+        return Err(first
+            .and_then(|r| r.get("error"))
+            .or_else(|| reply.get("error"))
+            .and_then(Json::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| body.trim().to_string()));
+    }
+    let mut out = first
+        .and_then(|r| r.get("value"))
+        .and_then(Json::as_str)
+        .unwrap_or("undefined")
+        .to_string();
+    if let Some(console) = reply.get("console") {
+        out.push_str(&format!("\n{{\"console\":{}}}", console.to_json()));
+    }
+    Ok(out)
+}
+
+/// The reply of a `wait` that was met, as what it says and the page: "there
+/// after 420 ms", what went wrong meanwhile, the snapshot. One that was not
+/// met stays as the daemon wrote it, with the step that failed and why.
+fn readable_wait(body: &str) -> String {
+    let Ok(Json::Object(members)) = Json::parse(body.trim()) else {
+        return readable(body);
+    };
+    let field = |name: &str| members.iter().find(|(key, _)| key == name).map(|(_, v)| v);
+    if field("ok") != Some(&Json::Bool(true)) {
+        return readable(body);
+    }
+    let said = match field("results") {
+        Some(Json::Array(results)) => results
+            .first()
+            .and_then(|r| r.get("value"))
+            .and_then(Json::as_str),
+        _ => None,
+    };
+    let mut out = said.unwrap_or("waited").to_string();
+    if let Some(console) = field("console") {
+        out.push_str(&format!("\n{{\"console\":{}}}", console.to_json()));
+    }
+    if let Some(snapshot) = field("snapshot").and_then(Json::as_str) {
+        out.push('\n');
+        out.push_str(snapshot.trim_end());
+    }
+    out
+}
+
+/// `GET /v1/tabs` with `yours` on each tab: whether this session opened it.
+fn tabs_with_owner(body: &str, mine: &[String]) -> String {
+    let Ok(Json::Object(mut members)) = Json::parse(body.trim()) else {
+        return body.trim().to_string();
+    };
+    for (key, value) in members.iter_mut() {
+        if key != "tabs" {
+            continue;
+        }
+        if let Json::Array(tabs) = value {
+            for tab in tabs.iter_mut() {
+                let id = tab.get("id").and_then(Json::as_str).map(str::to_string);
+                if let (Json::Object(fields), Some(id)) = (tab, id) {
+                    fields.retain(|(name, _)| name != "yours");
+                    fields.push(("yours".into(), Json::Bool(mine.contains(&id))));
+                }
+            }
+        }
+    }
+    Json::Object(members).to_json()
 }
 
 /// `GET /v1/text` as the words themselves, with a note when they were cut.
@@ -1710,5 +1899,144 @@ mod tests {
         assert!(plan_of(r#"{"answer":"maybe"}"#).is_err());
         assert!(plan_of(r#"{"answer":"accept","policy":"all=accept"}"#).is_err());
         assert!(tools_list().unwrap().contains("\"name\":\"dialog\""));
+    }
+
+    fn planned(tool: &str, args: &str) -> Result<Call, String> {
+        let json = Json::parse(args).expect("args parse");
+        plan(tool, &Args(&json))
+    }
+
+    #[test]
+    fn navigate_asks_for_the_page_it_lands_on() {
+        let call = planned("navigate", r#"{"url":"https://example.com/"}"#).unwrap();
+        assert_eq!((call.method, call.path.as_str()), ("POST", "/v1/navigate"));
+        assert_eq!(
+            call.body.as_deref(),
+            Some(r#"{"url":"https://example.com/","inject":true,"snapshot":true}"#)
+        );
+        let bare = planned(
+            "navigate",
+            r#"{"url":"https://example.com/","snapshot":false}"#,
+        );
+        assert!(
+            bare.unwrap()
+                .body
+                .unwrap()
+                .ends_with(r#""snapshot":false}"#)
+        );
+    }
+
+    #[test]
+    fn a_navigate_reply_keeps_what_an_agent_reads() {
+        let reply = r#"{"result":{"id":2,"result":{"frameId":"F","loaderId":"L"}},"settled_ms":9,"settled":true,"challenge":{"state":"ready","signals":["status 200"]},"status":200,"queued_ms":0,"console":{"new":1,"entries":[{"level":"error","text":"boom"}]},"vault":{"session":"none","credentials":0},"snapshot":"- url: https://example.com/\n- ref=e1 link \"More\"\n"}"#;
+        assert_eq!(
+            readable_navigate(reply),
+            "{\"settled\":true,\"status\":200,\"console\":{\"new\":1,\"entries\":[{\"level\":\"error\",\"text\":\"boom\"}]}}\n- url: https://example.com/\n- ref=e1 link \"More\""
+        );
+        // A challenge that is not "ready" and a vault that has something stay.
+        let held = r#"{"result":{},"settled":false,"challenge":{"state":"human_required"},"status":403,"vault":{"session":"injected","credentials":2}}"#;
+        let text = readable_navigate(held);
+        assert!(text.contains("human_required") && text.contains("\"credentials\":2"));
+        assert!(!text.contains("\"result\""));
+        // An error is passed on as it is.
+        assert_eq!(
+            readable_navigate(r#"{"error":"url is required"}"#),
+            r#"{"error":"url is required"}"#
+        );
+    }
+
+    #[test]
+    fn eval_is_one_script_and_answers_its_value() {
+        let call = planned("eval", r#"{"js":"document.title","tab":"T1"}"#).unwrap();
+        assert_eq!(call.path, "/v1/act?tab=T1");
+        assert_eq!(
+            call.body.as_deref(),
+            Some(r#"{"actions":[{"do":"eval","js":"document.title"}],"snapshot":false}"#)
+        );
+        assert!(planned("eval", "{}").is_err());
+        assert_eq!(
+            readable_eval(
+                r#"{"ok":true,"results":[{"ok":true,"navigated":false,"ms":0,"value":"{\"rows\":40}"}],"ms":1}"#
+            ),
+            Ok(r#"{"rows":40}"#.to_string())
+        );
+        // No value is `undefined`; what the script broke comes after it.
+        assert_eq!(
+            readable_eval(
+                r#"{"ok":true,"results":[{"ok":true}],"ms":1,"console":{"new":1,"entries":[]}}"#
+            ),
+            Ok("undefined\n{\"console\":{\"new\":1,\"entries\":[]}}".to_string())
+        );
+        // A script that threw is the tool's error.
+        assert_eq!(
+            readable_eval(
+                r#"{"ok":false,"results":[{"ok":false,"error":"eval: ReferenceError: x is not defined"}],"failed":0,"error":"eval: ReferenceError: x is not defined","ms":1}"#
+            ),
+            Err("eval: ReferenceError: x is not defined".to_string())
+        );
+    }
+
+    #[test]
+    fn wait_takes_one_condition_or_a_pause() {
+        let text = planned("wait", r#"{"text":"Saved","timeout":5}"#).unwrap();
+        assert_eq!(text.path, "/v1/act");
+        assert_eq!(
+            text.body.as_deref(),
+            Some(r#"{"actions":[{"do":"wait","text":"Saved","timeout":5}]}"#)
+        );
+        let gone = planned(
+            "wait",
+            r#"{"selector":".spinner","gone":true,"snapshot":false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            gone.body.as_deref(),
+            Some(
+                r#"{"actions":[{"do":"wait","selector":".spinner","gone":true}],"snapshot":false}"#
+            )
+        );
+        let pause = planned("wait", r#"{"ms":250}"#).unwrap();
+        assert_eq!(
+            pause.body.as_deref(),
+            Some(r#"{"actions":[{"do":"wait","ms":250}]}"#)
+        );
+        assert!(planned("wait", "{}").is_err());
+        assert!(planned("wait", r#"{"text":"a","url":"/b"}"#).is_err());
+        assert!(planned("wait", r#"{"text":"a","ms":10}"#).is_err());
+        // Met: what it says and the page. Not met: the daemon's own words.
+        assert_eq!(
+            readable_wait(
+                r#"{"ok":true,"results":[{"ok":true,"navigated":false,"ms":421,"value":"there after 420 ms"}],"ms":421,"snapshot":"- page: Done\n"}"#
+            ),
+            "there after 420 ms\n- page: Done"
+        );
+        let missed = r#"{"ok":false,"results":[{"ok":false,"error":"the text \"Saved\" did not appear within 5 s"}],"failed":0,"error":"the text \"Saved\" did not appear within 5 s","ms":5001}"#;
+        assert!(readable_wait(missed).contains("did not appear within 5 s"));
+    }
+
+    #[test]
+    fn tabs_say_which_are_this_sessions() {
+        let body = r#"{"tabs":[{"id":"A","url":"https://a/","title":"a","default":false,"opener":null},{"id":"B","url":"about:blank","title":"","default":true,"opener":null,"yours":true}]}"#;
+        let text = tabs_with_owner(body, &["A".to_string()]);
+        let parsed = Json::parse(&text).unwrap();
+        let Some(Json::Array(tabs)) = parsed.get("tabs") else {
+            panic!("{text}")
+        };
+        assert_eq!(tabs[0].get("yours"), Some(&Json::Bool(true)));
+        // What the daemon said about another session's header does not count.
+        assert_eq!(tabs[1].get("yours"), Some(&Json::Bool(false)));
+    }
+
+    #[test]
+    fn status_asks_for_the_detail_and_the_new_tools_are_listed() {
+        let status = planned("status", "{}").unwrap();
+        assert_eq!(status.path, "/v1/status?detail=1");
+        let list = tools_list().unwrap();
+        for tool in ["wait", "eval", "net"] {
+            assert!(list.contains(&format!("\"name\":\"{tool}\"")), "{tool}");
+        }
+        for word in ["`wait`", "`eval`", "`net`", "\"console\"", "`yours`"] {
+            assert!(INSTRUCTIONS.contains(word), "{word}");
+        }
     }
 }

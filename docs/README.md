@@ -621,14 +621,16 @@ is dropped and the next call opens a fresh one, and says so.
 
 | Tool | Daemon route | What it does |
 |---|---|---|
-| `status` | `GET /v1/status` | daemon and browser up? |
-| `navigate` | `POST /v1/navigate` | open a URL (`inject`, `new_tab`) |
+| `status` | `GET /v1/status?detail=1` | daemon and browser up, cu's version, the browser's engine and product, how idle tabs are kept |
+| `navigate` | `POST /v1/navigate` | open a URL and answer its status and its snapshot (`snapshot: false`, `inject`, `new_tab`) |
 | `snapshot` | `GET /v1/snapshot` | the ref-addressable page, as plain lines |
 | `text` | `GET /v1/text` | the page's words |
 | `click`, `type` | `POST /v1/click`, `/v1/type` | act on a ref (`snapshot: true` adds the page) |
 | `act` | `POST /v1/act` | a batch of steps, answering the resulting snapshot |
+| `wait` | `POST /v1/act` (`wait` step) | until a `text`, a `selector` or a `url` is there (or `gone`), then the snapshot; fails naming what never came |
+| `eval` | `POST /v1/act` (`eval` step) | run a script in the page and answer its value: a string as it is, anything else as JSON |
 | `screenshot` | `GET /v1/screenshot` | an image block; `path` saves it, `inline: false` only saves |
-| `tabs`, `close_tab` | `GET /v1/tabs`, `DELETE /v1/tabs/ID` | popups and extra tabs |
+| `tabs`, `close_tab` | `GET /v1/tabs`, `DELETE /v1/tabs/ID` | popups and extra tabs; each tab says whether it is `yours` |
 | `close_context` | `DELETE /v1/contexts/NAME` | drop a context a page tool opened |
 | `net` | `GET /v1/net` | the fetch and XHR requests the page made: method, address, status, duration (`grep`, `failed`, `since`, `limit`, `json`) |
 | `console` | `GET /v1/console` | console, exceptions, CSP and network failures, and (level `dialog`) the JavaScript dialogs cu answered |

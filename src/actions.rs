@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 use crate::input::InputPolicy;
 
 use crate::server::{
-    self, CdpConnection, Tab, checkin, checkout, evaluated_string, json_array, json_bool,
-    json_number, json_objects, json_string, json_string_value, json_value, open_connection,
+    self, CdpConnection, Tab, checkin, checkout, evaluated_string, evaluated_value, json_array,
+    json_bool, json_number, json_objects, json_string, json_string_value, json_value,
+    open_connection,
 };
 
 /// What a `wait` action waits for.
@@ -974,7 +975,7 @@ impl Page {
                         .unwrap_or_else(|| "the script threw".into());
                     return Err(format!("eval: {text}"));
                 }
-                value = evaluated_string(&reply);
+                value = evaluated_value(&reply);
                 false
             }
             Action::Emulate {

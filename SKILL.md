@@ -133,10 +133,15 @@ Use `cu` when an agent needs a persistent local browser session.
 
 12. Over MCP. When the harness has the `cu mcp` server configured (tools named
     like `mcp__cu__navigate`), the same flow is tools instead of commands:
-    `navigate`, `snapshot`, `click`, `type`, `act`, `screenshot`, `tabs`,
-    `console`, `inspect`, `mark`/`marks`, `handoff`, `dialog`, `login_url`... The
+    `navigate`, `snapshot`, `click`, `type`, `act`, `wait`, `eval`,
+    `screenshot`, `tabs`, `console`, `net`, `inspect`, `mark`/`marks`,
+    `handoff`, `dialog`, `login_url`... `navigate` already answers the page's
+    snapshot; `wait` (a `text`, a `selector` or a `url`) replaces every pause;
+    `eval` answers a script's value; `status` says which cu and which browser
+    you are talking to. The
     connection is the session: its page tools share one tab (pass `tab` for a
-    popup), and the tab is closed when the connection ends. No MCP tool takes a
+    popup), `tabs` says which tabs are `yours` (leave the others alone), and
+    the tab is closed when the connection ends. No MCP tool takes a
     password or a code: `login_url` for sign-ins, and the vault and `cu otp`
     stay on the CLI.
 
