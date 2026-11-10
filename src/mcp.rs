@@ -43,6 +43,7 @@ const INTERNAL_ERROR: i32 = -32603;
 const INSTRUCTIONS: &str = "cu drives one persistent local Chrome: navigate, read compact ref-addressable snapshots, act by ref, wait for the page, screenshots, console, network requests, script evaluation and QA marks.
 
 - This MCP connection is one browser session: page tools without `tab` or `context` work in its own tab, opened on first use and closed when the connection ends. Another client is another session with its own tab; `tabs` says which tabs are `yours`, and the others belong to somebody else: leave them alone. `new_tab: true` on a page tool opens one more for this session.
+- When several agents share this connection (a harness that runs one MCP client for all its sessions and subagents), the session's tab is shared too, and a call without `tab` lands on whichever page was opened last. Open your own with `navigate` and `new_tab: true`, keep the tab id the reply names, pass it as `tab` on every call, and `close_tab` it when you are done. Calls that name a `tab` also run side by side instead of one after the other.
 - `navigate` answers the page's snapshot with its status. Read with `snapshot` (one line per element, interactive ones carry a ref such as e3) or `text` when the answer is words. Use `screenshot` only when pixels matter; give it a `path` and `inline: false` to keep the image out of the conversation.
 - Act by ref with `click` and `type`, or `act` for several steps in one call; `act` answers the resulting snapshot (`click` and `type` do with `snapshot: true`). A stale ref means the page changed: take a new snapshot.
 - Never pause to let a page finish. `wait` returns the moment a text, a selector or an address is there (or `gone`) and fails naming what never came; put it after the action whose result arrives later.
@@ -342,7 +343,7 @@ impl Server {
             if header(&head, "x-cu-tab-new").is_some() {
                 lock(&self.opened).push(tab.to_string());
                 content.push(Content::Text(format!(
-                    "cu: this session works in a fresh tab ({tab}); page tools without `tab` use it, and it is closed when this MCP session ends"
+                    "cu: this session works in a fresh tab ({tab}); page tools without `tab` use it, and it is closed when this MCP session ends. If other agents share this MCP connection, pass \"tab\":\"{tab}\" on every call to stay on your page."
                 )));
             }
         }
@@ -2035,7 +2036,14 @@ mod tests {
         for tool in ["wait", "eval", "net"] {
             assert!(list.contains(&format!("\"name\":\"{tool}\"")), "{tool}");
         }
-        for word in ["`wait`", "`eval`", "`net`", "\"console\"", "`yours`"] {
+        for word in [
+            "`wait`",
+            "`eval`",
+            "`net`",
+            "\"console\"",
+            "`yours`",
+            "share this connection",
+        ] {
             assert!(INSTRUCTIONS.contains(word), "{word}");
         }
     }

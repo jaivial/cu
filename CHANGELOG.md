@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.13.1] - 2026-11-10
+
+### Changed
+
+- **The MCP instructions say what to do when a connection is shared.** A
+  harness that runs one MCP client for all its sessions and subagents gives
+  them all one cu session, so one "session tab": a call without `tab` lands
+  on whichever page was opened last, another agent's included. The way
+  around it was already there (`new_tab: true`, then `tab` on every call,
+  which also takes the call out of the session's queue); the instructions
+  and the note that names a fresh tab now say so.
+
 ## [1.13.0] - 2026-11-10
 
 The MCP server, as a QA agent uses it. What an agent read from `cu mcp` was
