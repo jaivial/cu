@@ -16,6 +16,7 @@ pub mod mcp;
 pub mod minbrowser;
 pub mod otp;
 pub mod pagecache;
+pub mod park;
 pub mod policy;
 pub mod qr;
 pub mod scheduler;

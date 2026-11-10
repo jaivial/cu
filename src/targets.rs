@@ -96,6 +96,25 @@ pub fn see(event: &str) {
     }
 }
 
+/// Every live page target with the browser context it is in, for the parker
+/// ([`crate::park`]): tabs of one context share a window.
+pub fn pages() -> Vec<crate::park::Page> {
+    registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .live
+        .iter()
+        .filter(|(_, target)| target.kind == "page")
+        .filter_map(|(id, target)| {
+            Some(crate::park::Page {
+                id: id.clone(),
+                context: target.context.clone()?,
+                blank: target.url == "about:blank",
+            })
+        })
+        .collect()
+}
+
 /// The page that opened `id`, if it is a popup.
 pub fn opener_of(id: &str) -> Option<String> {
     registry()

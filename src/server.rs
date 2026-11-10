@@ -2836,6 +2836,39 @@ fn restore_viewport(was: Option<Viewport>, tab: &Tab) {
     );
 }
 
+/// Bring `tab` forward for a capture, and keep other captures of this
+/// process out until the returned guard is dropped.
+///
+/// A headless tab that is not in front makes no frame, and a capture of it
+/// waits for one. Measured on Chromium 156 (headless, software rendering),
+/// with a blank tab in front and with the frame-rate limit either way:
+///
+/// - a page that is not animating, in a background tab: `Page.captureScreenshot`
+///   answers only after cu's 5 s read timeout and a second try (25 captures,
+///   24 of them 5.1 s; annotated ones 25 of 25);
+/// - the same page in front: 61 ms, none slow.
+///
+/// A page that animates got its frame from the animation, which is why this
+/// showed up as "sometimes the screenshot takes five seconds". The tab cu
+/// opens is a background tab, so this was the ordinary case until the first
+/// scroll. Coming forward costs about 4 ms, and the document already says
+/// `visible` on the next command (40 of 40).
+///
+/// One at a time because bringing one tab forward hides the others of its
+/// window: two agents capturing at once would hide each other's tab in the
+/// middle of the capture. Only where the parker runs ([`crate::park`]), which
+/// is what puts the tab back afterwards: not on a browser a person has a
+/// window on, and not with `CU_PARK_AFTER=0`.
+fn in_front_for_capture(tab: &Tab) -> Option<std::sync::MutexGuard<'static, ()>> {
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    if !crate::park::applies() {
+        return None;
+    }
+    let guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = tab_command(tab, "Page.bringToFront", "{}");
+    Some(guard)
+}
+
 fn screenshot(tab: &Tab, query: &str) -> (&'static str, &'static str, String) {
     let options = match ShotOptions::parse(query) {
         Ok(options) => options,
@@ -2859,6 +2892,12 @@ fn screenshot(tab: &Tab, query: &str) -> (&'static str, &'static str, String) {
     // device is known, and it goes back on whole -- screen, orientation,
     // mobile flag and all -- which a measured viewport could not say.
     let emulated = options.emulates() && crate::emulation::device(tab).is_some();
+    // The tab is in front for the whole capture (see [`in_front_for_capture`]):
+    // the overlay is drawn and the page measured on a document that paints,
+    // and a capture at another size photographs the page *after it reacted*
+    // to that size -- a hidden tab makes no frame, so its `resize` and
+    // media-query listeners do not run.
+    let _in_front = in_front_for_capture(tab);
     let was = if options.emulates() && !emulated {
         Viewport::read(tab)
     } else {
@@ -2927,7 +2966,26 @@ const MAX_SCALE: f64 = 4.0;
 /// third of this and nothing; the budget only matters on a browser that has
 /// stopped producing frames for the tab, where the wait ends by itself
 /// instead of hanging the capture until the socket read times out.
+///
+/// A document that says it is hidden is not waited for at all (see
+/// [`frame_wait_js`]).
 const FRAME_WAIT_MS: u32 = 250;
+
+/// The wait for two painted frames, as a JavaScript expression to `await`.
+///
+/// A hidden document resolves at once. It never gets an animation frame, and
+/// its timers are throttled to one wake-up a second, so the timer that is
+/// meant to end the wait after [`FRAME_WAIT_MS`] took about a second
+/// (measured: an annotated capture of a background tab 1.1-1.3 s, of a tab
+/// in front 50-66 ms). Nothing is lost by not waiting: no frame would have
+/// come, and `Page.captureScreenshot` makes the frame it photographs.
+pub fn frame_wait_js() -> String {
+    format!(
+        "new Promise(r=>{{if(document.hidden){{r();return;}}let done=false;\
+         const go=()=>{{if(!done){{done=true;r();}}}};\
+         requestAnimationFrame(()=>requestAnimationFrame(go));setTimeout(go,{FRAME_WAIT_MS});}})"
+    )
+}
 
 impl ShotOptions {
     pub fn parse(query: &str) -> Result<Self, String> {
@@ -3154,8 +3212,7 @@ fn capture(tab: &Tab, options: &ShotOptions) -> Result<(String, String), String>
         .unwrap_or_default();
     let expression = format!(
         "(async()=>{{const err=(m)=>JSON.stringify({{error:m}});{}\
-         await new Promise(r=>{{let done=false;const go=()=>{{if(!done){{done=true;r();}}}};\
-         requestAnimationFrame(()=>requestAnimationFrame(go));setTimeout(go,{FRAME_WAIT_MS});}});\
+         await {};\
          {}}})()",
         match &target {
             Some(target) => format!(
@@ -3167,6 +3224,7 @@ fn capture(tab: &Tab, options: &ShotOptions) -> Result<(String, String), String>
             ),
             None => String::new(),
         },
+        frame_wait_js(),
         match &target {
             Some(_) => format!(
                 "const r=el.getBoundingClientRect();\
@@ -4238,6 +4296,13 @@ impl Tab {
                 }
             }
         }
+        if method == "Page.captureScreenshot" && crate::park::applies() {
+            // A headless tab that is not in front makes no frame, and a
+            // capture of one that is not animating waits out the read
+            // timeout (see `in_front_for_capture`). Free on a tab that is
+            // already in front, which is every capture of `screenshot`.
+            let _ = tab_command(self, "Page.bringToFront", "{}");
+        }
         tab_command(self, method, params)
     }
 
@@ -4632,6 +4697,12 @@ pub struct CdpConnection {
     /// The entry this connection has in the in-flight registry, so a dialog
     /// left open for the agent can cut it (see [`interrupt_target`]).
     watch: Option<u64>,
+    /// The page this connection drives, when it was opened for a tab's
+    /// commands: every command on it tells the parker the tab is in use (see
+    /// [`crate::park`]). `None` for the browser endpoint and for the sessions
+    /// cu holds for good (a tab's keeper, an emulated device), which must not
+    /// keep a window in front.
+    page: Option<(u16, std::sync::Arc<str>)>,
 }
 
 impl Drop for CdpConnection {
@@ -4731,6 +4802,7 @@ impl CdpConnection {
             }
         };
         let mut connection = Self::connect(&ws)?;
+        connection.page = Some((tab.cdp_port, std::sync::Arc::from(target.as_str())));
         if let Ok(handle) = connection.stream.try_clone() {
             static NEXT: AtomicU64 = AtomicU64::new(1);
             let id = NEXT.fetch_add(1, Ordering::SeqCst);
@@ -4741,6 +4813,14 @@ impl CdpConnection {
             connection.watch = Some(id);
         }
         Ok(connection)
+    }
+
+    /// This connection as one cu holds in the background for the page's own
+    /// traffic, not for an agent's commands: what it sends does not count as
+    /// the tab being used, so it never keeps an idle window in front.
+    pub(crate) fn unattended(mut self) -> Self {
+        self.page = None;
+        self
     }
 
     /// The socket, for a session cu holds for good (the tab's keeper).
@@ -4789,7 +4869,16 @@ impl CdpConnection {
             stream,
             next_id: 1,
             watch: None,
+            page: None,
         })
+    }
+
+    /// Tell the parker a command is running on this connection's page, for
+    /// as long as the returned value lives.
+    fn in_use(&self) -> Option<crate::park::InUse> {
+        self.page
+            .as_ref()
+            .and_then(|(cdp_port, target)| crate::park::begin(*cdp_port, target))
     }
 
     /// Send one command and read its reply, skipping events meant for nobody.
@@ -4810,6 +4899,7 @@ impl CdpConnection {
         commands: &[(&str, &str)],
         observe: &mut dyn FnMut(&str),
     ) -> Vec<Result<String, String>> {
+        let _in_use = self.in_use();
         let started = Instant::now();
         let mut ids = Vec::with_capacity(commands.len());
         for (method, params) in commands {
@@ -4882,12 +4972,17 @@ impl CdpConnection {
         params: &str,
         observe: &mut dyn FnMut(&str),
     ) -> Result<String, String> {
+        let _in_use = self.in_use();
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         let message = format!("{{\"id\":{id},\"method\":\"{method}\",\"params\":{params}}}");
         let started = Instant::now();
         let reply = self.exchange(id, &message, observe);
-        crate::server::trace(&format!("cdp {method}"), Some(started));
+        // One line per DevTools command is for `CU_TRACE=1` only: the daemon's
+        // log is append-only, and this used to be written for every command.
+        if trace_enabled() {
+            crate::server::trace(&format!("cdp {method}"), Some(started));
+        }
         crate::diagnostics::record_command(
             method,
             params,
@@ -4932,6 +5027,7 @@ impl CdpConnection {
         deadline: std::time::Instant,
         observe: &mut dyn FnMut(&str) -> bool,
     ) -> Result<bool, String> {
+        let _in_use = self.in_use();
         let clean = loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
@@ -4957,6 +5053,9 @@ impl CdpConnection {
     /// inline would swallow the events arriving while it waited, and a
     /// request paused for ever is a page hung for ever.
     pub(crate) fn send(&mut self, method: &str, params: &str) -> Result<(), String> {
+        if let Some((cdp_port, target)) = &self.page {
+            crate::park::touch(*cdp_port, target);
+        }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         let message = format!("{{\"id\":{id},\"method\":\"{method}\",\"params\":{params}}}");
@@ -5233,7 +5332,9 @@ fn start_auth_keeper(tab: &Tab, host: &str, pair: (String, String)) {
     let tab = tab.clone();
     thread::spawn(move || {
         let mut connection = match CdpConnection::open(&tab) {
-            Ok(connection) => connection,
+            // Answering the page's own auth challenges is not an agent
+            // using the tab.
+            Ok(connection) => connection.unattended(),
             Err(_) => {
                 keeper.done.store(true, Ordering::SeqCst);
                 return;
@@ -5570,11 +5671,13 @@ pub fn base64_encode(bytes: &[u8]) -> String {
 /// Start a timing span. Enabled with `CU_TRACE=1`; the daemon prints one
 /// `TRACE <label> <ms>` line per span on stderr.
 pub fn trace_start() -> Option<std::time::Instant> {
-    if std::env::var_os("CU_TRACE").is_some() {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    }
+    trace_enabled().then(std::time::Instant::now)
+}
+
+/// Whether `CU_TRACE` is set. Read once: it is asked on every command.
+fn trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CU_TRACE").is_some())
 }
 
 /// Print a timing span started by [`trace_start`].

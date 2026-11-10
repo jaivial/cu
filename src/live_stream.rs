@@ -92,6 +92,21 @@ fn held_tabs() -> &'static Mutex<std::collections::HashMap<String, u64>> {
     HELD.get_or_init(Default::default)
 }
 
+/// Whether a person has this page open in the live viewer, or holds it. The
+/// parker ([`crate::park`]) asks before it hides a window: a tab somebody is
+/// watching stays in front.
+pub fn watched(cdp_port: u16, target: &str) -> bool {
+    let named = format!("{cdp_port}:{target}");
+    // A viewer of the default tab is listed without a target id.
+    let unnamed = (crate::server::pinned_default_target(cdp_port).as_deref() == Some(target))
+        .then(|| format!("{cdp_port}:default"));
+    let listed = |table: &Mutex<std::collections::HashMap<String, u64>>| {
+        let table = table.lock().unwrap_or_else(|e| e.into_inner());
+        table.contains_key(&named) || unnamed.as_ref().is_some_and(|key| table.contains_key(key))
+    };
+    listed(viewers()) || listed(held_tabs())
+}
+
 /// Whether a person holds this tab in the live viewer. The route table asks
 /// this before it lets an automatic action through.
 pub fn taken(tab: &Tab) -> bool {

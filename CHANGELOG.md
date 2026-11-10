@@ -1,5 +1,50 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **A screenshot of a background tab took five seconds.** A headless tab that
+  is not in front makes no frame, and `Page.captureScreenshot` waits for one:
+  on a page that is not animating it answered only after cu's 5 s read timeout
+  and a second try. The tab cu opens is a background tab, so this was every
+  capture until the first scroll. Measured on Chromium 156 (headless,
+  software rendering), 25 captures of a static page behind a blank tab: 24
+  took 5.1 s (annotated ones 25 of 25); the same page in front, 61 ms. A
+  capture now brings its tab forward first (4 ms; the document already says
+  `visible` on the next command, 40 of 40): 100 captures of the same pages,
+  64-204 ms, none slow. Captures of one browser are taken one at a time,
+  because bringing one tab forward hides the others of its window.
+- **An annotated capture of a hidden tab waited a second for nothing.** The
+  overlay and the measure step wait for two animation frames with a 250 ms
+  timer as the way out. A hidden document gets no animation frame and its
+  timers wake once a second, so the way out took about a second
+  (`shot --marks --annotate all` on a background tab: 1.1-1.3 s; in front,
+  50-66 ms). A document that says it is hidden is no longer waited for.
+- **A tab left in front painted for ever.** `scroll`, a tap and the touch
+  gestures bring a tab forward and nothing put it back; the first tab of a
+  browser context is in front from birth. A page with a looping animation is
+  then painted whether or not a command is being sent: 16-18 % of a core at
+  60 frames a second and two cores without the frame-rate limit (2,700
+  frames a second), measured with no command in flight. One QA daemon used
+  4 d 22 h of CPU in two days this way. It also never let the browser be
+  idle, which is the only time slimium's memory governor collects: 0 passes
+  in 36 s before, 4 after. Now a headless window that has had no command for
+  `CU_PARK_AFTER` seconds (default 3) is put behind a blank tab
+  (`Target.activateTarget`), per window, and never while a command is
+  running in it or a person has one of its tabs open in the live viewer.
+  What needs frames brings the tab forward again itself. On a QA flow of 38
+  commands over three apps, 8 s apart: 46 CPU-seconds of browser instead of
+  78, 2 % of a core instead of 15 % while the agent is quiet, and 5.3 s of
+  commands instead of 7.1 s. The cost: a capture of a tab that had been
+  parked repaints it from cold, 120-210 ms instead of 77 ms. A window with
+  no blank tab gets one, which `cu tabs` lists; closing it is noticed and
+  another is made. A page sees `visibilitychange` each time it is parked and
+  brought back. `CU_PARK_AFTER=0` is the old behaviour.
+- **`TRACE cdp ...` was written for every DevTools command**, `CU_TRACE` or
+  not, into a daemon log that is only ever appended to (1.1 MB after four
+  days of QA). It is behind `CU_TRACE` again, as the documentation says.
+
 ## [1.10.0] - 2026-11-06
 
 ### Added
