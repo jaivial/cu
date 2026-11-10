@@ -570,7 +570,8 @@ from the runs.
 agents, written in C: the same Chromium engine under a low-memory process
 model, a small memory governor (garbage collection and reclaim of the engine's
 cold pages once nobody is using the browser, earlier when memory grows) and
-every operation on the command line. Its repository is private for now.
+every operation on the command line. Landing page:
+<https://jaivial.github.io/slimium/>.
 
 It is a drop-in browser for cu. Point `CU_BROWSER` at its wrapper, ideally in a
 daemon of its own beside the canonical one:

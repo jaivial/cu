@@ -608,7 +608,7 @@ cu.save_session(<span class="s">"example"</span>)?;</pre>
       <p class="sub">
         slimium es un navegador para agentes escrito en C: el motor de Chromium con la mitad de memoria o menos.
         <code>cu</code> lo usa como navegador con <code>CU_BROWSER=slimium-chrome</code>, en un daemon propio
-        (<code>cu-slim</code>) al lado del de siempre. Su repositorio todavía es privado.
+        (<code>cu-slim</code>) al lado del de siempre. Su página: <a href="https://jaivial.github.io/slimium/">jaivial.github.io/slimium</a>.
       </p>
     </header>
     <div class="features qa">
