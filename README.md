@@ -386,6 +386,8 @@ cu act '[{"do":"type","ref":"e2","text":"Ada"},{"do":"click","ref":"e5"}]'
 cu batch 'snapshot --tab t1' 'click e3 --tab t1'   # many commands, one call
 cu shot [FILE.jpg] [--annotate REFS|all] [--marks] · cu downloads · cu login
 cu console [--level warn+|error,warn|dialog|all] [--grep S] [--clear]   # page console, all levels
+cu net [--grep S] [--failed] [--json]        # the API calls the page made: method, status, duration
+cu wait --text T | --selector CSS | --url PART [--gone] [--timeout S]   # until the page is ready
 cu dialog [accept [TEXT] | dismiss | policy SPEC]   # JavaScript dialogs, answered by policy
 cu inspect e3 · cu mark e3 "what is wrong" [--severity major] · cu marks [--md|clear]
 cu session save NAME · cu session load NAME

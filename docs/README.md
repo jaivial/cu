@@ -139,9 +139,26 @@ so a whole form is one call:
 ]}
 ```
 
+`wait` waits for the page instead of for a guess: `{"do":"wait","text":"Saved"}`
+(the visible text contains it), `"selector":".row"` (an element matches and has
+a size) or `"url":"/done"` (the address contains it); `"gone":true` waits for
+it to stop being true (a spinner that goes away); `"timeout"` is in seconds
+(default 10, at most 60). It looks every 100 ms, with the tab in front while
+it waits, answers `"there after 420 ms"` as the step's `value`, and fails the
+batch naming what never came. `{"do":"wait","ms":250}` is still a plain pause.
+`cu wait --text T | --selector CSS | --url PART [--gone] [--timeout S]` is the
+same step on its own. One QA session slept 162 s in 31 `sleep`s between its
+commands; this is what those were for.
+
+The reply of a batch (and of `navigate`) also carries
+`"console":{"new":N,"entries":[{"level":..,"text":..}]}` when the page logged
+an error, threw, violated its CSP or had a request fail or answer 4xx/5xx since
+the last reply for that tab: the last ten, cut to 300 characters. Warnings and
+plain log lines stay in `cu console`.
+
 Actions are `click`, `type` (`text`, `clear` default true, `submit`), `press`
 (`key`: Enter, Tab, Escape, arrows, ...), `select` (`value` or label),
-`navigate` (`url`), `wait` (`ms`) and `upload` (`files`: paths; `ref`: the
+`navigate` (`url`), `wait` and `upload` (`files`: paths; `ref`: the
 file input or the button that opens the picker -- file inputs are usually
 `display:none` and never get a ref of their own, so cu finds the input at,
 labelled by, inside or around that control; no `ref` = the page's only file
@@ -613,6 +630,7 @@ is dropped and the next call opens a fresh one, and says so.
 | `screenshot` | `GET /v1/screenshot` | an image block; `path` saves it, `inline: false` only saves |
 | `tabs`, `close_tab` | `GET /v1/tabs`, `DELETE /v1/tabs/ID` | popups and extra tabs |
 | `close_context` | `DELETE /v1/contexts/NAME` | drop a context a page tool opened |
+| `net` | `GET /v1/net` | the fetch and XHR requests the page made: method, address, status, duration (`grep`, `failed`, `since`, `limit`, `json`) |
 | `console` | `GET /v1/console` | console, exceptions, CSP and network failures, and (level `dialog`) the JavaScript dialogs cu answered |
 | `inspect`, `mark`, `marks` | `/v1/inspect`, `/v1/marks` | visual QA references and the report |
 | `upload` | `POST /v1/act` (`upload` step) | files into a file input; paths (here and in `act` upload steps) resolve against the server's working directory |

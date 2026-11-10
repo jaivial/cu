@@ -32,12 +32,27 @@ Use `cu` when an agent needs a persistent local browser session.
    rather than something to act on (prose, an API response, a message), read
    `cu text` -- the snapshot only lists what is clickable. `cu console --level warn+`
    shows console warnings, errors, uncaught exceptions, CSP and network failures.
+   `cu net` lists the API calls the page made (fetch and XHR: method,
+   address, status, duration; `--failed`, `--grep /api/orders`).
+   You rarely need to ask for the errors: the reply of `navigate` and of
+   every action carries `"console":{"new":N,"entries":[...]}` when the page
+   logged an error, threw, or had a request fail or answer 4xx/5xx since
+   your last command. Read it; it is what your action broke.
 5. Act on what the snapshot shows by ref: `cu click e3`, `cu type e2 "text"
    [--submit]`. For several steps, send them at once and get the resulting
    page back in the same call:
    `cu act '[{"do":"type","ref":"e2","text":"Ada"},{"do":"click","ref":"e5"}]'`.
    A reply with `"ok":false` says which action failed and why; a stale ref
-   means "take a new snapshot". Two more result fields to watch: an action
+   means "take a new snapshot".
+   **Never `sleep` to let a page finish.** Wait for what you expect, and get
+   the page back the moment it is there:
+   `cu act '[{"do":"click","ref":"e5"},{"do":"wait","text":"Saved"}]'`, or on
+   its own `cu wait --text "Saved"`, `cu wait --selector '.row'`,
+   `cu wait --selector '.spinner' --gone`, `cu wait --url /dashboard`
+   (`--timeout S`, default 10, at most 60). It returns as soon as the
+   condition holds and fails, naming what never came, when it does not: a
+   guess of four seconds is either too long or too short.
+   Two more result fields to watch: an action
    that starts a download answers `"download":"name"` (list finished files
    with `cu downloads`), and one that opens a window answers `"popup":true`
    (see `cu tabs`).
