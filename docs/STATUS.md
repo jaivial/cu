@@ -14,7 +14,8 @@ What changed under the hood:
   measure was two animation frames, and the capture then waited for the
   frame after that one).
 - Chromium is launched with `--disable-frame-rate-limit`: a capture no
-  longer waits for the compositor's next vsync.
+  longer waits for the compositor's next vsync. (Opt-in since 1.11:
+  `CU_FAST_CAPTURE=1`.)
 - The page helpers (the ref registry and the walk) are installed once per
   document instead of once per snapshot, and the isolated world they run in
   is remembered instead of made again for every action.

@@ -2859,14 +2859,52 @@ fn restore_viewport(was: Option<Viewport>, tab: &Tab) {
 /// middle of the capture. Only where the parker runs ([`crate::park`]), which
 /// is what puts the tab back afterwards: not on a browser a person has a
 /// window on, and not with `CU_PARK_AFTER=0`.
-fn in_front_for_capture(tab: &Tab) -> Option<std::sync::MutexGuard<'static, ()>> {
+///
+/// The tab stays in front for [`crate::park::CAPTURE_LINGER`] after the
+/// capture, not for the seconds a scroll gets: nothing is left to paint.
+fn in_front_for_capture(tab: &Tab) -> Option<InFront> {
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
     if !crate::park::applies() {
         return None;
     }
-    let guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let one_at_a_time = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    front_for_capture(tab);
+    Some(InFront {
+        tab: tab.clone(),
+        _one_at_a_time: one_at_a_time,
+    })
+}
+
+/// A tab brought forward for a capture; dropping it starts the short stay.
+struct InFront {
+    tab: Tab,
+    _one_at_a_time: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for InFront {
+    fn drop(&mut self) {
+        stay_after_capture(&self.tab);
+    }
+}
+
+/// Tell the parker `tab` stays in front for a capture's short while.
+fn stay_after_capture(tab: &Tab) {
+    // The default tab is the page it is pinned to; before its first command
+    // there is no pin, and the parker learns of the tab from that command.
+    if let Some(target) = tab.target.clone().or_else(|| pinned_target(tab.cdp_port)) {
+        let stay = crate::park::after()
+            .unwrap_or_default()
+            .min(crate::park::CAPTURE_LINGER);
+        crate::park::keep(tab.cdp_port, &target, stay);
+    }
+}
+
+/// Bring `tab` forward for a capture. The parker is told first, so a look of
+/// its that falls between this and the capture leaves the window alone.
+fn front_for_capture(tab: &Tab) {
+    stay_after_capture(tab);
     let _ = tab_command(tab, "Page.bringToFront", "{}");
-    Some(guard)
+    stay_after_capture(tab);
 }
 
 fn screenshot(tab: &Tab, query: &str) -> (&'static str, &'static str, String) {
@@ -4301,7 +4339,7 @@ impl Tab {
             // capture of one that is not animating waits out the read
             // timeout (see `in_front_for_capture`). Free on a tab that is
             // already in front, which is every capture of `screenshot`.
-            let _ = tab_command(self, "Page.bringToFront", "{}");
+            front_for_capture(self);
         }
         tab_command(self, method, params)
     }
@@ -4871,6 +4909,18 @@ impl CdpConnection {
             watch: None,
             page: None,
         })
+    }
+
+    /// Bring this connection's page forward for input that needs frames (a
+    /// wheel, a touch), and tell the parker to leave it there for a while:
+    /// what the input starts goes on painting after the action has returned.
+    pub(crate) fn bring_forward(&mut self) {
+        if let Some((cdp_port, target)) = &self.page
+            && let Some(stay) = crate::park::after()
+        {
+            crate::park::keep(*cdp_port, target, stay);
+        }
+        let _ = self.call("Page.bringToFront", "{}");
     }
 
     /// Tell the parker a command is running on this connection's page, for

@@ -813,7 +813,7 @@ impl Page {
                 scale,
                 ms,
             } => {
-                let _ = self.conn().call("Page.bringToFront", "{}");
+                self.conn().bring_forward();
                 let mut watch = NavWatch::new(&self.frame);
                 let (x, y) = match (reference, at) {
                     (Some(r), _) => self.locate(r, true)?.at,
@@ -917,7 +917,7 @@ impl Page {
             return Ok(());
         }
         // A hidden tab never produces frames, so wheel input would wait forever.
-        let _ = self.conn().call("Page.bringToFront", "{}");
+        self.conn().bring_forward();
         let mut watch = NavWatch::new(&self.frame);
         let at = match reference {
             Some(r) => self.locate(r, false)?.at,
@@ -1721,7 +1721,7 @@ impl Page {
         // Touch goes through the compositor, and a tab in the background
         // (every session tab starts there) produces no frames: the touch
         // would be accepted and never reach the page.
-        let _ = self.conn().call("Page.bringToFront", "{}");
+        self.conn().bring_forward();
         let (point, hold) = if self.input_policy == InputPolicy::Paced {
             let from = crate::input::pointer(&self.tab).unwrap_or(target.at);
             let plan = crate::input::plan_click(&self.tab, from, target.at, target.w, target.h);

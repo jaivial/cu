@@ -90,11 +90,11 @@ pub const FAST_TEST_ARGS: &[&str] = &[
     // process, but it crashes chrome-headless-shell on cross-document
     // navigation, so it is not used.)
     "--disable-gpu",
-    // No frame-rate limit. Chromium otherwise waits for the compositor's
-    // next vsync before it hands a frame to a screenshot, and a capture then
-    // costs two frame intervals (~33 ms) instead of the few milliseconds the
-    // raster itself takes. The browser only paints when something changed, so
-    // an idle page still costs nothing.
+    // No frame-rate limit, only with `CU_FAST_CAPTURE=1` (see
+    // [`fast_capture`]). Chromium otherwise waits for the compositor's next
+    // vsync before it hands a frame to a screenshot, and a capture then costs
+    // two frame intervals (~33 ms) instead of the few milliseconds the raster
+    // itself takes.
     "--disable-frame-rate-limit",
     // The network service as a thread of the browser, not a process.
     "--enable-features=NetworkServiceInProcess",
@@ -144,19 +144,28 @@ pub const WEBGL_ARGS: &[&str] = &[
     "--ignore-gpu-blocklist",
 ];
 
-/// Whether the browser may render as fast as the CPU allows.
+/// Whether the browser may render as fast as the CPU allows: only with
+/// `CU_FAST_CAPTURE=1`.
 ///
 /// Chromium's frame-rate limit is what makes a screenshot wait for the
 /// compositor's next vsync. Removing it makes a capture cost ~6 ms instead
-/// of ~34 ms, and it makes a page that animates cost the cores it takes to
-/// render it. `CU_FAST_CAPTURE=0` keeps the limit.
+/// of ~34 ms -- and makes a page that animates cost the cores it takes to
+/// render it, 2,700 frames a second on a headless browser with software
+/// rendering. It was the default from 1.8 to 1.10. Measured on a QA flow of
+/// 38 commands over three apps, 8 s apart, with idle tabs parked
+/// ([`crate::park`]): 82.9 CPU-seconds of browser without the limit, 27.5
+/// with it, for 3.7 s of commands instead of 4.1 s. And a capture of a
+/// background tab was slower without it, not faster (1.0 s each when they
+/// come one after the other, 85 ms with the limit). So the limit stays
+/// unless asked otherwise.
 pub fn fast_capture() -> bool {
-    !matches!(
-        env::var("CU_FAST_CAPTURE")
-            .ok()
-            .map(|v| v.trim().to_lowercase())
-            .as_deref(),
-        Some("0") | Some("off") | Some("false") | Some("no")
+    fast_capture_from(env::var("CU_FAST_CAPTURE").ok().as_deref())
+}
+
+fn fast_capture_from(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_lowercase()).as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
     )
 }
 
@@ -456,4 +465,26 @@ fn find_executable(name: &str) -> Option<PathBuf> {
             .map(|dir| dir.join(name))
             .find(|candidate| candidate.is_file())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_frame_rate_limit_stays_unless_asked_otherwise() {
+        for keep in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("off"),
+            Some("no"),
+            Some("maybe"),
+        ] {
+            assert!(!fast_capture_from(keep), "{keep:?}");
+        }
+        for remove in ["1", "on", "true", "yes", " ON "] {
+            assert!(fast_capture_from(Some(remove)), "{remove}");
+        }
+    }
 }

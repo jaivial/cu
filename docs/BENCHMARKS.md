@@ -46,7 +46,9 @@ What the pass did, and why each number moved:
   something changed. The price is a page that *animates*: it is then
   rendered as fast as the CPU allows (2.4 cores on a host without a GPU,
   headless; a windowed browser keeps the display's rate either way).
-  `CU_FAST_CAPTURE=0` keeps the limit.
+  Since 1.11 the limit is kept unless `CU_FAST_CAPTURE=1` is set: with
+  several tabs and an agent's pauses between commands it cost three times
+  the browser CPU for a tenth of the command time (see the changelog).
 - **The helpers are installed once per document.** The ref registry and the
   page walk are eleven kilobytes of JavaScript that the browser compiles
   every time it is sent. They are installed in the document's isolated world
