@@ -73,6 +73,19 @@ pub const CONSOLE_JS: &str = r##"(function () {
   var K = Symbol.for("cu.console");
   if (window[K]) return;
   var buf = [], seq = 0, MAX = 1000;
+  // Every fetch and XHR, failed or not: what the page asked its API for.
+  var net = [], nseq = 0, NMAX = 500;
+  function req(method, url, status, ms, kind, error) {
+    try {
+      url = String(url);
+      if (url.indexOf(location.origin + "/") === 0) url = url.slice(location.origin.length);
+      if (url.length > 600) url = url.slice(0, 600) + "...";
+      var e = { n: ++nseq, t: Date.now(), method: method, url: url, status: status, ms: ms, kind: kind };
+      if (error) e.error = String(error).slice(0, 200);
+      net.push(e);
+      if (net.length > NMAX) net.shift();
+    } catch (x) {}
+  }
   function str(a) {
     try {
       if (typeof a === "string") return a;
@@ -138,10 +151,10 @@ pub const CONSOLE_JS: &str = r##"(function () {
     if (typeof of === "function") {
       window.fetch = new Proxy(of, {
         apply: function (target, self, args) {
-          var p = Reflect.apply(target, self, args), u = "", m = "GET";
+          var p = Reflect.apply(target, self, args), u = "", m = "GET", t0 = Date.now();
           try { u = String(args[0] && args[0].url ? args[0].url : args[0]); m = String((args[1] && args[1].method) || (args[0] && args[0].method) || "GET").toUpperCase(); } catch (e) {}
-          p.then(function (r) { if (r && r.status >= 400) add("network", m + " " + u + " -> " + r.status + " " + (r.statusText || ""), { kind: "fetch", status: r.status }); },
-                 function (err) { add("network", m + " " + u + " failed: " + str(err), { kind: "fetch" }); });
+          p.then(function (r) { req(m, u, r ? r.status : 0, Date.now() - t0, "fetch"); if (r && r.status >= 400) add("network", m + " " + u + " -> " + r.status + " " + (r.statusText || ""), { kind: "fetch", status: r.status }); },
+                 function (err) { req(m, u, 0, Date.now() - t0, "fetch", str(err)); add("network", m + " " + u + " failed: " + str(err), { kind: "fetch" }); });
           return p;
         }
       });
@@ -150,8 +163,9 @@ pub const CONSOLE_JS: &str = r##"(function () {
     P.open = new Proxy(oo, { apply: function (t, self, a) { try { self.__cuReq = [String(a[0]).toUpperCase(), String(a[1])]; } catch (e) {} return Reflect.apply(t, self, a); } });
     P.send = new Proxy(os, { apply: function (t, self, a) {
       try {
-        var q = self.__cuReq || ["GET", ""];
+        var q = self.__cuReq || ["GET", ""], t0 = Date.now();
         self.addEventListener("loadend", function () {
+          req(q[0], q[1], self.status, Date.now() - t0, "xhr", self.status === 0 ? "failed" : "");
           if (self.status === 0) add("network", q[0] + " " + q[1] + " failed", { kind: "xhr" });
           else if (self.status >= 400) add("network", q[0] + " " + q[1] + " -> " + self.status + " " + (self.statusText || ""), { kind: "xhr", status: self.status });
         });
@@ -168,6 +182,20 @@ pub const CONSOLE_JS: &str = r##"(function () {
       if (limit > 0 && out.length > limit) out = out.slice(out.length - limit);
       if (clear) { buf.length = 0; }
       return { entries: out, matched: total, last: seq, page: location.href };
+    },
+    net: function (grep, since, limit, failed) {
+      var out = net.filter(function (e) {
+        return e.n > since && (!failed || e.status === 0 || e.status >= 400) && (!grep || (e.method + " " + e.url).toLowerCase().indexOf(grep.toLowerCase()) > -1);
+      });
+      var total = out.length;
+      if (limit > 0 && out.length > limit) out = out.slice(out.length - limit);
+      return { requests: out, matched: total, last: nseq, page: location.href };
+    },
+    netlines: function (o) {
+      return o.requests.map(function (e) {
+        var d = new Date(e.t), p = function (n, w) { return String(n).padStart(w, "0"); };
+        return "#" + e.n + " " + p(d.getHours(), 2) + ":" + p(d.getMinutes(), 2) + ":" + p(d.getSeconds(), 2) + "." + p(d.getMilliseconds(), 3) + " " + e.method.padEnd(7) + e.url + " -> " + (e.status || "failed" + (e.error && e.error !== "failed" ? " (" + e.error + ")" : "")) + "  " + e.ms + " ms";
+      }).join("\n");
     },
     lines: function (o) {
       return o.entries.map(function (e) {
@@ -331,5 +359,171 @@ pub fn read(
             "application/json",
             format!("{{\"error\":{}}}", json_string(&e)),
         ),
+    }
+}
+
+/// `GET /v1/net`: the fetch and XHR requests the page made, newest last --
+/// method, address (same-origin ones without the origin), status and how long
+/// they took. `failed` keeps the ones that did not answer or answered 4xx/5xx.
+///
+/// This is the part of a network tab a QA pass reads: which endpoints a page
+/// calls and what they answer. It comes from the same wrappers that note the
+/// failures for `cu console --level network`, kept in a ring of 500 per
+/// document, so it costs nothing until it is asked for and it starts with the
+/// document (or with the first `cu console` / `cu net` on a tab cu did not
+/// open). Scripts, styles and images are not listed; a failed one is in
+/// `cu console --level network`.
+pub fn net(
+    tab: &Tab,
+    grep: &str,
+    since: u64,
+    limit: usize,
+    failed: bool,
+    text: bool,
+) -> (&'static str, &'static str, String) {
+    if disabled() {
+        return (
+            "409 Conflict",
+            "application/json",
+            "{\"error\":\"console capture is off (CU_CONSOLE=off)\"}".into(),
+        );
+    }
+    ensure(tab);
+    let expr = format!(
+        "(function(){{var K=Symbol.for('cu.console');var fresh=false;if(!window[K]){{{install}fresh=true;}}\
+         var a=window[K];if(!a||!a.net)return JSON.stringify({{error:'request capture is not installed on this document; it starts with the next one'}});\
+         var o=a.net({grep},{since},{limit},{failed});o.fresh=fresh;\
+         return {out};}})()",
+        install = CONSOLE_JS,
+        grep = json_string(grep),
+        out = if text {
+            "(fresh?'(capture started now; earlier requests of this document were not recorded)\\n':'')+(o.requests.length?a.netlines(o):'(no matching requests)')+'\\n-- '+o.requests.length+' of '+o.matched+' matching, last #'+o.last+' --'"
+        } else {
+            "JSON.stringify(o)"
+        },
+    );
+    let params = format!(
+        "{{\"expression\":{},\"returnByValue\":true}}",
+        json_string(&expr)
+    );
+    match tab.command("Runtime.evaluate", &params) {
+        Ok(reply) => match crate::server::evaluated_string(&reply) {
+            Some(v) if text && !v.starts_with("{\"error\"") => {
+                ("200 OK", "text/plain; charset=utf-8", v)
+            }
+            Some(v) => ("200 OK", "application/json", v),
+            None => (
+                "502 Bad Gateway",
+                "application/json",
+                "{\"error\":\"page did not answer the request read\"}".into(),
+            ),
+        },
+        Err(e) => (
+            "502 Bad Gateway",
+            "application/json",
+            format!("{{\"error\":{}}}", json_string(&e)),
+        ),
+    }
+}
+
+/// The most entries a reply carries; the count says how many there were.
+const PROBLEMS_SHOWN: usize = 10;
+
+/// What went wrong on `tab` since the last reply that said so: errors,
+/// uncaught exceptions, CSP violations and requests that failed or answered
+/// 4xx/5xx. `None` when there is nothing new (or nothing can be read), else a
+/// JSON object `{"new":N,"entries":[{"level":..,"text":..}]}` with the last
+/// few entries, for the reply of the action that is about to be answered.
+///
+/// An agent reads the console when it thinks of it (4 times in 80 commands
+/// of one QA session, measured), and an error it never asked about is an
+/// error the QA missed. So the reply to `navigate` and to every action
+/// carries what is new, at the price of one evaluation. Warnings and plain
+/// log lines stay in `cu console`: a development build writes dozens.
+///
+/// "Since the last reply" is by the page's clock, per tab, so it survives the
+/// navigation an action causes; what a document wrote before it was replaced
+/// is gone with it, as it is for `cu console`.
+pub fn problems(
+    tab: &Tab,
+    command: &mut dyn FnMut(&str, &str) -> Result<String, String>,
+) -> Option<String> {
+    if disabled() || crate::dialogs::blocked(tab).is_some() {
+        return None;
+    }
+    let since = seen()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(tab)
+        .copied()
+        .unwrap_or(0);
+    let reply = command("Runtime.evaluate", &problems_params(since)).ok()?;
+    let value = crate::server::evaluated_string(&reply)?;
+    let now = crate::server::json_number(&value, "now")? as u64;
+    seen()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(tab.clone(), now);
+    let count = crate::server::json_number(&value, "new").unwrap_or(0.0);
+    (count >= 1.0).then(|| {
+        // Without the clock: `{"new":N,"entries":[...]}`.
+        match value.find("\"new\":") {
+            Some(at) => format!("{{{}", &value[at..]),
+            None => value,
+        }
+    })
+}
+
+/// The evaluation behind [`problems`]: the entries of the four levels newer
+/// than `since` (the page's `Date.now()`), cut to the last few and to 300
+/// characters each, with the page's clock first.
+fn problems_params(since: u64) -> String {
+    let expr = format!(
+        "(function(){{var a=window[Symbol.for('cu.console')],now=Date.now();\
+         if(!a)return JSON.stringify({{now:now,new:0}});\
+         var e=a.read(['error','exception','csp','network'],'',0,0,false).entries\
+         .filter(function(x){{return x.t>{since};}});\
+         return JSON.stringify({{now:now,new:e.length,entries:e.slice(-{PROBLEMS_SHOWN}).map(function(x){{\
+         var o={{level:x.level,text:x.text.length>300?x.text.slice(0,300)+'...':x.text}};\
+         if(x.status)o.status=x.status;return o;}})}});}})()"
+    );
+    format!(
+        "{{\"expression\":{},\"returnByValue\":true}}",
+        json_string(&expr)
+    )
+}
+
+/// The page clock at the last [`problems`] reply of each tab.
+fn seen() -> &'static std::sync::Mutex<std::collections::HashMap<Tab, u64>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<Tab, u64>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn problems_are_the_four_levels_since_a_time() {
+        let params = problems_params(1_794_000_000_123);
+        // Errors, exceptions, CSP and failed requests; not warnings or logs.
+        assert!(params.contains("['error','exception','csp','network']"));
+        assert!(!params.contains("'warn'") && !params.contains("'log'"));
+        assert!(params.contains("x.t>1794000000123"));
+        // The reply starts with the page's clock, which is the next `since`.
+        assert!(params.contains("now:now,new:e.length"));
+        assert!(params.contains(&format!("slice(-{PROBLEMS_SHOWN})")));
+    }
+
+    #[test]
+    fn the_page_script_keeps_every_request_and_still_notes_the_failures() {
+        // One ring for what `cu net` lists, the old one for `cu console`.
+        assert!(CONSOLE_JS.contains("function req(method, url, status, ms, kind, error)"));
+        assert!(CONSOLE_JS.contains("net: function (grep, since, limit, failed)"));
+        assert!(CONSOLE_JS.contains(r#"add("network", m + " " + u + " -> " + r.status"#));
+        // Both wrappers report to it: fetch on either outcome, XHR on loadend.
+        assert_eq!(CONSOLE_JS.matches("req(m, u, ").count(), 2);
+        assert_eq!(CONSOLE_JS.matches("req(q[0], q[1], ").count(), 1);
     }
 }

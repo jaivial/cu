@@ -543,7 +543,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "act",
         title: "Batch of actions",
-        description: "Run several steps on one connection and get the resulting page back, e.g. [{\"do\":\"type\",\"ref\":\"e2\",\"text\":\"Ada\"},{\"do\":\"click\",\"ref\":\"e5\"}]. Steps: click (ref); type or fill (ref, text, clear default true, submit); press (key: Enter, Tab, Escape, arrows...); select (ref, value or label); navigate (url); scroll (dy/dx px or to: top|bottom, optional ref); tap, longpress, swipe, pinch (ref or x and y; dx, dy, scale, ms); emulate (mode: mobile|tablet|desktop|custom, width, height, optional orientation: portrait|landscape and scale: device pixel ratio; mobile is a 390x844 portrait phone at 3x with touch and an Android Chrome User-Agent, held through reloads until desktop; a click on an emulated tab is a touch tap); wait (ms); upload (files, relative to the server's working directory; optional ref). `\"ok\":false` names the step that failed and why; a stale ref means take a new snapshot.",
+        description: "Run several steps on one connection and get the resulting page back, e.g. [{\"do\":\"type\",\"ref\":\"e2\",\"text\":\"Ada\"},{\"do\":\"click\",\"ref\":\"e5\"}]. Steps: click (ref); type or fill (ref, text, clear default true, submit); press (key: Enter, Tab, Escape, arrows...); select (ref, value or label); navigate (url); scroll (dy/dx px or to: top|bottom, optional ref); tap, longpress, swipe, pinch (ref or x and y; dx, dy, scale, ms); emulate (mode: mobile|tablet|desktop|custom, width, height, optional orientation: portrait|landscape and scale: device pixel ratio; mobile is a 390x844 portrait phone at 3x with touch and an Android Chrome User-Agent, held through reloads until desktop; a click on an emulated tab is a touch tap); wait (text, selector or url to wait for, optional gone: true to wait for it to go away and timeout in seconds, default 10; or ms for a plain pause): use it after an action whose result arrives later, instead of pausing; upload (files, relative to the server's working directory; optional ref). `\"ok\":false` names the step that failed and why; a stale ref means take a new snapshot. `\"console\"` in the reply lists the errors, uncaught exceptions and failed requests since the last reply for this tab.",
         properties: r#""actions":{"type":"array","items":{"type":"object"},"description":"The steps, in order. Each is an object with \"do\" and that step's fields."},"snapshot":{"type":"boolean","description":"End with a fresh snapshot (default true)."}"#,
         required: &["actions"],
         target: Target::Page,
@@ -610,6 +610,18 @@ const TOOLS: &[Tool] = &[
         read_only: false,
         destructive: false,
         idempotent: false,
+        open_world: false,
+    },
+    Tool {
+        name: "net",
+        title: "Page requests",
+        description: "The fetch and XHR requests the page made, newest last: method, address, status and duration, as text lines (or JSON). What a network tab shows of the page's API calls.",
+        properties: r#""grep":{"type":"string","description":"Only requests whose method and address contain this text."},"failed":{"type":"boolean","description":"Only requests that did not answer or answered 4xx/5xx."},"limit":{"type":"number","description":"At most this many requests (default 200)."},"since":{"type":"number","description":"Only requests after this sequence number."},"json":{"type":"boolean","description":"Answer JSON instead of text lines."}"#,
+        required: &[],
+        target: Target::Page,
+        read_only: true,
+        destructive: false,
+        idempotent: true,
         open_world: false,
     },
     Tool {
@@ -1058,6 +1070,24 @@ fn plan(name: &str, args: &Args) -> Result<Call, String> {
                 query.push(("format", "text".into()));
             }
             page(args, "GET", "/v1/console", query, None)
+        }
+        "net" => {
+            let mut query = Vec::new();
+            if let Some(value) = args.str("grep") {
+                query.push(("grep", value.to_string()));
+            }
+            for key in ["limit", "since"] {
+                if let Some(n) = args.number(key)? {
+                    query.push((key, n.to_string()));
+                }
+            }
+            if args.flag("failed")? == Some(true) {
+                query.push(("failed", "1".into()));
+            }
+            if args.flag("json")? != Some(true) {
+                query.push(("format", "text".into()));
+            }
+            page(args, "GET", "/v1/net", query, None)
         }
         "inspect" => {
             let query = element(args)?;

@@ -20,9 +20,57 @@ use std::time::{Duration, Instant};
 use crate::input::InputPolicy;
 
 use crate::server::{
-    self, CdpConnection, Tab, checkin, checkout, evaluated_string, json_array, json_objects,
-    json_string, json_string_value, json_value, open_connection,
+    self, CdpConnection, Tab, checkin, checkout, evaluated_string, json_array, json_bool,
+    json_number, json_objects, json_string, json_string_value, json_value, open_connection,
 };
+
+/// What a `wait` action waits for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WaitFor {
+    /// The page's visible text contains this.
+    Text(String),
+    /// An element matches this CSS selector and has a size on the page.
+    Selector(String),
+    /// The page's address contains this.
+    Url(String),
+}
+
+impl WaitFor {
+    /// The condition as a JavaScript expression.
+    fn expression(&self) -> String {
+        match self {
+            Self::Text(text) => format!(
+                "(document.body?document.body.innerText:'').includes({})",
+                json_string(text)
+            ),
+            Self::Selector(css) => format!(
+                "(function(){{var e=document.querySelector({});if(!e)return false;\
+                 var r=e.getBoundingClientRect();return r.width>0&&r.height>0;}})()",
+                json_string(css)
+            ),
+            Self::Url(part) => format!("location.href.includes({})", json_string(part)),
+        }
+    }
+
+    fn name(&self) -> String {
+        match self {
+            Self::Text(text) => format!("the text {}", json_string(text)),
+            Self::Selector(css) => format!("an element matching {}", json_string(css)),
+            Self::Url(part) => format!("an address containing {}", json_string(part)),
+        }
+    }
+}
+
+/// How long a `wait` for a condition waits when it is not told.
+const WAIT_FOR_DEFAULT: Duration = Duration::from_secs(10);
+/// The longest it may be told to wait.
+const WAIT_FOR_MAX: Duration = Duration::from_secs(60);
+/// How often the condition is looked at. One evaluation each time, on a
+/// hidden tab as well as on one in front.
+const WAIT_FOR_POLL: Duration = Duration::from_millis(100);
+
+/// The longest a scroll waits for the page to stop moving.
+const SCROLL_SETTLE_MAX: Duration = Duration::from_millis(300);
 
 /// Longest a single `wait` action may sleep.
 const MAX_WAIT: Duration = Duration::from_secs(10);
@@ -53,6 +101,13 @@ pub enum Action {
     },
     Wait {
         ms: u64,
+    },
+    /// Wait until something is true of the page (or, with `gone`, until it
+    /// stops being true), instead of sleeping a guess.
+    WaitFor {
+        what: WaitFor,
+        gone: bool,
+        timeout: Duration,
     },
     /// Put local files on a file input. `reference` is the input or the
     /// visible control that opens the picker (the input itself is usually
@@ -239,11 +294,40 @@ pub fn parse_action(object: &str) -> Result<Action, String> {
                 scale,
             }
         }
-        "wait" => Action::Wait {
-            ms: json_value(object, "ms")
-                .and_then(|v| v.parse().ok())
-                .ok_or("wait needs \"ms\"")?,
-        },
+        "wait" => {
+            let what = json_string_value(object, "text")
+                .map(WaitFor::Text)
+                .or_else(|| json_string_value(object, "selector").map(WaitFor::Selector))
+                .or_else(|| json_string_value(object, "url").map(WaitFor::Url));
+            match what {
+                Some(WaitFor::Text(t) | WaitFor::Selector(t) | WaitFor::Url(t)) if t.is_empty() => {
+                    return Err("wait needs something to wait for, not an empty string".into());
+                }
+                Some(what) => Action::WaitFor {
+                    what,
+                    gone: json_bool(object, "gone"),
+                    timeout: match json_number(object, "timeout") {
+                        None => WAIT_FOR_DEFAULT,
+                        Some(s) if s > 0.0 && s <= WAIT_FOR_MAX.as_secs_f64() => {
+                            Duration::from_secs_f64(s)
+                        }
+                        Some(s) => {
+                            return Err(format!(
+                                "wait \"timeout\" is in seconds, more than 0 and at most {}, got {s}",
+                                WAIT_FOR_MAX.as_secs()
+                            ));
+                        }
+                    },
+                },
+                None => Action::Wait {
+                    ms: json_value(object, "ms")
+                        .and_then(|v| v.parse().ok())
+                        .ok_or(
+                            "wait needs \"ms\", or \"text\", \"selector\" or \"url\" to wait for",
+                        )?,
+                },
+            }
+        }
         "upload" => {
             let reference = match json_string_value(object, "ref") {
                 Some(_) => Some(reference()?),
@@ -438,6 +522,9 @@ pub struct Outcome {
 /// Returns the JSON response body.
 pub fn run_batch(tab: &Tab, batch: &Batch) -> Result<String, String> {
     let started = Instant::now();
+    // The console capture is on for every tab a batch runs on, so the reply
+    // can say what went wrong (a tab opened by a click never saw `navigate`).
+    crate::console::ensure(tab);
     let mut page = Page::open(tab)?;
     let mut results = Vec::new();
     let mut failure = None;
@@ -534,12 +621,21 @@ pub fn run_batch(tab: &Tab, batch: &Batch) -> Result<String, String> {
     } else {
         String::new()
     };
+    // What went wrong on the page since the last reply for this tab: the
+    // errors, uncaught exceptions and failed requests these actions caused
+    // (see `crate::console::problems`).
+    let problems = {
+        let tab = page.tab.clone();
+        crate::console::problems(&tab, &mut |m, p| page.conn().call(m, p))
+            .map(|found| format!(",\"console\":{found}"))
+            .unwrap_or_default()
+    };
     page.close();
     let error = failure
         .map(|(i, e)| format!(",\"failed\":{i},\"error\":{}", json_string(&e)))
         .unwrap_or_default();
     Ok(format!(
-        "{{\"ok\":{},\"results\":[{}]{error},\"ms\":{}{snapshot}}}",
+        "{{\"ok\":{},\"results\":[{}]{error},\"ms\":{}{problems}{snapshot}}}",
         error.is_empty(),
         results.join(","),
         started.elapsed().as_millis()
@@ -787,6 +883,14 @@ impl Page {
                 std::thread::sleep(Duration::from_millis(*ms).min(MAX_WAIT));
                 false
             }
+            Action::WaitFor {
+                what,
+                gone,
+                timeout,
+            } => {
+                value = Some(self.wait_for(what, *gone, *timeout)?);
+                false
+            }
             Action::Upload {
                 reference,
                 selector,
@@ -913,7 +1017,7 @@ impl Page {
                 "Runtime.evaluate",
                 &format!("{{\"expression\":\"window.scrollTo({{top:{y},behavior:'instant'}})\",\"returnByValue\":true}}"),
             )?;
-            std::thread::sleep(Duration::from_millis(250));
+            self.scroll_settled();
             return Ok(());
         }
         // A hidden tab never produces frames, so wheel input would wait forever.
@@ -942,8 +1046,106 @@ impl Page {
             ),
             &mut watch,
         )?;
-        std::thread::sleep(Duration::from_millis(300));
+        if reference.is_some() {
+            // The wheel landed on an element: what scrolls is some container
+            // of it, and its position is not the page's to read.
+            std::thread::sleep(SCROLL_SETTLE_MAX);
+        } else {
+            self.scroll_settled();
+        }
         Ok(())
+    }
+
+    /// Return once the page has stopped scrolling: its position read the same
+    /// three times, 40 ms apart, or [`SCROLL_SETTLE_MAX`] at the latest.
+    ///
+    /// A scroll used to sleep 300 ms whatever happened, which was most of its
+    /// 340 ms and 40 % of the time a QA flow spent in commands. A wheel
+    /// scroll is over in 80-120 ms (it is animated), a `scrollTo` at once.
+    /// The tab stays in front afterwards (see [`crate::park`]), so what the
+    /// scroll brings into view goes on loading and painting as before.
+    fn scroll_settled(&mut self) {
+        const POSITION: &str = "{\"expression\":\"scrollX+','+scrollY\",\"returnByValue\":true}";
+        let deadline = Instant::now() + SCROLL_SETTLE_MAX;
+        let (mut last, mut same) = (None, 0);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(40));
+            let now = self
+                .conn()
+                .call("Runtime.evaluate", POSITION)
+                .ok()
+                .and_then(|reply| json_string_value(&reply, "value"));
+            if now.is_some() && now == last {
+                same += 1;
+                if same == 2 {
+                    return;
+                }
+            } else {
+                same = 0;
+            }
+            last = now;
+        }
+    }
+
+    /// Look at the page every [`WAIT_FOR_POLL`] until `what` holds (or, with
+    /// `gone`, no longer holds), and say how long that took.
+    ///
+    /// This is what an agent's `sleep 4` was for: the page is still loading
+    /// its data, and nobody knows for how long. One QA session slept 162 s
+    /// that way in 31 guesses; a wait returns the moment the page is ready
+    /// and fails, naming what it waited for, when it never is.
+    fn wait_for(
+        &mut self,
+        what: &WaitFor,
+        gone: bool,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let params = format!(
+            "{{\"expression\":{},\"returnByValue\":true}}",
+            json_string(&format!("String(!!({}))", what.expression()))
+        );
+        // In front while it is waited for, as it would be for a person who is
+        // waiting for it: a hidden tab runs no animation frame, and what a
+        // page does in one (a list that renders its rows, an image that
+        // loads when it scrolls into view) would never arrive. The checks
+        // themselves keep it there; the parker takes it back afterwards.
+        if crate::park::applies() {
+            let _ = self.conn().call("Page.bringToFront", "{}");
+        }
+        let started = Instant::now();
+        loop {
+            let reply = self.conn().call("Runtime.evaluate", &params)?;
+            if reply.contains("\"exceptionDetails\"") {
+                // A selector the browser cannot parse fails every time.
+                return Err(format!(
+                    "wait: {}",
+                    json_string_value(&reply, "description")
+                        .unwrap_or_else(|| "the condition could not be evaluated".into())
+                ));
+            }
+            let holds = evaluated_string(&reply).as_deref() == Some("true");
+            let waited = started.elapsed();
+            if holds != gone {
+                return Ok(format!(
+                    "{} after {} ms",
+                    if gone { "gone" } else { "there" },
+                    waited.as_millis()
+                ));
+            }
+            if waited >= timeout {
+                return Err(format!(
+                    "{} {} within {} s",
+                    what.name(),
+                    if gone {
+                        "was still there"
+                    } else {
+                        "did not appear"
+                    },
+                    timeout.as_secs_f64()
+                ));
+            }
+            std::thread::sleep(WAIT_FOR_POLL.min(timeout - waited));
+        }
     }
 
     /// Emulate a device on this tab, or turn emulation off (`desktop`).
@@ -2187,6 +2389,59 @@ mod tests {
             Action::Eval { js: "1+1".into() }
         );
         assert!(parse_action(r#"{"do":"eval"}"#).is_err());
+    }
+
+    #[test]
+    fn a_wait_is_a_pause_or_a_condition() {
+        assert_eq!(
+            parse_action(r#"{"do":"wait","ms":250}"#).unwrap(),
+            Action::Wait { ms: 250 }
+        );
+        assert_eq!(
+            parse_action(r#"{"do":"wait","text":"Saved"}"#).unwrap(),
+            Action::WaitFor {
+                what: WaitFor::Text("Saved".into()),
+                gone: false,
+                timeout: WAIT_FOR_DEFAULT,
+            }
+        );
+        assert_eq!(
+            parse_action(r##"{"do":"wait","selector":"#spinner","gone":true,"timeout":2.5}"##)
+                .unwrap(),
+            Action::WaitFor {
+                what: WaitFor::Selector("#spinner".into()),
+                gone: true,
+                timeout: Duration::from_millis(2500),
+            }
+        );
+        assert_eq!(
+            parse_action(r#"{"do":"wait","url":"/done"}"#).unwrap(),
+            Action::WaitFor {
+                what: WaitFor::Url("/done".into()),
+                gone: false,
+                timeout: WAIT_FOR_DEFAULT,
+            }
+        );
+        // Nothing to wait for, an empty condition, a timeout out of range.
+        assert!(parse_action(r#"{"do":"wait"}"#).is_err());
+        assert!(parse_action(r#"{"do":"wait","text":""}"#).is_err());
+        assert!(parse_action(r#"{"do":"wait","text":"x","timeout":0}"#).is_err());
+        assert!(parse_action(r#"{"do":"wait","text":"x","timeout":61}"#).is_err());
+    }
+
+    #[test]
+    fn a_wait_condition_is_quoted_into_its_expression() {
+        // What is waited for is data, never code: a quote in it stays inside
+        // the string literal.
+        let text = WaitFor::Text(r#"it's "done""#.into()).expression();
+        assert!(text.contains(r#".includes("it's \"done\"")"#), "{text}");
+        let css = WaitFor::Selector(r#"a[href="/x"]"#.into()).expression();
+        assert!(css.contains(r#"querySelector("a[href=\"/x\"]")"#), "{css}");
+        assert_eq!(
+            WaitFor::Url("/done".into()).expression(),
+            r#"location.href.includes("/done")"#
+        );
+        assert_eq!(WaitFor::Text("Saved".into()).name(), r#"the text "Saved""#);
     }
 
     #[test]

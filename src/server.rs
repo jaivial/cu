@@ -1008,6 +1008,7 @@ fn route_with(
             | ("GET", "/v1/inspect")
             | ("GET", "/v1/marks")
             | ("GET", "/v1/console")
+            | ("GET", "/v1/net")
             | ("POST", "/v1/marks")
             | ("DELETE", "/v1/marks")
             | ("POST", "/v1/vault/sessions/save")
@@ -1423,6 +1424,19 @@ fn route_with(
                 since,
                 limit,
                 form_value(q, "clear") == "1",
+                form_value(q, "format") == "text",
+            )
+        }
+        // The fetch and XHR requests the page made (see `crate::console::net`):
+        // `?grep=`, `since=`, `limit=`, `failed=1`, `format=text`.
+        ("GET", "/v1/net") => {
+            let q = query(full_path);
+            crate::console::net(
+                &tab,
+                &form_value(q, "grep"),
+                form_value(q, "since").parse::<u64>().unwrap_or(0),
+                form_value(q, "limit").parse::<usize>().unwrap_or(200),
+                form_value(q, "failed") == "1",
                 form_value(q, "format") == "text",
             )
         }
@@ -1949,6 +1963,11 @@ pub fn navigate_scheduled(
         }
         if !closed.is_zero() {
             extra.push_str(&format!(",\"origin_closed_ms\":{}", closed.as_millis()));
+        }
+        // What the new page got wrong while it loaded: errors, uncaught
+        // exceptions, failed requests (see `crate::console::problems`).
+        if let Some(problems) = crate::console::problems(tab, &mut |m, p| tab.command(m, p)) {
+            extra.push_str(&format!(",\"console\":{problems}"));
         }
         return (
             "200 OK",

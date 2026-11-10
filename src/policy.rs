@@ -96,6 +96,15 @@ pub const FAST_TEST_ARGS: &[&str] = &[
     // two frame intervals (~33 ms) instead of the few milliseconds the raster
     // itself takes.
     "--disable-frame-rate-limit",
+    // A tab cu is not looking at is a hidden tab, and Chromium slows a hidden
+    // tab's timers to one wake-up a second (to one a minute once it has been
+    // hidden for five). The page an agent just clicked on is hidden too, so
+    // its own `setTimeout(.., 300)` took a second: a reaction scheduled 1.5 s
+    // after a click arrived after 2.2 s, measured. These three keep a hidden
+    // tab's scripts at full speed; it still paints nothing.
+    "--disable-background-timer-throttling",
+    "--disable-renderer-backgrounding",
+    "--disable-backgrounding-occluded-windows",
     // The network service as a thread of the browser, not a process.
     "--enable-features=NetworkServiceInProcess",
     // Fewer processes: same-site frames share a renderer.

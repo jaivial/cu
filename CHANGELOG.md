@@ -1,5 +1,52 @@
 # Changelog
 
+## [1.12.0] - 2026-11-10
+
+Less time per QA pass. One real session, measured from its logs: 80 shell
+commands carrying 90 cu commands, 31 `sleep`s between them adding up to 162 s,
+four `cu console` calls. cu's own time for those commands was a few seconds;
+the session's time was the agent's round trips and its guesses at how long a
+page needs. This release goes after both.
+
+### Added
+
+- **`wait` for the page, not for a guess.** `{"do":"wait","text":"Saved"}`,
+  `"selector":".row"` or `"url":"/done"`, with `"gone":true` for something
+  that should go away and `"timeout"` in seconds (default 10, at most 60);
+  on the CLI, `cu wait --text T | --selector CSS | --url PART [--gone]
+  [--timeout S]`. It looks every 100 ms with the tab in front, returns the
+  moment the condition holds (with the page's snapshot, like any action) and
+  fails naming what never came. On a page that shows its result 1.5 s after
+  a click: 1516 ms, where a `sleep 4` took four seconds and a `sleep 1` came
+  back too early. `{"do":"wait","ms":N}` is still a plain pause.
+- **Replies say what went wrong.** The reply of `navigate` and of every
+  action batch (`act`, `click`, `type`, `wait`) carries
+  `"console":{"new":N,"entries":[...]}` when the page logged an error, threw,
+  violated its CSP or had a request fail or answer 4xx/5xx since the last
+  reply for that tab (the last ten, 300 characters each; one evaluation).
+  An error nobody asked about was an error the QA missed. Warnings and log
+  lines stay in `cu console`.
+- **`cu net`: the API calls the page made.** Every fetch and XHR with its
+  method, address, status and duration, newest last (`--grep`, `--failed`,
+  `--since`, `--limit`, `--json`; `GET /v1/net`; MCP tool `net`). The same
+  wrappers that note failures for `cu console --level network` now keep a
+  ring of the last 500 requests per document, so it costs nothing until it
+  is asked for. Scripts, styles and images are not listed.
+
+### Changed
+
+- **A hidden tab's timers run at full speed** in fast mode
+  (`--disable-background-timer-throttling`, `--disable-renderer-backgrounding`,
+  `--disable-backgrounding-occluded-windows`). Chromium wakes a hidden tab's
+  timers once a second, and once a minute after five minutes, and the tab an
+  agent is acting on is a hidden one: a reaction a page schedules 1.5 s after
+  a click arrived after 2.2 s. It still paints nothing; an unused browser
+  with three parked tabs costs the same as before (0.8 s of CPU in 90 s).
+- **A scroll returns when the page has stopped moving**, not after a fixed
+  300 ms: 137 ms instead of 340 ms, the position already final. A scroll on
+  an element (`ref`) keeps the fixed wait: what scrolls there is a container
+  whose position is not the page's.
+
 ## [1.11.0] - 2026-11-10
 
 A resource pass on the daemon as agents use it: several tabs, seconds between

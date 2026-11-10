@@ -130,6 +130,8 @@ fn main() {
         },
         // `cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]`
         Some("console") => console_cmd(&args[1..], &on_tab),
+        Some("net") => net_cmd(&args[1..], &on_tab),
+        Some("wait") => wait_cmd(&args[1..], &on_tab),
         // `cu dialog [accept [TEXT] | dismiss | policy [SPEC]]`: JavaScript
         // dialogs on the tab -- the one waiting for an answer, the log, the
         // policy that answers them.
@@ -329,7 +331,7 @@ fn wait_for_handoff(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<
 
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release|wait [--timeout S]]\n  cu handoff [wait [--timeout S]]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]\n          levels: debug|verbose log info trace warn error exception csp network dialog, all, LEVEL+\n  cu dialog [accept [TEXT] | dismiss | policy [SPEC]]   JavaScript dialogs (CU_DIALOGS sets the daemon's policy)\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF | --selector CSS] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu mcp   the daemon's tools as an MCP server on stdio (pi, Claude Code, Codex, Cursor)\n  cu seo audit URL [--keywords \"k1,k2\"] [--context C] [--geo LOC] [--md]\n  cu seo crawl URL [--max-pages N] [--depth N] [--delay-ms MS] [--keywords K] [--out FILE.jsonl]\n  cu seo geo CONTEXT \"Town,Region,Country\" [--proxy URL] [--lat N --lon N] [--lang L] [--tz Z]\n  cu seo geo CONTEXT            what a page in CONTEXT sees (language, zone, position)\n  cu seo robots URL\n  cu serp QUERY [--geo LOC | --context C] [--engine google|bing|duckduckgo] [--num N]\n          [--target DOMAIN] [--proxy URL] [--md]\n  cu serp compare QUERY --geo LOC1 --geo LOC2 [...] [--engine E] [--md]\n          LOC: \"ES\", \"Sevilla,ES\", \"Getxo,Bizkaia,ES\" (town, region, country)\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n  cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup]\n          [--wait] [--timeout S]\n  cu otp wait ID [--timeout S] | cancel ID | list\n  cu otp capture --tab T [--domain D] [--request ID] [--credential ID] [--replace]\n  cu otp code DOMAIN | --credential ID\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status\n  cu diagnostics\n  cu targets\n  cu challenge [release|wait [--timeout S]]\n  cu handoff [wait [--timeout S]]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]\n          levels: debug|verbose log info trace warn error exception csp network dialog, all, LEVEL+\n  cu net [--grep S] [--failed] [--since N] [--limit N] [--json]   the fetch/XHR requests the page made\n  cu wait (--text TEXT | --selector CSS | --url PART) [--gone] [--timeout S]   until the page is ready, instead of sleep\n  cu dialog [accept [TEXT] | dismiss | policy [SPEC]]   JavaScript dialogs (CU_DIALOGS sets the daemon's policy)\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF | --selector CSS] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu mcp   the daemon's tools as an MCP server on stdio (pi, Claude Code, Codex, Cursor)\n  cu seo audit URL [--keywords \"k1,k2\"] [--context C] [--geo LOC] [--md]\n  cu seo crawl URL [--max-pages N] [--depth N] [--delay-ms MS] [--keywords K] [--out FILE.jsonl]\n  cu seo geo CONTEXT \"Town,Region,Country\" [--proxy URL] [--lat N --lon N] [--lang L] [--tz Z]\n  cu seo geo CONTEXT            what a page in CONTEXT sees (language, zone, position)\n  cu seo robots URL\n  cu serp QUERY [--geo LOC | --context C] [--engine google|bing|duckduckgo] [--num N]\n          [--target DOMAIN] [--proxy URL] [--md]\n  cu serp compare QUERY --geo LOC1 --geo LOC2 [...] [--engine E] [--md]\n          LOC: \"ES\", \"Sevilla,ES\", \"Getxo,Bizkaia,ES\" (town, region, country)\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n  cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup]\n          [--wait] [--timeout S]\n  cu otp wait ID [--timeout S] | cancel ID | list\n  cu otp capture --tab T [--domain D] [--request ID] [--credential ID] [--replace]\n  cu otp code DOMAIN | --credential ID\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
     );
 }
 
@@ -1954,6 +1956,89 @@ fn dialog_cmd(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), St
     };
     println!("{reply}");
     Ok(())
+}
+
+/// `cu wait (--text T | --selector CSS | --url PART) [--gone] [--timeout S]`,
+/// or `cu wait MS`: one `wait` action (see `cu act`), so the reply is an
+/// action's reply -- the snapshot of the page as it is once the wait is over.
+fn wait_cmd(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), String> {
+    let usage = "usage: cu wait (--text TEXT | --selector CSS | --url PART) [--gone] [--timeout S]  |  cu wait MS";
+    let mut fields: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--text" | "--selector" | "--url" => fields.push(format!(
+                "{}:{}",
+                server::json_string(&a[2..]),
+                server::json_string(it.next().ok_or(usage)?)
+            )),
+            "--gone" => fields.push("\"gone\":true".into()),
+            "--timeout" => {
+                let seconds: f64 = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("--timeout takes seconds")?;
+                fields.push(format!("\"timeout\":{seconds}"));
+            }
+            ms if ms.parse::<u64>().is_ok() => fields.push(format!("\"ms\":{ms}")),
+            other => return Err(format!("unknown option {other}; {usage}")),
+        }
+    }
+    if fields.is_empty() {
+        return Err(usage.into());
+    }
+    page_request(
+        "POST",
+        &on_tab("/v1/act"),
+        Some(&format!(
+            "{{\"actions\":[{{\"do\":\"wait\",{}}}]}}",
+            fields.join(",")
+        )),
+    )
+    .map(|s| println!("{s}"))
+}
+
+/// `cu net [--grep TEXT] [--failed] [--since N] [--limit N] [--json]`: the
+/// fetch and XHR requests the page made.
+fn net_cmd(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), String> {
+    let usage = "usage: cu net [--grep TEXT] [--failed] [--since N] [--limit N] [--json]";
+    let (mut grep, mut limit, mut since) = (String::new(), String::new(), String::new());
+    let (mut failed, mut json) = (false, false);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--grep" | "-g" => grep = it.next().ok_or(usage)?.clone(),
+            "--limit" | "-n" => limit = it.next().ok_or(usage)?.clone(),
+            "--since" => since = it.next().ok_or(usage)?.clone(),
+            "--failed" => failed = true,
+            "--json" => json = true,
+            other => return Err(format!("unknown option {other}; {usage}")),
+        }
+    }
+    let enc = |s: &str| {
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect::<String>()
+    };
+    let mut q = format!(
+        "grep={}&limit={}&since={}",
+        enc(&grep),
+        enc(&limit),
+        enc(&since)
+    );
+    if failed {
+        q.push_str("&failed=1");
+    }
+    if !json {
+        q.push_str("&format=text");
+    }
+    page_request("GET", &on_tab(&format!("/v1/net?{q}")), None)
+        .map(|s| println!("{}", s.trim_end()))
 }
 
 fn console_cmd(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), String> {
