@@ -1242,7 +1242,8 @@ fn route_with(
                 ),
             }
         }
-        ("GET", "/v1/tabs") => match tabs_json(state.cdp_port) {
+        ("GET", "/v1/tabs") => match tabs_json_for(state.cdp_port, session.map(|(owner, _)| owner))
+        {
             Ok(body) => ("200 OK", "application/json", body),
             Err(e) => (
                 "502 Bad Gateway",
@@ -1334,10 +1335,18 @@ fn route_with(
         // Popups, iframe targets and workers the browser is running, as
         // target discovery reported them.
         ("GET", "/v1/targets") => ("200 OK", "application/json", crate::targets::json()),
+        // `?detail=1` adds what is running: cu's version, the browser's
+        // engine and product, and how tabs are kept (see
+        // `crate::diagnostics::status_json`). The plain form is two fixed
+        // fields, which scripts compare as a string.
         ("GET", "/v1/status") => (
             "200 OK",
             "application/json",
-            "{\"running\":true,\"browser\":\"chromium\"}".into(),
+            if form_value(query(full_path), "detail") == "1" {
+                crate::diagnostics::status_json()
+            } else {
+                "{\"running\":true,\"browser\":\"chromium\"}".into()
+            },
         ),
         // Visible text of the page, for the reading a snapshot deliberately
         // does not do: prose, API responses, error messages. Every frame is
@@ -1398,7 +1407,23 @@ fn route_with(
             let auth_enabled = !body.contains("\"auth\":false")
                 && !body.contains("\"auth\": \"off\"")
                 && !body.contains("\"auth\":\"off\"");
-            navigate_with_vault(state, &tab, &url, inject, auth_enabled)
+            let (status, kind, mut reply) =
+                navigate_with_vault(state, &tab, &url, inject, auth_enabled);
+            // `"snapshot":true`: the page it landed on, in the same reply. An
+            // agent reads the page after every navigation, and that was a
+            // second call each time.
+            if json_bool(body, "snapshot") && status.starts_with('2') && reply.ends_with('}') {
+                let field = match snapshot_tab(&tab) {
+                    Ok(snapshot) => snapshot
+                        .strip_prefix('{')
+                        .and_then(|s| s.strip_suffix('}'))
+                        .map(|inner| format!(",{inner}"))
+                        .unwrap_or_default(),
+                    Err(error) => format!(",\"snapshot_error\":{}", json_string(&error)),
+                };
+                reply.insert_str(reply.len() - 1, &field);
+            }
+            (status, kind, reply)
         }
         // Everything the page wrote to its console, by level (see
         // `crate::console`): `?level=warn+`, `grep=`, `since=`, `limit=`,
@@ -2360,6 +2385,24 @@ fn act(
 
 /// Every open page tab, default first, as the `/v1/tabs` body.
 pub fn tabs_json(cdp_port: u16) -> Result<String, String> {
+    tabs_json_for(cdp_port, None)
+}
+
+/// [`tabs_json`] for a session: each tab also says `"yours"`, whether it is
+/// one this session opened (its own page, or one it asked for with
+/// `new_tab`). Several agents share one daemon, and a list that does not say
+/// whose tab is whose is how one of them closes another's page.
+pub fn tabs_json_for(cdp_port: u16, session: Option<Owner>) -> Result<String, String> {
+    let mine: Vec<String> = match session {
+        Some(owner) => tab_leases()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|((port, _), lease)| *port == cdp_port && lease.owner == owner)
+            .map(|((_, id), _)| id.clone())
+            .collect(),
+        None => Vec::new(),
+    };
     let discovery = http_get(&format!("127.0.0.1:{cdp_port}"), "/json")?;
     let pages = page_target_ids_and_sockets(&discovery, cdp_port);
     let pinned = pinned_target(cdp_port);
@@ -2371,8 +2414,12 @@ pub fn tabs_json(cdp_port: u16) -> Result<String, String> {
         .filter(|o| is_page(o))
         .filter_map(|o| {
             let id = json_string_value(&o, "id")?;
+            let yours = match session {
+                Some(_) => format!(",\"yours\":{}", mine.contains(&id)),
+                None => String::new(),
+            };
             Some(format!(
-                "{{\"id\":{},\"url\":{},\"title\":{},\"default\":{},\"opener\":{}}}",
+                "{{\"id\":{},\"url\":{},\"title\":{},\"default\":{},\"opener\":{}{yours}}}",
                 json_string(&id),
                 json_string(&json_string_value(&o, "url").unwrap_or_default()),
                 json_string(&json_string_value(&o, "title").unwrap_or_default()),
@@ -5459,6 +5506,38 @@ pub fn evaluated_string(reply: &str) -> Option<String> {
         .or_else(|| json_string_value(reply, "value"))
 }
 
+/// What a `Runtime.evaluate` with `returnByValue` produced, as text: a string
+/// as it is, anything else as JSON (`4`, `true`, `null`, `{"a":1}`, `[1,2]`),
+/// and `None` for `undefined`.
+///
+/// [`evaluated_string`] answers strings only, which is right for cu's own
+/// scripts (they all return one) and wrong for an agent's: `cu eval '1+1'`
+/// answered nothing at all, and so did every count, flag and object an agent
+/// asked a page for unless it remembered to wrap it in `String(..)`.
+pub fn evaluated_value(reply: &str) -> Option<String> {
+    use crate::mcp::Json;
+    let parsed = Json::parse(reply).ok()?;
+    let outer = parsed.get("result")?;
+    let object = outer.get("result").unwrap_or(outer);
+    match object.get("type").and_then(Json::as_str)? {
+        "string" => object
+            .get("value")
+            .and_then(Json::as_str)
+            .map(str::to_string),
+        "undefined" => None,
+        _ => match object.get("value") {
+            Some(value) => Some(value.to_json()),
+            // NaN, Infinity, a bigint, a function: not JSON, but they have a
+            // name.
+            None => object
+                .get("unserializableValue")
+                .or_else(|| object.get("description"))
+                .and_then(Json::as_str)
+                .map(str::to_string),
+        },
+    }
+}
+
 /// A client-to-server websocket frame: masked, as the protocol requires.
 fn encode_client_frame(bytes: &[u8]) -> Vec<u8> {
     let mask = [0x43, 0x55, 0x2d, 0x31];
@@ -7241,6 +7320,44 @@ fn navigate_with_vault(
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn an_evaluation_answers_any_value_as_text() {
+        let reply = |inner: &str| format!("{{\"id\":7,\"result\":{{\"result\":{inner}}}}}");
+        let value = |inner: &str| evaluated_value(&reply(inner));
+        assert_eq!(
+            value(r#"{"type":"string","value":"QA \"fixture\""}"#).as_deref(),
+            Some("QA \"fixture\"")
+        );
+        assert_eq!(
+            value(r#"{"type":"number","value":3,"description":"3"}"#).as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            value(r#"{"type":"boolean","value":false}"#).as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            value(r#"{"type":"object","subtype":"null","value":null}"#).as_deref(),
+            Some("null")
+        );
+        assert_eq!(
+            value(r#"{"type":"object","value":{"rows":40,"ok":true,"tags":["a","b"]}}"#).as_deref(),
+            Some(r#"{"rows":40,"ok":true,"tags":["a","b"]}"#)
+        );
+        // Not JSON, but it has a name.
+        assert_eq!(
+            value(r#"{"type":"number","unserializableValue":"NaN","description":"NaN"}"#)
+                .as_deref(),
+            Some("NaN")
+        );
+        assert_eq!(value(r#"{"type":"undefined"}"#), None);
+        // A string that looks like an object stays the string it is.
+        assert_eq!(
+            value(r#"{"type":"string","value":"{\"value\":1}"}"#).as_deref(),
+            Some(r#"{"value":1}"#)
+        );
+    }
 
     fn lease(owner: Owner, start: Option<u64>, age_s: u64) -> TabLease {
         TabLease {

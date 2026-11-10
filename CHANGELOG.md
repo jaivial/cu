@@ -1,5 +1,48 @@
 # Changelog
 
+## [1.13.0] - 2026-11-10
+
+The MCP server, as a QA agent uses it. What an agent read from `cu mcp` was
+measured by speaking JSON-RPC to it: `navigate` answered 803 characters of
+DevTools ids, timings and a "ready" challenge and no page, so every
+navigation was two calls; running a script or waiting for the page meant
+writing an `act` batch by hand and getting a whole snapshot back with the
+value; `status` said `chromium` and nothing else; `tabs` listed everybody's
+tabs alike.
+
+### Added
+
+- **MCP tools `wait` and `eval`.** `wait` takes one of `text`, `selector`,
+  `url` (`gone`, `timeout`, or `ms` for a plain pause) and answers "there
+  after 420 ms" and the snapshot; `eval` takes `js` and answers the value
+  itself, with a script that throws as the tool's error. Both are the `act`
+  steps of 1.12, first-class.
+- **`eval` answers any value.** `cu eval '1+1'` answered nothing: only strings
+  came back, so every count, flag and object needed a `String(..)` around
+  it. A string is still answered as it is; anything else as JSON (`3`,
+  `true`, `null`, `{"rows":40}`), `undefined` as no value.
+- **`navigate` answers the page.** Over MCP it asks for the snapshot by
+  default (`snapshot: false` to skip it) and drops what only cu needs from
+  the reply: status, `settled`, the `console` problems of the load and the
+  snapshot in 632 characters, where 803 carried no page. On the HTTP API,
+  `"snapshot":true` in the body of `POST /v1/navigate`.
+- **`status` says what is running.** `GET /v1/status?detail=1`
+  (`cu status --detail`, the MCP `status` tool): cu's version, the browser's
+  engine (`slimium`, `chromium`, `chrome-headless-shell`), executable and
+  product, whether it is headless, how idle tabs are kept and whether the
+  frame-rate limit is on. The plain `GET /v1/status` is unchanged.
+- **`tabs` says which are yours.** Each tab carries `yours`: whether this
+  session opened it (the MCP session's own record; on the CLI, the session
+  named in the request). Several agents share one daemon, and a list that
+  does not say whose tab is whose is how one closes another's page.
+
+### Changed
+
+- The server's `instructions` (what a client shows its model at connect)
+  now say how a QA pass goes: `navigate` answers the page, `wait` instead of
+  pausing, read `"console"` in every reply, `net` and `eval` for the rest,
+  leave tabs that are not `yours` alone.
+
 ## [1.12.0] - 2026-11-10
 
 Less time per QA pass. One real session, measured from its logs: 80 shell

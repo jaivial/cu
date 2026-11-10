@@ -113,6 +113,57 @@ pub fn record_ready(
     let _ = std::fs::write(data.join("browser.json"), launch_json(&record) + "\n");
 }
 
+/// `GET /v1/status?detail=1`: what is running, in a line. cu's version (the
+/// daemon's, which is what an MCP client that was started before an upgrade
+/// is still talking to), the browser's engine and product, whether it has a
+/// window, and how idle tabs are kept.
+pub fn status_json() -> String {
+    let record = launch().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut out = format!(
+        "{{\"running\":true,\"browser\":\"chromium\",\"version\":{}",
+        json_string(env!("CARGO_PKG_VERSION"))
+    );
+    if let Some(record) = record {
+        // slimium execs the engine from its own copy; the name is in the path
+        // either way.
+        let engine = if [&record.requested, &record.executable, &record.resolved]
+            .iter()
+            .any(|p| p.contains("slimium"))
+        {
+            "slimium"
+        } else if record.headless_shell {
+            "chrome-headless-shell"
+        } else {
+            "chromium"
+        };
+        out.push_str(&format!(
+            ",\"engine\":{},\"executable\":{},\"mode\":{},\"headless\":{}",
+            json_string(engine),
+            json_string(&record.executable),
+            json_string(&record.mode),
+            record.headless || record.headless_shell
+        ));
+        if let Some(product) = &record.product {
+            out.push_str(&format!(",\"product\":{}", json_string(product)));
+        }
+        if let Some(error) = &record.error {
+            out.push_str(&format!(",\"browser_error\":{}", json_string(error)));
+        }
+    }
+    out.push_str(&match crate::park::after() {
+        Some(after) if crate::park::applies() => format!(
+            ",\"idle_tabs\":\"parked {} s after a scroll, 1 s after a capture\"",
+            after.as_secs_f64()
+        ),
+        _ => ",\"idle_tabs\":\"left where they are\"".to_string(),
+    });
+    out.push_str(&format!(
+        ",\"frame_rate_limit\":{}}}",
+        !crate::policy::fast_capture()
+    ));
+    out
+}
+
 /// Whether the running browser has a window a person can use.
 pub fn headful() -> bool {
     launch()
