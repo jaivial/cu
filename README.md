@@ -13,6 +13,13 @@ leased tab each. Every tool was measured again, before and after, in the
 [second speed pass](docs/BENCHMARKS.md#the-second-speed-pass): a screenshot is
 **5-7x** faster, a click and a batch **1.5-1.7x**, a snapshot **1.5x**.
 
+It also has to stay cheap while it waits. Run on **slimium**, a Chromium for
+agents with half the memory (see [cu on slimium](#cu-on-slimium)), a QA pass of
+38 commands spent **27.5 CPU-seconds of browser instead of 458**, **5 % of a
+core instead of two** while the agent was thinking, and **3.3 s in commands
+instead of 6.4** -- with `wait` instead of `sleep`, the errors of every action in its
+reply and the page's API calls one command away.
+
 Landing page: <https://jaivial.github.io/cu/> · API: [docs/README.md](docs/README.md) ·
 Benchmarks: [docs/BENCHMARKS.md](docs/BENCHMARKS.md) · Skill: [SKILL.md](SKILL.md) ·
 Task skills: [Instagram Story](skills/instagram-story/SKILL.md)
@@ -48,6 +55,18 @@ cargo run -- marks --md     # the QA report a developer can act on
 - **Batches by ref.** `cu act '[…]'` runs a whole form on one connection and
   returns the resulting page in the same call; `cu batch` sends many CLI
   commands at once and prints one compact JSON line per command.
+- **Wait for the page, never for a guess.** `cu wait --text "Saved"` (or
+  `--selector`, `--url`, `--gone`), or a `wait` step inside `cu act`, returns
+  the moment the page shows it and fails naming what never came.
+- **The errors come to the agent.** The reply of `navigate` and of every action
+  carries what the page logged as an error, threw, or had fail or answer
+  4xx/5xx since the last command. `cu console` has the rest, `cu net` lists the
+  fetch and XHR calls the page made (method, address, status, duration), and
+  `cu eval` runs a script and answers its value.
+- **Idle tabs cost nothing.** A headless tab nobody is driving is put behind a
+  blank one, where it stops painting; what needs frames (a capture, a scroll)
+  brings it forward again. A page with a looping animation went from two cores
+  to none.
 - **Text when words are the answer.** `GET /v1/text` (`cu text`) returns the
   page's visible words — prose, API responses, messages — including inside
   frames and open shadow roots, capped at 16 000 characters.
@@ -460,8 +479,10 @@ protection law when crawling.
 
 ## Running JavaScript in the page
 
-`cu eval '<js>'` (or `{"do":"eval","js":"…"}` inside a batch) runs the script
-through `Runtime.evaluate` and prints the value when it is a string. It is the
+`cu eval '<js>'` (or `{"do":"eval","js":"…"}` inside a batch, or the MCP
+`eval` tool) runs the script through `Runtime.evaluate`, awaits a promise and
+answers its value: a string as it is, anything else as JSON (`3`, `true`,
+`{"rows":40}`). It is the
 escape hatch for what no snapshot ref reaches: injecting a bridge, reading a
 global that only exists in JS. It passes the same gate as every other page
 command (live viewer, challenge, origin budget), and `cu act` batches can mix
@@ -494,18 +515,25 @@ dismiss`. Details: [docs](docs/README.md#javascript-dialogs).
 the daemon, for agents whose harness speaks MCP rather than bash:
 
 ```sh
-pi mcp add cu -- cu mcp          # pi; `pi mcp list` shows the 22 tools
+pi mcp add cu -- cu mcp          # pi; `pi mcp list` shows the 25 tools
 claude mcp add cu -- cu mcp      # Claude Code
 codex mcp add cu -- cu mcp       # Codex
 ```
 
 or `{"mcpServers":{"cu":{"command":"cu","args":["mcp"]}}}` in a client's JSON
-config. The tools mirror the CLI -- `navigate`, `snapshot`, `text`, `click`,
-`type`, `act`, `screenshot` (an image block), `tabs`, `console`, `inspect`,
-`mark`/`marks`, `upload`, `downloads`, `handoff`, `dialog`, `session_save`/`session_load`,
-`login_url` -- and each is one request to the running daemon. The `cu mcp`
-process is the session: its page tools share one tab, another connection never
-lands in it, and the tab is closed when the connection ends. No tool takes or
+config. The tools mirror the CLI -- `status`, `navigate`, `snapshot`, `text`,
+`click`, `type`, `act`, `wait`, `eval`, `screenshot` (an image block, or a file
+with `path`), `tabs`, `console`, `net`, `inspect`, `mark`/`marks`, `upload`,
+`downloads`, `handoff`, `dialog`, `session_save`/`session_load`, `login_url` --
+and each is one request to the running daemon. They are shaped for a QA agent:
+`navigate` answers the page's status, the errors of the load and its snapshot
+in one call; `wait` answers "there after 420 ms" and the page; `eval` answers
+the value itself; `status` says which cu and which browser (`slimium`,
+`chromium`) is behind it. The `cu mcp` process is the session: its page tools
+share one tab, `tabs` marks the ones that are `yours`, and the tab is closed
+when the connection ends. A harness that runs one MCP client for all its agents
+shares that tab too: each agent then opens its own with `new_tab: true` and
+passes `tab` on every call. No tool takes or
 returns a password, a vault secret or a one-time code. Details:
 [MCP server](docs/README.md#mcp-server).
 
@@ -535,6 +563,53 @@ parallel-agents section is measured the same way: two rounds of real agent
 sessions against a private app, with the method, the sampling, the stop rules
 and every number written out in the section, including what was **not** isolated
 from the runs.
+
+## cu on slimium
+
+[slimium](https://github.com/jaivial/slimium) is a Chromium-based browser for
+agents, written in C: the same Chromium engine under a low-memory process
+model, a small memory governor (garbage collection and reclaim of the engine's
+cold pages once nobody is using the browser, earlier when memory grows) and
+every operation on the command line. Its repository is private for now.
+
+It is a drop-in browser for cu. Point `CU_BROWSER` at its wrapper, ideally in a
+daemon of its own beside the canonical one:
+
+```sh
+CU_DAEMON_DIR=~/.local/share/cu-slim CU_PORT=8790 CU_CDP_PORT=9390 \
+  CU_BROWSER=slimium-chrome cu daemon
+cu status --detail      # "engine":"slimium", cu's version, how idle tabs are kept
+```
+
+`cu-slim`, a wrapper that ships with slimium, sets exactly that up, and an MCP
+client launches `cu-slim mcp`.
+
+| | stock Chromium (cu fast mode) | slimium |
+|---|---:|---:|
+| 13 tabs through cu, steady footprint (iso MB, median) | 532 | **225** |
+
+Measured on one QA flow (38 commands over three development apps, 8 s apart,
+headless Chromium 156 with software rendering), cu 1.10 with slimium 0.3.1
+against cu 1.12 with slimium 0.3.2 (1.13 changes only the MCP server):
+
+| | before | after |
+|---|---:|---:|
+| browser CPU for the flow | 458 s | 27.5 s |
+| browser CPU while the agent is quiet | 203 % of a core | 5 % |
+| time spent in cu commands | 6.4 s | 3.3 s |
+| anonymous memory, mean / peak | 521 / 1009 MB | 387 / 475 MB |
+
+A browser that is never idle -- a navigation a second for 90 s on a
+development build -- was never collected by slimium 0.3.1's governor and peaked
+at 3949 MB; 0.3.2 collects it once it has grown by 1 GB, and it peaked at
+1959 MB with no fewer navigations.
+
+What made the difference, release by release, is in the
+[changelog](CHANGELOG.md) (1.11 to 1.13): the frame-rate limit kept, idle tabs
+parked, captures that no longer wait five seconds on a background tab, `wait`,
+the errors in every reply, `cu net`, and on slimium's side a governor that
+collects when the browser is quiet or has grown, not between an agent's
+commands.
 
 ## Min Browser (opt-in)
 
