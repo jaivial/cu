@@ -1136,6 +1136,7 @@ fn daemon(args: &[String]) -> Result<(), String> {
     let browser = server::BrowserState::new();
     server::spawn_browser_thread(data.clone(), cdp_port, Arc::clone(&browser), policy);
     server::spawn_tab_gc(cdp_port);
+    cu::park::spawn(cdp_port);
     let vault_host = env::var("CU_VAULT_HOST")
         .ok()
         .filter(|h| !h.trim().is_empty());

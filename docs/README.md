@@ -323,12 +323,30 @@ including a comparison with agent-browser and Playwright MCP.
 on its stderr: where the time of an action went, down to the DevTools round
 trips. It is off by default and changes nothing else.
 
-`CU_FAST_CAPTURE=0` keeps Chromium's frame-rate limit. By default cu removes
-it, which makes a screenshot cost ~6 ms instead of ~34 ms (the browser
+`CU_FAST_CAPTURE=1` removes Chromium's frame-rate limit, which makes a
+screenshot of a tab in front cost ~6 ms instead of ~34 ms (the browser
 otherwise waits for the compositor's next vsync before it hands a frame to a
 capture). The price: a page that animates is then rendered as fast as the CPU
-allows -- 2.4 cores on a host without a GPU, in a headless browser. A
+allows -- 2.4 cores on a host without a GPU, in a headless browser -- for as
+long as its tab is in front. It was the default from 1.8 to 1.10; on a QA
+flow of 38 commands it cost three times the browser CPU (82.9 s against 27.5)
+to save 0.4 s of commands, so the limit now stays unless this is set. A
 windowed browser keeps the display's rate either way.
+
+`CU_PARK_AFTER=<seconds>` (default `3`) is how long a tab of a headless
+browser stays in front after a scroll or a touch before cu puts it behind a
+blank tab, where it stops painting; after a capture it stays one second. A
+scroll, a touch and a capture bring a tab forward, because a hidden tab makes
+no frame for them; left in front, a page with a looping animation is painted
+for as long as the tab is open (16-18 % of a core at 60 frames a second, two
+cores without the frame-rate limit), whether or not any command is being
+sent. Every other command works on a hidden tab and brings nothing forward.
+A parked tab still runs its scripts, timers and requests, and comes forward
+again by itself for whatever needs frames. `CU_PARK_AFTER=0` turns this off:
+tabs then stay where the last action left them and a capture is taken
+without bringing the tab forward, which on a background tab that is not
+animating takes about five seconds. Never done on a browser with a window
+(`CU_HEADLESS=0`, Min) or on a tab open in the live viewer.
 
 The browser executable defaults to `chromium`; set `CU_BROWSER` to an alternate binary. Browsers are launched headless, which is what an agent usually wants; set `CU_HEADLESS=0` to attach a display instead. `CU_DATA_DIR` changes the default data directory, `CU_PORT` the HTTP port (default `8787` for `cu start`, `8810` for `cu daemon`) and `CU_CDP_PORT` the DevTools port (default `9222`; `cu daemon` otherwise picks a free one from `9362`). With `CU_DAEMON_DIR` (the daemon's data directory) plus `CU_PORT` and `CU_CDP_PORT`, a second daemon -- another browser build, such as slimium's `slimium-chrome` -- runs next to the canonical one and every CLI call made with the same environment goes to it. Do not expose this server beyond localhost without adding TLS and an access-control layer; the one supported exposure is the login form behind a reverse proxy (see *Public login URL*).
 

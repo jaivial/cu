@@ -55,11 +55,15 @@ pub fn see(event: &str) {
         if method == "Target.targetDestroyed"
             && let Some(id) = json_string_value(event, "targetId")
         {
-            registry()
+            let gone = registry()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .live
                 .remove(&id);
+            // The browser puts a neighbour in front of a closed tab's window.
+            if gone.is_some_and(|target| target.kind == "page") {
+                crate::park::disturbed();
+            }
         }
         return;
     };
@@ -86,7 +90,13 @@ pub fn see(event: &str) {
                     target.url
                 );
             }
+            let page = target.kind == "page";
             r.live.insert(id, target);
+            drop(r);
+            // The first tab of a browser context is in front from birth.
+            if page {
+                crate::park::disturbed();
+            }
         }
         "Target.targetInfoChanged" => {
             let seen = r.live.get(&id).map(|t| t.seen).unwrap_or(target.seen);
@@ -94,6 +104,25 @@ pub fn see(event: &str) {
         }
         _ => {}
     }
+}
+
+/// Every live page target with the browser context it is in, for the parker
+/// ([`crate::park`]): tabs of one context share a window.
+pub fn pages() -> Vec<crate::park::Page> {
+    registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .live
+        .iter()
+        .filter(|(_, target)| target.kind == "page")
+        .filter_map(|(id, target)| {
+            Some(crate::park::Page {
+                id: id.clone(),
+                context: target.context.clone()?,
+                blank: target.url == "about:blank",
+            })
+        })
+        .collect()
 }
 
 /// The page that opened `id`, if it is a popup.

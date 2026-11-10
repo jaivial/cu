@@ -510,7 +510,11 @@ const DRAW_JS: &str = r#"(async (items, find) => {
   }
   document.documentElement.appendChild(host);
   window.__cuOverlay = host;
-  await new Promise((r) => { let done = false; const go = () => { if (!done) { done = true; r(); } };
+  // A hidden document gets no animation frame and its timers wake once a
+  // second, so waiting for the paint there only waited (about a second per
+  // annotated capture of a background tab); the capture makes its own frame.
+  await new Promise((r) => { if (document.hidden) { r(); return; }
+    let done = false; const go = () => { if (!done) { done = true; r(); } };
     requestAnimationFrame(() => requestAnimationFrame(go)); setTimeout(go, 250); });
   return JSON.stringify({ drawn });
 })"#;

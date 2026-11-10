@@ -1,5 +1,76 @@
 # Changelog
 
+## [1.11.0] - 2026-11-10
+
+A resource pass on the daemon as agents use it: several tabs, seconds between
+commands, the browser left open. Measured on a QA flow of 38 commands over
+three development apps, 8 s apart, headless Chromium 156 with software
+rendering (cu-slim on slimium), 1.10.0 with slimium 0.3.1 against 1.11.0 with
+slimium 0.3.2: **458 -> 29 CPU-seconds of browser** for the flow, two cores
+-> 3 % of one while the agent is quiet, 6.4 -> 4.2 s spent in commands, peak
+anonymous memory 1009 -> 501 MB (mean 521 -> 412 MB). Four rounds of the flow
+in one browser (152 commands): the same CPU each round, memory flat from the
+second round on.
+
+### Changed
+
+- **The frame-rate limit stays unless `CU_FAST_CAPTURE=1`.** From 1.8 to 1.10
+  Chromium was started with `--disable-frame-rate-limit`, which makes a
+  capture of a tab in front cost ~6 ms instead of ~34 ms and makes a page
+  that animates cost the cores it takes to render it (2,700 frames a second,
+  two cores, for a dashboard with sixteen pulsing dots). On the flow above,
+  with everything else in this release in place: 82.9 CPU-seconds of browser
+  without the limit, 27.5 with it, for 3.7 s of commands instead of 4.1 s.
+  And captures of a background tab were slower without it, not faster: 1.0 s
+  each when they came one after the other, 85 ms with the limit.
+
+### Fixed
+
+- **A screenshot of a background tab took five seconds.** A headless tab that
+  is not in front makes no frame, and `Page.captureScreenshot` waits for one:
+  on a page that is not animating it answered only after cu's 5 s read timeout
+  and a second try. The tab cu opens is a background tab, so this was every
+  capture until the first scroll. 25 captures of a static page behind a blank
+  tab: 24 took 5.1 s (annotated ones 25 of 25); the same page in front, 61 ms.
+  A capture now brings its tab forward first (4 ms; the document already says
+  `visible` on the next command, 40 of 40): 75 captures of static and
+  animated pages, plain, annotated and at another width, 76-233 ms on
+  average, none slow. Captures of one browser are taken one at a time,
+  because bringing one tab forward hides the others of its window.
+- **An annotated capture of a hidden tab waited a second for nothing.** The
+  overlay and the measure step wait for two animation frames with a 250 ms
+  timer as the way out. A hidden document gets no animation frame and its
+  timers wake once a second, so the way out took about a second
+  (`shot --marks --annotate all` on a background tab: 1.1-1.3 s; in front,
+  50-66 ms). A document that says it is hidden is no longer waited for.
+- **A tab left in front painted for ever.** `scroll`, a tap and the touch
+  gestures bring a tab forward and nothing put it back; the first tab of a
+  browser context is in front from birth (103 % of a core with no command
+  ever sent to it); the browser puts a neighbour in front of a tab that is
+  closed. A page with a looping animation is then painted whether or not a
+  command is being sent: 16-18 % of a core at 60 frames a second and two
+  cores without the frame-rate limit. One QA daemon used 4 d 22 h of CPU in
+  two days this way. It also never let the browser be idle, which is the
+  only time slimium's memory governor collects.
+  The new parker (`src/park.rs`) keeps every headless window behind a blank
+  tab (`Target.activateTarget`) unless something needs it in front. What
+  brings a tab forward says how long it stays: `CU_PARK_AFTER` seconds
+  (default 3) after a scroll or a touch, whose page goes on painting; one
+  second after a capture, which is over when it returns (three captures in a
+  row stay in front for the run: 823 ms for the three). Every other command
+  works on a hidden tab and brings nothing forward. A window is never parked
+  while a command runs in it or a person has one of its tabs open in the
+  live viewer, and never on a browser with a window. Whenever a page appears
+  or goes away, every window is looked at again. A window with no blank tab
+  gets one, which `cu tabs` lists; closing it is noticed and another is
+  made. The cost: a capture of a tab that was parked repaints it from cold,
+  about 110 ms instead of 61 ms, and a page sees `visibilitychange` each
+  time it is parked and brought back. `CU_PARK_AFTER=0` is the old behaviour,
+  five-second captures of background tabs included.
+- **`TRACE cdp ...` was written for every DevTools command**, `CU_TRACE` or
+  not, into a daemon log that is only ever appended to (1.1 MB after four
+  days of QA). It is behind `CU_TRACE` again, as the documentation says.
+
 ## [1.10.0] - 2026-11-06
 
 ### Added
