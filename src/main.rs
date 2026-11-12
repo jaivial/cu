@@ -147,6 +147,8 @@ fn main() {
         // dialogs on the tab -- the one waiting for an answer, the log, the
         // policy that answers them.
         Some("dialog") => dialog_cmd(&args[1..], &on_tab),
+        Some("inject") => inject_cmd(&args[1..]),
+        Some("grant") => grant_cmd(&args[1..]),
         Some("text") => page_request("GET", &on_tab("/v1/text"), None).map(|s| println!("{s}")),
         Some("downloads") => request("GET", "/v1/downloads", None).map(|s| println!("{s}")),
         Some("tabs") => match args.get(1).map(String::as_str) {
@@ -344,7 +346,7 @@ fn wait_for_handoff(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<
 
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status [--detail]\n  cu diagnostics\n  cu targets\n  cu challenge [release|wait [--timeout S]]\n  cu handoff [wait [--timeout S]]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]\n          levels: debug|verbose log info trace warn error exception csp network dialog, all, LEVEL+\n  cu net [--grep S] [--failed] [--since N] [--limit N] [--json]   the fetch/XHR requests the page made\n  cu wait (--text TEXT | --selector CSS | --url PART) [--gone] [--timeout S]   until the page is ready, instead of sleep\n  cu dialog [accept [TEXT] | dismiss | policy [SPEC]]   JavaScript dialogs (CU_DIALOGS sets the daemon's policy)\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF | --selector CSS] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu mcp   the daemon's tools as an MCP server on stdio (pi, Claude Code, Codex, Cursor)\n  cu seo audit URL [--keywords \"k1,k2\"] [--context C] [--geo LOC] [--md]\n  cu seo crawl URL [--max-pages N] [--depth N] [--delay-ms MS] [--keywords K] [--out FILE.jsonl]\n  cu seo geo CONTEXT \"Town,Region,Country\" [--proxy URL] [--lat N --lon N] [--lang L] [--tz Z]\n  cu seo geo CONTEXT            what a page in CONTEXT sees (language, zone, position)\n  cu seo robots URL\n  cu serp QUERY [--geo LOC | --context C] [--engine google|bing|duckduckgo] [--num N]\n          [--target DOMAIN] [--proxy URL] [--md]\n  cu serp compare QUERY --geo LOC1 --geo LOC2 [...] [--engine E] [--md]\n          LOC: \"ES\", \"Sevilla,ES\", \"Getxo,Bizkaia,ES\" (town, region, country)\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n  cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup]\n          [--wait] [--timeout S]\n  cu otp wait ID [--timeout S] | cancel ID | list\n  cu otp capture --tab T [--domain D] [--request ID] [--credential ID] [--replace]\n  cu otp code DOMAIN | --credential ID\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status [--detail]\n  cu diagnostics\n  cu targets\n  cu challenge [release|wait [--timeout S]]\n  cu handoff [wait [--timeout S]]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]\n          levels: debug|verbose log info trace warn error exception csp network dialog, all, LEVEL+\n  cu net [--grep S] [--failed] [--since N] [--limit N] [--json]   the fetch/XHR requests the page made\n  cu wait (--text TEXT | --selector CSS | --url PART) [--gone] [--timeout S]   until the page is ready, instead of sleep\n  cu dialog [accept [TEXT] | dismiss | policy [SPEC]]   JavaScript dialogs (CU_DIALOGS sets the daemon's policy)\n  cu inject add NAME --match GLOB (--file F | --js CODE) [--retry-ms N] [--keep-open URL] | list | rm NAME | run NAME\n  cu grant add NAME --origin ORIGIN --permission P[,P] | list | rm NAME\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF | --selector CSS] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu mcp   the daemon's tools as an MCP server on stdio (pi, Claude Code, Codex, Cursor)\n  cu seo audit URL [--keywords \"k1,k2\"] [--context C] [--geo LOC] [--md]\n  cu seo crawl URL [--max-pages N] [--depth N] [--delay-ms MS] [--keywords K] [--out FILE.jsonl]\n  cu seo geo CONTEXT \"Town,Region,Country\" [--proxy URL] [--lat N --lon N] [--lang L] [--tz Z]\n  cu seo geo CONTEXT            what a page in CONTEXT sees (language, zone, position)\n  cu seo robots URL\n  cu serp QUERY [--geo LOC | --context C] [--engine google|bing|duckduckgo] [--num N]\n          [--target DOMAIN] [--proxy URL] [--md]\n  cu serp compare QUERY --geo LOC1 --geo LOC2 [...] [--engine E] [--md]\n          LOC: \"ES\", \"Sevilla,ES\", \"Getxo,Bizkaia,ES\" (town, region, country)\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n  cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup]\n          [--wait] [--timeout S]\n  cu otp wait ID [--timeout S] | cancel ID | list\n  cu otp capture --tab T [--domain D] [--request ID] [--credential ID] [--replace]\n  cu otp code DOMAIN | --credential ID\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
     );
 }
 
@@ -1152,6 +1154,7 @@ fn daemon(args: &[String]) -> Result<(), String> {
     server::spawn_browser_thread(data.clone(), cdp_port, Arc::clone(&browser), policy);
     server::spawn_tab_gc(cdp_port);
     cu::park::spawn(cdp_port);
+    cu::inject::spawn(&data, cdp_port);
     let vault_host = env::var("CU_VAULT_HOST")
         .ok()
         .filter(|h| !h.trim().is_empty());
@@ -2096,4 +2099,90 @@ fn console_cmd(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), S
     }
     page_request("GET", &on_tab(&format!("/v1/console?{q}")), None)
         .map(|s| println!("{}", s.trim_end()))
+}
+
+/// `cu inject add NAME --match GLOB (--file F | --js CODE) [--retry-ms N]
+/// [--keep-open URL]`, `list`, `rm NAME`, `run NAME`: scripts the daemon
+/// keeps injected into every matching tab (see `cu::inject`).
+fn inject_cmd(args: &[String]) -> Result<(), String> {
+    const USAGE: &str = "usage: cu inject add NAME --match GLOB (--file F | --js CODE) [--retry-ms N] [--keep-open URL] | list | rm NAME | run NAME";
+    let name = || args.get(1).cloned().ok_or(USAGE.to_string());
+    let body = |name: &str| format!("{{\"name\":{}}}", server::json_string(name));
+    let reply = match args.first().map(String::as_str) {
+        None | Some("list") => request("GET", "/v1/inject", None)?,
+        Some("rm") => request("POST", "/v1/inject/rm", Some(&body(&name()?)))?,
+        Some("run") => request("POST", "/v1/inject/run", Some(&body(&name()?)))?,
+        Some("add") => {
+            let name = name()?;
+            let (mut matcher, mut js, mut retry, mut keep) =
+                (String::new(), String::new(), 0u64, String::new());
+            let mut it = args[2..].iter();
+            while let Some(flag) = it.next() {
+                let value = it.next().ok_or(USAGE)?;
+                match flag.as_str() {
+                    "--match" => matcher = value.clone(),
+                    "--js" => js = value.clone(),
+                    "--file" => {
+                        js = fs::read_to_string(value).map_err(|e| format!("{value}: {e}"))?
+                    }
+                    "--retry-ms" => retry = value.parse().map_err(|_| USAGE)?,
+                    "--keep-open" => keep = value.clone(),
+                    _ => return Err(USAGE.into()),
+                }
+            }
+            if matcher.is_empty() || js.is_empty() {
+                return Err(USAGE.into());
+            }
+            let body = format!(
+                "{{\"name\":{},\"match\":{},\"js\":{},\"retry_ms\":{retry},\"keep_open\":{}}}",
+                server::json_string(&name),
+                server::json_string(&matcher),
+                server::json_string(&js),
+                server::json_string(&keep)
+            );
+            request("POST", "/v1/inject", Some(&body))?
+        }
+        Some(_) => return Err(USAGE.into()),
+    };
+    println!("{reply}");
+    Ok(())
+}
+
+/// `cu grant add NAME --origin O --permission P[,P]`, `list`, `rm NAME`:
+/// permissions the daemon keeps granted (see `cu::grant`).
+fn grant_cmd(args: &[String]) -> Result<(), String> {
+    const USAGE: &str =
+        "usage: cu grant add NAME --origin ORIGIN --permission P[,P] | list | rm NAME";
+    let name = || args.get(1).cloned().ok_or(USAGE.to_string());
+    let reply = match args.first().map(String::as_str) {
+        None | Some("list") => request("GET", "/v1/grant", None)?,
+        Some("rm") => request(
+            "POST",
+            "/v1/grant/rm",
+            Some(&format!("{{\"name\":{}}}", server::json_string(&name()?))),
+        )?,
+        Some("add") => {
+            let name = name()?;
+            let (mut origin, mut perms) = (String::new(), String::new());
+            let mut it = args[2..].iter();
+            while let Some(flag) = it.next() {
+                let value = it.next().ok_or(USAGE)?;
+                match flag.as_str() {
+                    "--origin" => origin = value.clone(),
+                    "--permission" | "--permissions" => perms = value.clone(),
+                    _ => return Err(USAGE.into()),
+                }
+            }
+            let body = format!(
+                "{{\"name\":{},\"origin\":{},\"permissions\":{}}}",
+                server::json_string(&name),
+                server::json_string(&origin),
+                server::json_string(&perms)
+            );
+            request("POST", "/v1/grant", Some(&body))?
+        }
+        Some(_) => return Err(USAGE.into()),
+    };
+    println!("{reply}");
+    Ok(())
 }

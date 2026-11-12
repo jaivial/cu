@@ -509,6 +509,25 @@ dismissed, each one logged (`cu dialog`, `cu console --level dialog`, and the
 then fail at once naming it until `cu dialog accept [TEXT]` or `cu dialog
 dismiss`. Details: [docs](docs/README.md#javascript-dialogs).
 
+## Registered scripts and grants
+
+`cu inject` keeps a script in every tab whose URL matches a glob, across
+reloads, new tabs and browser restarts; `cu grant` keeps a permission
+granted to an origin. Both live in the daemon dir and are re-applied by a
+daemon thread.
+
+```sh
+cu grant add figma --origin https://www.figma.com --permission localNetworkAccess
+docs/examples/figma-fork-wrapper.sh 1996 > /tmp/figma-wrapper.js
+cu inject add figma-fork --match 'https://www.figma.com/design/*' \
+  --file /tmp/figma-wrapper.js --retry-ms 3000 --keep-open https://www.figma.com/design/KEY
+cu inject list        # each matching tab's last result
+cu inject run figma-fork
+```
+
+With `--retry-ms` the script is evaluated again until its result starts
+with `ok`, `started` or `already`. MCP: tools `inject` and `grant`.
+
 ## MCP server
 
 `cu mcp` is a stdio [MCP](https://modelcontextprotocol.io) server in front of

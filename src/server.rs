@@ -618,6 +618,8 @@ const CDP_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum accepted request head and body. Guards against unbounded buffering.
 const MAX_REQUEST: usize = 64 * 1024;
+/// Maximum accepted request body: registered inject scripts (a Figma plugin wrapper is ~120 KB) need more than a head. Loopback-only daemon.
+const MAX_BODY: usize = 2 * 1024 * 1024;
 
 /// How long a client may take to finish sending one request. Without this a
 /// peer that announces more body than it sends would pin a thread forever.
@@ -668,7 +670,7 @@ fn read_request(stream: &mut TcpStream) -> Result<String, String> {
     let len = header_value(&head, "content-length")
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(0);
-    if len > MAX_REQUEST {
+    if len > MAX_BODY {
         return Err("request body is too large".into());
     }
     while buf.len() < head_end + len {
@@ -969,6 +971,10 @@ fn route_with(
     // A query string selects options (`?format=png`), never a different
     // resource, so the match below is on the path alone.
     let path = full_path.split('?').next().unwrap_or("");
+    // Registered scripts and grants live in the daemon's dir, not on a tab.
+    if let Some(reply) = crate::inject::route(method, path, body, &state.data_dir, state.cdp_port) {
+        return reply;
+    }
     // A CLI-created tab stays owned as long as its agent keeps using it.
     let wanted_tab = form_value(query(full_path), "tab");
     if !wanted_tab.is_empty() {

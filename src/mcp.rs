@@ -710,6 +710,30 @@ const TOOLS: &[Tool] = &[
         open_world: true,
     },
     Tool {
+        name: "inject",
+        title: "Registered page scripts",
+        description: "Scripts the daemon keeps injected into every tab whose URL matches a glob, across reloads, new tabs and browser restarts. add (name, match, js, optional retry_ms to re-run until the result starts with ok/started/already, keep_open URL to open when no tab matches), list (with each tab's last result), rm, run (evaluate now on the matching tabs).",
+        properties: r#""action":{"type":"string","enum":["add","list","rm","run"]},"name":{"type":"string"},"match":{"type":"string","description":"URL glob, * and ?."},"js":{"type":"string","description":"The script; its value is the result."},"retry_ms":{"type":"number"},"keep_open":{"type":"string","description":"URL to open in a background tab when nothing matches (once a minute at most)."}"#,
+        required: &["action"],
+        target: Target::None,
+        read_only: false,
+        destructive: false,
+        idempotent: false,
+        open_world: false,
+    },
+    Tool {
+        name: "grant",
+        title: "Persistent permission grants",
+        description: "Browser permissions the daemon keeps granted to an origin, re-applied when the browser restarts. add (name, origin, permissions), list (with the last error), rm.",
+        properties: r#""action":{"type":"string","enum":["add","list","rm"]},"name":{"type":"string"},"origin":{"type":"string"},"permissions":{"type":"array","items":{"type":"string"},"description":"CDP PermissionType names, e.g. localNetworkAccess, clipboardReadWrite."}"#,
+        required: &["action"],
+        target: Target::None,
+        read_only: false,
+        destructive: false,
+        idempotent: false,
+        open_world: false,
+    },
+    Tool {
         name: "downloads",
         title: "Downloads",
         description: "Files the browser finished downloading, newest first, with their paths. The click that started a download already named it.",
@@ -942,6 +966,74 @@ fn plan(name: &str, args: &Args) -> Result<Call, String> {
     match name {
         "status" => Ok(Call::plain("GET", "/v1/status?detail=1", None)),
         "tabs" => Ok(Call::plain("GET", "/v1/tabs", None)),
+        "inject" => {
+            let name = || {
+                args.str("name")
+                    .map(json_string)
+                    .unwrap_or_else(|| "\"\"".into())
+            };
+            match args.required("action")? {
+                "list" => Ok(Call::plain("GET", "/v1/inject", None)),
+                "rm" => Ok(Call::plain(
+                    "POST",
+                    "/v1/inject/rm",
+                    Some(&format!("{{\"name\":{}}}", name())),
+                )),
+                "run" => Ok(Call::plain(
+                    "POST",
+                    "/v1/inject/run",
+                    Some(&format!("{{\"name\":{}}}", name())),
+                )),
+                "add" => {
+                    let retry = args.number("retry_ms")?.unwrap_or("0");
+                    let body = format!(
+                        "{{\"name\":{},\"match\":{},\"js\":{},\"retry_ms\":{retry},\"keep_open\":{}}}",
+                        name(),
+                        json_string(args.required("match")?),
+                        json_string(args.required("js")?),
+                        json_string(args.str("keep_open").unwrap_or(""))
+                    );
+                    Ok(Call::plain("POST", "/v1/inject", Some(&body)))
+                }
+                other => Err(format!("action is add, list, rm or run, not {other}")),
+            }
+        }
+        "grant" => {
+            let name = || {
+                args.str("name")
+                    .map(json_string)
+                    .unwrap_or_else(|| "\"\"".into())
+            };
+            match args.required("action")? {
+                "list" => Ok(Call::plain("GET", "/v1/grant", None)),
+                "rm" => Ok(Call::plain(
+                    "POST",
+                    "/v1/grant/rm",
+                    Some(&format!("{{\"name\":{}}}", name())),
+                )),
+                "add" => {
+                    let list: Vec<String> = match args.value("permissions") {
+                        Some(Json::Array(items)) => items
+                            .iter()
+                            .filter_map(|i| match i {
+                                Json::String(s) => Some(json_string(s)),
+                                _ => None,
+                            })
+                            .collect(),
+                        Some(Json::String(s)) => vec![json_string(s)],
+                        _ => Vec::new(),
+                    };
+                    let permissions = format!("[{}]", list.join(","));
+                    let body = format!(
+                        "{{\"name\":{},\"origin\":{},\"permissions\":{permissions}}}",
+                        name(),
+                        json_string(args.required("origin")?)
+                    );
+                    Ok(Call::plain("POST", "/v1/grant", Some(&body)))
+                }
+                other => Err(format!("action is add, list or rm, not {other}")),
+            }
+        }
         "downloads" => Ok(Call::plain("GET", "/v1/downloads", None)),
         "close_tab" => {
             let id = args.required("id")?;
