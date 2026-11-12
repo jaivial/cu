@@ -147,6 +147,8 @@ fn main() {
         // dialogs on the tab -- the one waiting for an answer, the log, the
         // policy that answers them.
         Some("dialog") => dialog_cmd(&args[1..], &on_tab),
+        Some("inject") => inject_cmd(&args[1..]),
+        Some("grant") => grant_cmd(&args[1..]),
         Some("text") => page_request("GET", &on_tab("/v1/text"), None).map(|s| println!("{s}")),
         Some("downloads") => request("GET", "/v1/downloads", None).map(|s| println!("{s}")),
         Some("tabs") => match args.get(1).map(String::as_str) {
@@ -1152,6 +1154,7 @@ fn daemon(args: &[String]) -> Result<(), String> {
     server::spawn_browser_thread(data.clone(), cdp_port, Arc::clone(&browser), policy);
     server::spawn_tab_gc(cdp_port);
     cu::park::spawn(cdp_port);
+    cu::inject::spawn(&data, cdp_port);
     let vault_host = env::var("CU_VAULT_HOST")
         .ok()
         .filter(|h| !h.trim().is_empty());
@@ -2097,3 +2100,86 @@ fn console_cmd(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), S
     page_request("GET", &on_tab(&format!("/v1/console?{q}")), None)
         .map(|s| println!("{}", s.trim_end()))
 }
+
+/// `cu inject add NAME --match GLOB (--file F | --js CODE) [--retry-ms N]
+/// [--keep-open URL]`, `list`, `rm NAME`, `run NAME`: scripts the daemon
+/// keeps injected into every matching tab (see `cu::inject`).
+fn inject_cmd(args: &[String]) -> Result<(), String> {
+    const USAGE: &str = "usage: cu inject add NAME --match GLOB (--file F | --js CODE) [--retry-ms N] [--keep-open URL] | list | rm NAME | run NAME";
+    let name = || args.get(1).cloned().ok_or(USAGE.to_string());
+    let body = |name: &str| format!("{{\"name\":{}}}", server::json_string(name));
+    let reply = match args.first().map(String::as_str) {
+        None | Some("list") => request("GET", "/v1/inject", None)?,
+        Some("rm") => request("POST", "/v1/inject/rm", Some(&body(&name()?)))?,
+        Some("run") => request("POST", "/v1/inject/run", Some(&body(&name()?)))?,
+        Some("add") => {
+            let name = name()?;
+            let (mut matcher, mut js, mut retry, mut keep) = (String::new(), String::new(), 0u64, String::new());
+            let mut it = args[2..].iter();
+            while let Some(flag) = it.next() {
+                let value = it.next().ok_or(USAGE)?;
+                match flag.as_str() {
+                    "--match" => matcher = value.clone(),
+                    "--js" => js = value.clone(),
+                    "--file" => js = fs::read_to_string(value).map_err(|e| format!("{value}: {e}"))?,
+                    "--retry-ms" => retry = value.parse().map_err(|_| USAGE)?,
+                    "--keep-open" => keep = value.clone(),
+                    _ => return Err(USAGE.into()),
+                }
+            }
+            if matcher.is_empty() || js.is_empty() {
+                return Err(USAGE.into());
+            }
+            let body = format!(
+                "{{\"name\":{},\"match\":{},\"js\":{},\"retry_ms\":{retry},\"keep_open\":{}}}",
+                server::json_string(&name),
+                server::json_string(&matcher),
+                server::json_string(&js),
+                server::json_string(&keep)
+            );
+            request("POST", "/v1/inject", Some(&body))?
+        }
+        Some(_) => return Err(USAGE.into()),
+    };
+    println!("{reply}");
+    Ok(())
+}
+
+/// `cu grant add NAME --origin O --permission P[,P]`, `list`, `rm NAME`:
+/// permissions the daemon keeps granted (see `cu::grant`).
+fn grant_cmd(args: &[String]) -> Result<(), String> {
+    const USAGE: &str = "usage: cu grant add NAME --origin ORIGIN --permission P[,P] | list | rm NAME";
+    let name = || args.get(1).cloned().ok_or(USAGE.to_string());
+    let reply = match args.first().map(String::as_str) {
+        None | Some("list") => request("GET", "/v1/grant", None)?,
+        Some("rm") => request(
+            "POST",
+            "/v1/grant/rm",
+            Some(&format!("{{\"name\":{}}}", server::json_string(&name()?))),
+        )?,
+        Some("add") => {
+            let name = name()?;
+            let (mut origin, mut perms) = (String::new(), String::new());
+            let mut it = args[2..].iter();
+            while let Some(flag) = it.next() {
+                let value = it.next().ok_or(USAGE)?;
+                match flag.as_str() {
+                    "--origin" => origin = value.clone(),
+                    "--permission" | "--permissions" => perms = value.clone(),
+                    _ => return Err(USAGE.into()),
+                }
+            }
+            let body = format!(
+                "{{\"name\":{},\"origin\":{},\"permissions\":{}}}",
+                server::json_string(&name),
+                server::json_string(&origin),
+                server::json_string(&perms)
+            );
+            request("POST", "/v1/grant", Some(&body))?
+        }
+        Some(_) => return Err(USAGE.into()),
+    };
+    println!("{reply}");
+    Ok(())
+}
+

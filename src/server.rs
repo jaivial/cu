@@ -969,6 +969,10 @@ fn route_with(
     // A query string selects options (`?format=png`), never a different
     // resource, so the match below is on the path alone.
     let path = full_path.split('?').next().unwrap_or("");
+    // Registered scripts and grants live in the daemon's dir, not on a tab.
+    if let Some(reply) = crate::inject::route(method, path, body, &state.data_dir, state.cdp_port) {
+        return reply;
+    }
     // A CLI-created tab stays owned as long as its agent keeps using it.
     let wanted_tab = form_value(query(full_path), "tab");
     if !wanted_tab.is_empty() {

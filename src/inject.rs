@@ -10,7 +10,7 @@
 //! matches (at most once a minute). Grants ([`crate::grant`]) ride the same
 //! thread.
 
-use crate::server::{CdpConnection, json_number, json_objects, json_string, json_string_value};
+use crate::server::{json_number, json_objects, json_string, json_string_value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
