@@ -60,7 +60,12 @@ fn path(dir: &Path) -> PathBuf {
 
 pub fn load(dir: &Path) -> Vec<Grant> {
     std::fs::read_to_string(path(dir))
-        .map(|s| json_objects(&s).iter().filter_map(|o| Grant::parse(o)).collect())
+        .map(|s| {
+            json_objects(&s)
+                .iter()
+                .filter_map(|o| Grant::parse(o))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -119,12 +124,13 @@ pub fn browser_call(cdp_port: u16, method: &str, params: &str) -> Result<String,
     }
 }
 
-
 /// Apply every grant not yet applied on the live session.
 pub fn tick(dir: &Path, cdp_port: u16) {
     let grants = load(dir);
     let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
-    state.errors.retain(|name, _| grants.iter().any(|g| &g.name == name));
+    state
+        .errors
+        .retain(|name, _| grants.iter().any(|g| &g.name == name));
     if grants.is_empty() {
         return;
     }
@@ -181,7 +187,11 @@ pub fn add(dir: &Path, cdp_port: u16, body: &str) -> Result<String, String> {
         .get(&name)
         .map(|(e, _)| e.clone());
     Ok(match error {
-        Some(e) => format!("{{\"added\":{},\"error\":{}}}", json_string(&name), json_string(&e)),
+        Some(e) => format!(
+            "{{\"added\":{},\"error\":{}}}",
+            json_string(&name),
+            json_string(&e)
+        ),
         None => format!("{{\"added\":{},\"applied\":true}}", json_string(&name)),
     })
 }
@@ -232,10 +242,13 @@ mod tests {
 
     #[test]
     fn grants_parse_lists_and_comma_strings() {
-        let g = Grant { name: "f".into(), origin: "https://www.figma.com".into(), permissions: vec!["localNetworkAccess".into(), "clipboardReadWrite".into()] };
+        let g = Grant {
+            name: "f".into(),
+            origin: "https://www.figma.com".into(),
+            permissions: vec!["localNetworkAccess".into(), "clipboardReadWrite".into()],
+        };
         assert_eq!(Grant::parse(&g.json()), Some(g.clone()));
         let body = r#"{"name":"f","origin":"https://www.figma.com","permissions":"localNetworkAccess, clipboardReadWrite"}"#;
         assert_eq!(Grant::parse(body), Some(g));
     }
 }
-

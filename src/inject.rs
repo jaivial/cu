@@ -55,7 +55,12 @@ fn path(dir: &Path) -> PathBuf {
 
 pub fn load(dir: &Path) -> Vec<Script> {
     std::fs::read_to_string(path(dir))
-        .map(|s| json_objects(&s).iter().filter_map(|o| Script::parse(o)).collect())
+        .map(|s| {
+            json_objects(&s)
+                .iter()
+                .filter_map(|o| Script::parse(o))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -114,7 +119,6 @@ pub fn now_secs() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
-
 
 /// What happened on one tab for one registration.
 #[derive(Clone, Debug)]
@@ -190,8 +194,14 @@ pub fn pages(cdp_port: u16) -> Vec<(String, String)> {
 fn apply(cdp_port: u16, script: &Script, target: &str, url: &str, force: bool) -> Option<String> {
     let keeper = crate::keeper::watch(cdp_port, target).ok()?;
     let key = (script.name.clone(), target.to_string());
-    let prior = tabs().lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
-    let fresh = prior.as_ref().is_none_or(|p| p.generation != keeper.generation);
+    let prior = tabs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned();
+    let fresh = prior
+        .as_ref()
+        .is_none_or(|p| p.generation != keeper.generation);
     if fresh {
         let params = format!(
             "{{\"source\":{},\"runImmediately\":false}}",
@@ -231,7 +241,6 @@ fn apply(cdp_port: u16, script: &Script, target: &str, url: &str, force: bool) -
     Some(result)
 }
 
-
 /// Open `url` in a background tab, at most once a minute per registration.
 fn keep_open(cdp_port: u16, script: &Script) {
     let mut opened = opened().lock().unwrap_or_else(|e| e.into_inner());
@@ -255,9 +264,16 @@ fn keep_open(cdp_port: u16, script: &Script) {
 /// One pass over every registration.
 pub fn tick(dir: &Path, cdp_port: u16) {
     let scripts = load(dir);
-    let pages = if scripts.is_empty() { Vec::new() } else { pages(cdp_port) };
+    let pages = if scripts.is_empty() {
+        Vec::new()
+    } else {
+        pages(cdp_port)
+    };
     for script in &scripts {
-        let matching: Vec<_> = pages.iter().filter(|(_, url)| glob(&script.matcher, url)).collect();
+        let matching: Vec<_> = pages
+            .iter()
+            .filter(|(_, url)| glob(&script.matcher, url))
+            .collect();
         if matching.is_empty() && !script.keep_open.is_empty() {
             keep_open(cdp_port, script);
         }
@@ -327,7 +343,6 @@ pub fn list_json(dir: &Path) -> String {
     format!("{{\"scripts\":[{}]}}", items.join(","))
 }
 
-
 pub fn add(dir: &Path, cdp_port: u16, script: Script) -> Result<String, String> {
     if script.name.is_empty() || script.matcher.is_empty() || script.js.is_empty() {
         return Err("inject add needs a name, a match glob and a script".into());
@@ -376,7 +391,11 @@ pub fn run(dir: &Path, cdp_port: u16, name: &str) -> Result<String, String> {
             )
         })
         .collect();
-    Ok(format!("{{\"name\":{},\"tabs\":[{}]}}", json_string(name), results.join(",")))
+    Ok(format!(
+        "{{\"name\":{},\"tabs\":[{}]}}",
+        json_string(name),
+        results.join(",")
+    ))
 }
 
 type Reply = (&'static str, &'static str, String);
@@ -423,7 +442,10 @@ mod tests {
 
     #[test]
     fn globs_match_like_a_shell() {
-        assert!(glob("https://www.figma.com/design/*", "https://www.figma.com/design/abc/x"));
+        assert!(glob(
+            "https://www.figma.com/design/*",
+            "https://www.figma.com/design/abc/x"
+        ));
         assert!(glob("*figma.com*", "https://figma.com/"));
         assert!(!glob("https://a.com/*", "https://b.com/x"));
         assert!(glob("a?c", "abc"));
@@ -446,8 +468,13 @@ mod tests {
 
     #[test]
     fn scripts_round_trip_through_json() {
-        let s = Script { name: "f".into(), matcher: "*".into(), js: "\"x\"\n".into(), retry_ms: 5, keep_open: String::new() };
+        let s = Script {
+            name: "f".into(),
+            matcher: "*".into(),
+            js: "\"x\"\n".into(),
+            retry_ms: 5,
+            keep_open: String::new(),
+        };
         assert_eq!(Script::parse(&s.json()), Some(s));
     }
 }
-
