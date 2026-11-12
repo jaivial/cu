@@ -125,6 +125,10 @@ pub fn now_secs() -> u64 {
 struct TabState {
     generation: u64,
     done: bool,
+    /// `performance.timeOrigin` of the document the script last ran in: a
+    /// reload or navigation keeps the keeper (same generation) but starts a new
+    /// document, where a script that needs a late global must be retried.
+    doc: String,
     last_eval: Instant,
     url: String,
     result: String,
@@ -190,6 +194,9 @@ pub fn pages(cdp_port: u16) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Identifies the current document of a tab (changes on every load).
+const DOC_ID: &str = "String(performance.timeOrigin)";
+
 /// One registration on one tab: register on a new keeper, evaluate, retry.
 fn apply(cdp_port: u16, script: &Script, target: &str, url: &str, force: bool) -> Option<String> {
     let keeper = crate::keeper::watch(cdp_port, target).ok()?;
@@ -213,8 +220,17 @@ fn apply(cdp_port: u16, script: &Script, target: &str, url: &str, force: bool) -
             Duration::from_secs(5),
         );
     }
+    // A settled tab whose document changed (reload, SPA hard navigation) runs again.
+    let doc = evaluate(&keeper, DOC_ID);
+    let reloaded = prior.as_ref().is_some_and(|p| p.done && p.doc != doc);
+    if reloaded {
+        eprintln!(
+            "cu: inject {}: tab {} has a new document, running again",
+            script.name, target
+        );
+    }
     let due = match &prior {
-        _ if fresh || force => true,
+        _ if fresh || force || reloaded => true,
         Some(p) => {
             !p.done
                 && script.retry_ms > 0
@@ -232,6 +248,7 @@ fn apply(cdp_port: u16, script: &Script, target: &str, url: &str, force: bool) -
         TabState {
             generation: keeper.generation,
             done,
+            doc,
             last_eval: Instant::now(),
             url: url.to_string(),
             result: result.clone(),
