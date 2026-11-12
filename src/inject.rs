@@ -72,13 +72,22 @@ fn save(dir: &Path, scripts: &[Script]) -> Result<(), String> {
 /// Write a file only its owner can read (the scripts may carry tokens).
 pub fn write_private(path: &Path, body: &str) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // Created 0600, never readable by others even for a moment.
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&tmp).map_err(|e| e.to_string())?;
+    std::io::Write::write_all(&mut file, body.as_bytes()).map_err(|e| e.to_string())?;
+    drop(file);
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+/// Serializes load→modify→save of inject.json and grant.json.
+pub fn store_lock() -> std::sync::MutexGuard<'static, ()> {
+    static STORE: Mutex<()> = Mutex::new(());
+    STORE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// `*` matches any run of characters, `?` one; everything else literally.
@@ -129,6 +138,8 @@ struct TabState {
     /// reload or navigation keeps the keeper (same generation) but starts a new
     /// document, where a script that needs a late global must be retried.
     doc: String,
+    /// `Page.addScriptToEvaluateOnNewDocument` identifier on this generation.
+    identifier: String,
     last_eval: Instant,
     url: String,
     result: String,
@@ -143,6 +154,42 @@ fn tabs() -> &'static Mutex<HashMap<(String, String), TabState>> {
 fn opened() -> &'static Mutex<HashMap<String, Instant>> {
     static OPENED: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
     OPENED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Drop the on-new-document copy a tab state registered, if its keeper lives.
+fn unregister(cdp_port: u16, target: &str, state: &TabState) {
+    if state.identifier.is_empty() {
+        return;
+    }
+    let Some(keeper) = crate::keeper::existing(cdp_port, target) else {
+        return;
+    };
+    if keeper.generation != state.generation {
+        return;
+    }
+    let params = format!("{{\"identifier\":{}}}", json_string(&state.identifier));
+    let _ = keeper.call(
+        "Page.removeScriptToEvaluateOnNewDocument",
+        &params,
+        Duration::from_secs(5),
+    );
+}
+
+/// Forget (and unregister) every tab state of registration `name`.
+fn drop_tabs(cdp_port: u16, name: &str) {
+    let mut gone = Vec::new();
+    tabs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(n, id), t| {
+            if n == name {
+                gone.push((id.clone(), t.clone()));
+            }
+            n != name
+        });
+    for (id, t) in gone {
+        unregister(cdp_port, &id, &t);
+    }
 }
 
 /// The value (or the exception) a `Runtime.evaluate` reply carries, as text.
@@ -171,12 +218,12 @@ pub fn eval_result(reply: &str) -> String {
     }
 }
 
-fn evaluate(keeper: &crate::keeper::Keeper, js: &str) -> String {
+fn evaluate(keeper: &crate::keeper::Keeper, js: &str, timeout: Duration) -> String {
     let params = format!(
         "{{\"expression\":{},\"returnByValue\":true,\"awaitPromise\":true}}",
         json_string(js)
     );
-    match keeper.call("Runtime.evaluate", &params, Duration::from_secs(15)) {
+    match keeper.call("Runtime.evaluate", &params, timeout) {
         Ok(reply) => eval_result(&reply),
         Err(e) => format!("error: {e}"),
     }
@@ -209,19 +256,34 @@ fn apply(cdp_port: u16, script: &Script, target: &str, url: &str, force: bool) -
     let fresh = prior
         .as_ref()
         .is_none_or(|p| p.generation != keeper.generation);
+    let mut identifier = prior
+        .as_ref()
+        .filter(|_| !fresh)
+        .map(|p| p.identifier.clone())
+        .unwrap_or_default();
     if fresh {
         let params = format!(
             "{{\"source\":{},\"runImmediately\":false}}",
             json_string(&script.js)
         );
-        let _ = keeper.call(
+        if let Ok(reply) = keeper.call(
             "Page.addScriptToEvaluateOnNewDocument",
             &params,
             Duration::from_secs(5),
-        );
+        ) {
+            identifier = crate::server::json_object(&reply, "result")
+                .and_then(|r| json_string_value(r, "identifier"))
+                .unwrap_or_default();
+        }
     }
     // A settled tab whose document changed (reload, SPA hard navigation) runs again.
-    let doc = evaluate(&keeper, DOC_ID);
+    // Short timeout: this runs on every matching tab every tick; a tab that
+    // does not answer keeps its last known document.
+    let probed = evaluate(&keeper, DOC_ID, Duration::from_secs(2));
+    let doc = match &prior {
+        Some(p) if probed.starts_with("error") => p.doc.clone(),
+        _ => probed,
+    };
     let reloaded = prior.as_ref().is_some_and(|p| p.done && p.doc != doc);
     if reloaded {
         eprintln!(
@@ -241,7 +303,7 @@ fn apply(cdp_port: u16, script: &Script, target: &str, url: &str, force: bool) -
     if !due {
         return None;
     }
-    let result = evaluate(&keeper, &script.js);
+    let result = evaluate(&keeper, &script.js, Duration::from_secs(15));
     let done = script.retry_ms == 0 || settled(&result);
     tabs().lock().unwrap_or_else(|e| e.into_inner()).insert(
         key,
@@ -249,6 +311,7 @@ fn apply(cdp_port: u16, script: &Script, target: &str, url: &str, force: bool) -
             generation: keeper.generation,
             done,
             doc,
+            identifier,
             last_eval: Instant::now(),
             url: url.to_string(),
             result: result.clone(),
@@ -300,10 +363,20 @@ pub fn tick(dir: &Path, cdp_port: u16) {
     }
     // Forget tabs that are gone and registrations that were removed.
     let live: Vec<&String> = pages.iter().map(|(id, _)| id).collect();
+    let mut removed = Vec::new();
     tabs()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|(name, id), _| live.contains(&id) && scripts.iter().any(|s| &s.name == name));
+        .retain(|(name, id), t| {
+            let registered = scripts.iter().any(|s| &s.name == name);
+            if live.contains(&id) && !registered {
+                removed.push((id.clone(), t.clone()));
+            }
+            live.contains(&id) && registered
+        });
+    for (id, t) in removed {
+        unregister(cdp_port, &id, &t);
+    }
     crate::grant::tick(dir, cdp_port);
 }
 
@@ -364,21 +437,21 @@ pub fn add(dir: &Path, cdp_port: u16, script: Script) -> Result<String, String> 
     if script.name.is_empty() || script.matcher.is_empty() || script.js.is_empty() {
         return Err("inject add needs a name, a match glob and a script".into());
     }
+    let store = store_lock();
     let mut scripts = load(dir);
     scripts.retain(|s| s.name != script.name);
     let name = script.name.clone();
     scripts.push(script);
     save(dir, &scripts)?;
-    // A re-registration starts over on every tab.
-    tabs()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|(n, _), _| n != &name);
+    drop(store);
+    // A re-registration starts over on every tab, without the old copy.
+    drop_tabs(cdp_port, &name);
     spawn(dir, cdp_port);
     Ok(format!("{{\"added\":{}}}", json_string(&name)))
 }
 
-pub fn remove(dir: &Path, name: &str) -> Result<String, String> {
+pub fn remove(dir: &Path, cdp_port: u16, name: &str) -> Result<String, String> {
+    let store = store_lock();
     let mut scripts = load(dir);
     let before = scripts.len();
     scripts.retain(|s| s.name != name);
@@ -386,6 +459,8 @@ pub fn remove(dir: &Path, name: &str) -> Result<String, String> {
         return Err(format!("no inject registration named {name}"));
     }
     save(dir, &scripts)?;
+    drop(store);
+    drop_tabs(cdp_port, name);
     Ok(format!("{{\"removed\":{}}}", json_string(name)))
 }
 
@@ -444,7 +519,7 @@ pub fn route(method: &str, path: &str, body: &str, dir: &Path, cdp_port: u16) ->
                 keep_open: json_string_value(body, "keep_open").unwrap_or_default(),
             },
         )),
-        ("POST", "/v1/inject/rm") => reply(remove(dir, &name())),
+        ("POST", "/v1/inject/rm") => reply(remove(dir, cdp_port, &name())),
         ("POST", "/v1/inject/run") => reply(run(dir, cdp_port, &name())),
         ("GET", "/v1/grant") => ("200 OK", "application/json", crate::grant::list_json(dir)),
         ("POST", "/v1/grant") => reply(crate::grant::add(dir, cdp_port, body)),

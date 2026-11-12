@@ -173,11 +173,13 @@ pub fn add(dir: &Path, cdp_port: u16, body: &str) -> Result<String, String> {
     if grant.origin.is_empty() || grant.permissions.is_empty() {
         return Err("grant add needs an origin and at least one permission".into());
     }
+    let store = crate::inject::store_lock();
     let mut grants = load(dir);
     grants.retain(|g| g.name != grant.name);
     let name = grant.name.clone();
     grants.push(grant);
     save(dir, &grants)?;
+    drop(store);
     crate::inject::spawn(dir, cdp_port);
     tick(dir, cdp_port);
     let error = state()
@@ -197,6 +199,7 @@ pub fn add(dir: &Path, cdp_port: u16, body: &str) -> Result<String, String> {
 }
 
 pub fn remove(dir: &Path, name: &str) -> Result<String, String> {
+    let _store = crate::inject::store_lock();
     let mut grants = load(dir);
     let before = grants.len();
     grants.retain(|g| g.name != name);
