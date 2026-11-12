@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.14.0] - 2026-11-12
+
+### Added
+
+- **`cu inject`: scripts the daemon keeps in every matching tab.**
+  `cu inject add NAME --match GLOB (--file F | --js CODE) [--retry-ms N]
+  [--keep-open URL]`, `list`, `rm NAME`, `run NAME`; MCP tool `inject`.
+  Stored in `inject.json` in the daemon dir. A daemon thread (only once
+  something is registered) checks the page targets every 2 s, registers the
+  script with `Page.addScriptToEvaluateOnNewDocument` on each matching tab's
+  keeper (again for each new keeper) and evaluates it at once; with
+  `retry_ms` it re-evaluates until the result starts with `ok`, `started`
+  or `already`. `keep_open` opens a URL in a background tab when nothing
+  matches, at most once a minute. `list` shows each tab's last result.
+- **`cu grant`: persistent permission grants.** `cu grant add NAME
+  --origin O --permission P[,P]`, `list`, `rm`; MCP tool `grant`.
+  `Browser.grantPermissions` is applied on a browser-level session the
+  daemon holds open, and applied again when it drops or the browser
+  restarts; `list` reports the last error.
+- `docs/examples/figma-fork-wrapper.sh` prints the figma-mcp-go plugin
+  wrapper for `cu inject`, replacing `figma-fork-slim-bridge.mjs`.
+
 ## [1.13.1] - 2026-11-10
 
 ### Changed

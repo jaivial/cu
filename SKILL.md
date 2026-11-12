@@ -157,3 +157,8 @@ Use `cu` when an agent needs a persistent local browser session.
     retry around it.
 
 The bearer token is stored in `.cu/server.json`; keep that file private. The server binds to loopback only.
+
+## Registered scripts and grants
+
+- `cu inject add NAME --match GLOB (--file F | --js CODE) [--retry-ms N] [--keep-open URL]`, `list`, `rm NAME`, `run NAME` (MCP `inject`): the daemon injects the script into every matching tab, now and on every new document; retry until the result starts with ok/started/already.
+- `cu grant add NAME --origin O --permission P[,P]`, `list`, `rm NAME` (MCP `grant`): permissions kept granted, re-applied after a browser restart; `list` shows the last error.
