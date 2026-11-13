@@ -7056,11 +7056,12 @@ fn process_start(pid: u32) -> Option<u64> {
 
 /// Tabs the CLI created for an invocation, with the session that owns them.
 ///
-/// A tab is never closed out from under a live owner. Once the owner is
-/// gone, the tab is collected after a short grace ([`TAB_GC_IDLE`]) -- a
-/// tab cu cannot tell the owner of (another pid namespace) only after a long
-/// idle ([`TAB_GC_UNKNOWN_IDLE`]). This is what keeps two agents working in
-/// the same daemon from touching each other's pages.
+/// A tab is never closed out from under a live owner: one that used any of
+/// its tabs within `CU_TAB_TTL` (see [`TabLimits`]). Once the owner is gone,
+/// the tab is collected after a short grace ([`TAB_GC_IDLE`]); an owner
+/// still running (or that cu cannot see, in another pid namespace) loses its
+/// tabs once it has been idle for the TTL. This is what keeps two agents
+/// working in the same daemon from touching each other's pages.
 pub struct TabLease {
     pub owner: Owner,
     /// The owner's start time when the lease was made, if the daemon can
@@ -7075,9 +7076,6 @@ pub struct TabLease {
 /// busy. Not zero: an agent may still reach the tab with `--tab ID` right
 /// after the process that opened it ended, and every such use renews it.
 pub const TAB_GC_IDLE: Duration = Duration::from_secs(60);
-/// Idle age after which a tab whose owner cu cannot see (another pid
-/// namespace) is collected.
-pub const TAB_GC_UNKNOWN_IDLE: Duration = Duration::from_secs(10 * 60);
 /// How often the collector looks.
 const TAB_GC_TICK: Duration = Duration::from_secs(10);
 
@@ -7775,14 +7773,6 @@ fn tab_gc(
     report.live_sessions = live.len();
     report.idle_sessions = idle.difference(&live).count();
     Some(report)
-}
-
-/// The tabs of exited sessions, as before: kept for callers that only want
-/// that (see [`collect_tabs`] for the whole collection).
-pub fn reap_orphan_tabs(cdp_port: u16, _idle: Duration) -> Vec<String> {
-    collect_tabs(cdp_port, 0, None)
-        .map(|r| r.collected.into_iter().map(|(id, _)| id).collect())
-        .unwrap_or_default()
 }
 
 /// The daemon's background collector: every few seconds, run
