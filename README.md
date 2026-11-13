@@ -396,7 +396,8 @@ is **not** measured, stated plainly:
 cu start [--data DIR] [--webgl]   # one daemon per machine; a second start fails cleanly
 cu status [--short]          # daemon, browser and how many leases are held
 cu tab open [URL] [--lease S] [--label NAME]   # one tab per test
-cu tab close ID · cu tab renew ID [SECONDS] · cu tabs [close ID]
+cu tab close ID · cu tab renew ID [SECONDS] · cu tabs [close ID | --stats | --gc [--idle S]]
+cu viewport 375 812 [--mobile|--desktop] [--dpr F] · cu viewport off   # kept through every command
 cu context open NAME [--lease S] · cu context close NAME   # isolated cookie jar
 cu lease [KEY [SECONDS]]     # list held leases / extend one
 cu navigate URL · cu snapshot · cu text        # all take --tab ID / --context NAME
@@ -497,6 +498,30 @@ holds through the page's own reloads and every later command until
 `{"do":"emulate","mode":"desktop"}`; a click on it is a touch tap. `tablet`,
 `custom` (`width`, `height`), `orientation` and `scale` are in
 [docs](docs/README.md#phone-and-tablet-emulation).
+
+`cu viewport W H [--mobile|--desktop] [--dpr F]` (MCP tool `viewport`:
+`width`, `height`, `mobile`, `dpr`, `off`) is the same as one step:
+`--mobile` (the default below 820 px) is a whole phone, `--desktop` a narrow
+desktop window with the mouse and the browser's own User-Agent. The viewport
+stays through navigations, clicks, typing and captures (a `cu shot --width`
+puts it back afterwards); before each command cu checks the page still sees
+it and puts it back if not, and a popup the tab opens gets the same one.
+
+## Stale tabs
+
+A shared daemon collects the tabs nobody is using, so they do not pile up
+and hold the browser's connections (six per host): tabs of a session whose
+process exited (after a minute), of a session that has used none of its
+tabs for `CU_TAB_TTL` (default `30m`; an MCP server outlives the agent that
+used it), and tabs nobody holds (opened before the daemon started, over raw
+DevTools) idle that long. Above `CU_TAB_MAX` pages (default 40, `0` off)
+the least recently used tabs idle 5 minutes or more go first. A tab idle
+`CU_TAB_FREEZE` (default `10m`, `off`) that is not a live session's is
+frozen, and thawed by the next command on it. A live session's tab, the
+default tab, a named context's page and a tab a person watches are never
+closed. `cu tabs --stats` (and `cu status --detail`, `tabs`) says what is
+open, held, frozen and due; `cu tabs --gc [--idle S]` (MCP `tabs` with
+`gc: true`) collects now.
 
 ## JavaScript dialogs
 

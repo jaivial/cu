@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.15.0] - 2026-11-13
+
+### Added
+
+- **Stale tabs are collected on a shared daemon.** Besides the tabs of
+  exited sessions: the tabs of a session idle for `CU_TAB_TTL` (default
+  30 min) even while its process runs (an MCP server whose agent is gone),
+  unleased tabs idle that long (left from before a daemon start, raw
+  DevTools), and the least recently used ones above `CU_TAB_MAX` (default
+  40). Tabs idle `CU_TAB_FREEZE` (default 10 min) that are not a live
+  session's are frozen (`Page.setWebLifecycleState`) and thawed before the
+  next command on them. A session that works in an unleased tab takes it.
+  Live sessions' tabs, the default tab, context pages, watched tabs and one
+  blank page per window are never closed. `cu tabs --stats`,
+  `cu tabs --gc [--idle S]`, `GET|POST /v1/tabs/gc`, MCP `tabs` with
+  `gc: true`, and a `tabs` block in `cu status --detail`. Measured on the
+  shared cu-slim daemon: 161 pages (59 on one host) had exhausted the
+  browser's six connections per host.
+- **`cu viewport W H [--mobile|--desktop] [--dpr F]` / `off`, MCP tool
+  `viewport`.** An emulate step whose `custom` mode takes `mobile`:
+  `false` is a desktop window of that size (mouse, the browser's own
+  User-Agent). Before each command on an emulated tab cu checks
+  `screen.width` and puts the device back if the page lost it; a popup of
+  an emulated tab gets the same device.
+
 ## [1.14.0] - 2026-11-12
 
 ### Added

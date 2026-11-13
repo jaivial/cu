@@ -155,6 +155,9 @@ pub enum Action {
         height: Option<u32>,
         orientation: Option<String>,
         scale: Option<f64>,
+        /// `custom` only: `true` a phone whatever the width, `false` a
+        /// desktop window of that size; absent, decided by the width.
+        mobile: Option<bool>,
     },
 }
 
@@ -285,14 +288,23 @@ pub fn parse_action(object: &str) -> Result<Action, String> {
             let (width, height) = (side("width")?, side("height")?);
             let orientation = json_string_value(object, "orientation");
             let scale = crate::server::json_number(object, "scale");
+            let mobile = flag_value(object, "mobile");
             // Checked here, so a bad step fails the batch before it starts.
-            crate::emulation::Device::plan(&mode, width, height, orientation.as_deref(), scale)?;
+            crate::emulation::Device::plan_with(
+                &mode,
+                width,
+                height,
+                orientation.as_deref(),
+                scale,
+                mobile,
+            )?;
             Action::Emulate {
                 mode,
                 width,
                 height,
                 orientation,
                 scale,
+                mobile,
             }
         }
         "wait" => {
@@ -984,8 +996,16 @@ impl Page {
                 height,
                 orientation,
                 scale,
+                mobile,
             } => {
-                value = self.emulate(mode, *width, *height, orientation.as_deref(), *scale)?;
+                value = self.emulate(
+                    mode,
+                    *width,
+                    *height,
+                    orientation.as_deref(),
+                    *scale,
+                    *mobile,
+                )?;
                 false
             }
         };
@@ -1163,8 +1183,10 @@ impl Page {
         height: Option<u32>,
         orientation: Option<&str>,
         scale: Option<f64>,
+        mobile: Option<bool>,
     ) -> Result<Option<String>, String> {
-        match crate::emulation::Device::plan(mode, width, height, orientation, scale)? {
+        match crate::emulation::Device::plan_with(mode, width, height, orientation, scale, mobile)?
+        {
             Some(device) => crate::emulation::apply(&self.tab, device).map(Some),
             None => {
                 crate::emulation::clear(&self.tab);
@@ -2373,6 +2395,21 @@ if (!window.__cu) {
 }
 "#;
 
+/// A bare JSON boolean member: `Some(true)`, `Some(false)`, or `None` when
+/// absent (the string-only reader cannot tell `false` from missing).
+fn flag_value(object: &str, key: &str) -> Option<bool> {
+    let needle = format!("\"{key}\"");
+    let start = object.find(&needle)? + needle.len();
+    let rest = object[start..].trim_start().strip_prefix(':')?.trim_start();
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2483,6 +2520,7 @@ mod tests {
                 height: Some(900),
                 orientation: None,
                 scale: None,
+                mobile: None,
             }
         );
         assert_eq!(
@@ -2493,6 +2531,7 @@ mod tests {
                 height: None,
                 orientation: None,
                 scale: None,
+                mobile: None,
             }
         );
         // The optional fields.
@@ -2507,6 +2546,7 @@ mod tests {
                 height: None,
                 orientation: Some("landscape".into()),
                 scale: Some(2.5),
+                mobile: None,
             }
         );
         // Refused before the batch runs, not half way through it.

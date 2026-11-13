@@ -160,10 +160,30 @@ fn main() {
                     .map(|s| println!("{s}")),
                 None => Err("usage: cu tabs close ID".into()),
             },
+            // How many tabs are open, held by live sessions, idle or frozen,
+            // and what a collection would close now.
+            Some("--stats") => request("GET", "/v1/tabs/gc", None).map(|s| println!("{s}")),
+            // Collect now: exited and idle sessions' tabs, unheld tabs idle
+            // past CU_TAB_TTL (or --idle SECONDS), then down to CU_TAB_MAX.
+            // A live session's tab is never closed.
+            Some("--gc") => match args.iter().position(|a| a == "--idle") {
+                Some(i) => args
+                    .get(i + 1)
+                    .and_then(|v| server::parse_span(v))
+                    .map(|span| format!("{{\"idle_s\":{}}}", span.as_secs()))
+                    .ok_or_else(|| "usage: cu tabs --gc [--idle SECONDS]".to_string()),
+                None => Ok("{}".to_string()),
+            }
+            .and_then(|body| request("POST", "/v1/tabs/gc", Some(&body)))
+            .map(|s| println!("{s}")),
             Some(other) => Err(format!(
-                "unknown tabs command {other}; usage: cu tabs [close ID]"
+                "unknown tabs command {other}; usage: cu tabs [close ID | --stats | --gc [--idle S]]"
             )),
         },
+        // cu viewport W H [--mobile|--desktop] [--dpr F] [--portrait|--landscape]
+        // or cu viewport off: a viewport the tab keeps through every
+        // command (navigate, click, type, act, shot) until it is turned off.
+        Some("viewport") => viewport_cmd(&args[1..], &on_tab),
         Some("click") => match args.get(1) {
             Some(r) => page_request(
                 "POST",
@@ -346,7 +366,7 @@ fn wait_for_handoff(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<
 
 fn print_help() {
     println!(
-        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status [--detail]\n  cu diagnostics\n  cu targets\n  cu challenge [release|wait [--timeout S]]\n  cu handoff [wait [--timeout S]]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]\n          levels: debug|verbose log info trace warn error exception csp network dialog, all, LEVEL+\n  cu net [--grep S] [--failed] [--since N] [--limit N] [--json]   the fetch/XHR requests the page made\n  cu wait (--text TEXT | --selector CSS | --url PART) [--gone] [--timeout S]   until the page is ready, instead of sleep\n  cu dialog [accept [TEXT] | dismiss | policy [SPEC]]   JavaScript dialogs (CU_DIALOGS sets the daemon's policy)\n  cu inject add NAME --match GLOB (--file F | --js CODE) [--retry-ms N] [--keep-open URL] | list | rm NAME | run NAME\n  cu grant add NAME --origin ORIGIN --permission P[,P] | list | rm NAME\n  cu text\n  cu downloads\n  cu tabs [close ID]\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF | --selector CSS] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu mcp   the daemon's tools as an MCP server on stdio (pi, Claude Code, Codex, Cursor)\n  cu seo audit URL [--keywords \"k1,k2\"] [--context C] [--geo LOC] [--md]\n  cu seo crawl URL [--max-pages N] [--depth N] [--delay-ms MS] [--keywords K] [--out FILE.jsonl]\n  cu seo geo CONTEXT \"Town,Region,Country\" [--proxy URL] [--lat N --lon N] [--lang L] [--tz Z]\n  cu seo geo CONTEXT            what a page in CONTEXT sees (language, zone, position)\n  cu seo robots URL\n  cu serp QUERY [--geo LOC | --context C] [--engine google|bing|duckduckgo] [--num N]\n          [--target DOMAIN] [--proxy URL] [--md]\n  cu serp compare QUERY --geo LOC1 --geo LOC2 [...] [--engine E] [--md]\n          LOC: \"ES\", \"Sevilla,ES\", \"Getxo,Bizkaia,ES\" (town, region, country)\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n  cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup]\n          [--wait] [--timeout S]\n  cu otp wait ID [--timeout S] | cancel ID | list\n  cu otp capture --tab T [--domain D] [--request ID] [--credential ID] [--replace]\n  cu otp code DOMAIN | --credential ID\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
+        "cu — persistent browser for AI agents\n\n  cu start [--port N] [--data DIR] [--mode fast|compat] [--webgl] [--public-url URL]\n  cu status [--detail]\n  cu diagnostics\n  cu targets\n  cu challenge [release|wait [--timeout S]]\n  cu handoff [wait [--timeout S]]\n  cu navigate URL\n  cu shot [FILE] [--png] [--width N] [--height N] [--scale F]\n          [--ref REF | --selector CSS] [--padding N]\n          [--annotate REFS|all] [--marks]\n  cu snapshot\n  cu inspect REF | --selector CSS\n  cu mark REF|--selector CSS NOTE [--severity blocker|major|minor|nit]\n  cu marks [--md | clear]\n  cu console [--level L] [--grep S] [--limit N] [--since N] [--clear] [--json]\n          levels: debug|verbose log info trace warn error exception csp network dialog, all, LEVEL+\n  cu net [--grep S] [--failed] [--since N] [--limit N] [--json]   the fetch/XHR requests the page made\n  cu wait (--text TEXT | --selector CSS | --url PART) [--gone] [--timeout S]   until the page is ready, instead of sleep\n  cu dialog [accept [TEXT] | dismiss | policy [SPEC]]   JavaScript dialogs (CU_DIALOGS sets the daemon's policy)\n  cu inject add NAME --match GLOB (--file F | --js CODE) [--retry-ms N] [--keep-open URL] | list | rm NAME | run NAME\n  cu grant add NAME --origin ORIGIN --permission P[,P] | list | rm NAME\n  cu text\n  cu downloads\n  cu tabs [close ID | --stats | --gc [--idle S]]   idle sessions' tabs are collected (CU_TAB_TTL, CU_TAB_MAX, CU_TAB_FREEZE)\n  cu viewport W H [--mobile|--desktop] [--dpr F] [--portrait|--landscape] | off   kept through every command\n  cu click REF\n  cu type REF TEXT [--submit]\n  cu upload [REF | --selector CSS] FILE...\n  cu act JSON_ACTIONS   (or JSON on stdin)\n  cu login\n  cu session save|load NAME [--context CTX]\n  cu daemon [--port N] [--cdp-port N] [--data DIR]  always-on multi-agent daemon\n  cu mcp   the daemon's tools as an MCP server on stdio (pi, Claude Code, Codex, Cursor)\n  cu seo audit URL [--keywords \"k1,k2\"] [--context C] [--geo LOC] [--md]\n  cu seo crawl URL [--max-pages N] [--depth N] [--delay-ms MS] [--keywords K] [--out FILE.jsonl]\n  cu seo geo CONTEXT \"Town,Region,Country\" [--proxy URL] [--lat N --lon N] [--lang L] [--tz Z]\n  cu seo geo CONTEXT            what a page in CONTEXT sees (language, zone, position)\n  cu seo robots URL\n  cu serp QUERY [--geo LOC | --context C] [--engine google|bing|duckduckgo] [--num N]\n          [--target DOMAIN] [--proxy URL] [--md]\n  cu serp compare QUERY --geo LOC1 --geo LOC2 [...] [--engine E] [--md]\n          LOC: \"ES\", \"Sevilla,ES\", \"Getxo,Bizkaia,ES\" (town, region, country)\n  cu vault status|sessions|session save [--tab ID] [DOMAIN]|session forget DOMAIN\n  cu vault creds [QUERY]|cred get ID|cred rm ID|cred add DOMAIN LABEL|passwd\n  cu vault request DOMAIN [--reason TEXT] [--from NAME] [--wait] [--timeout S]\n  cu vault requests [STATUS]\n  cu otp request DOMAIN [--reason TEXT] [--from NAME] [--kind code|setup]\n          [--wait] [--timeout S]\n  cu otp wait ID [--timeout S] | cancel ID | list\n  cu otp capture --tab T [--domain D] [--request ID] [--credential ID] [--replace]\n  cu otp code DOMAIN | --credential ID\n\nPage commands take --tab ID to run in another tab (see `cu tabs`),\nor --new-tab to work in a page of their own instead of the session's."
     );
 }
 
@@ -1978,6 +1998,59 @@ fn dialog_cmd(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), St
 /// or `cu wait MS`: one `wait` action (see `cu act`), so the reply is an
 /// action's reply -- the snapshot of the page as it is once the wait is over.
 fn wait_cmd(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), String> {
+    wait_cmd_inner(args, on_tab)
+}
+
+/// cu viewport W H [--mobile|--desktop] [--dpr F] [--portrait|--landscape],
+/// cu viewport off: an emulate step of its own. The tab's keeper holds the
+/// viewport, so it stays through navigations, clicks, typing and captures
+/// until it is turned off (see the daemon's emulation module).
+fn viewport_cmd(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), String> {
+    let usage = "usage: cu viewport W H [--mobile|--desktop] [--dpr F] [--portrait|--landscape]  |  cu viewport off";
+    let step = if matches!(args.first().map(String::as_str), Some("off" | "desktop")) {
+        "{\"do\":\"emulate\",\"mode\":\"desktop\"}".to_string()
+    } else {
+        let side = |i: usize| -> Result<u32, String> {
+            args.get(i)
+                .and_then(|v| v.parse::<u32>().ok())
+                .ok_or_else(|| usage.to_string())
+        };
+        let (width, height) = (side(0)?, side(1)?);
+        let mut fields = vec![
+            "\"do\":\"emulate\"".to_string(),
+            "\"mode\":\"custom\"".to_string(),
+            format!("\"width\":{width}"),
+            format!("\"height\":{height}"),
+        ];
+        let mut it = args[2..].iter();
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--mobile" => fields.push("\"mobile\":true".into()),
+                "--desktop" => fields.push("\"mobile\":false".into()),
+                "--portrait" | "--landscape" => {
+                    fields.push(format!("\"orientation\":\"{}\"", &a[2..]))
+                }
+                "--dpr" => {
+                    let dpr = it
+                        .next()
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .ok_or_else(|| usage.to_string())?;
+                    fields.push(format!("\"scale\":{dpr}"));
+                }
+                _ => return Err(usage.into()),
+            }
+        }
+        format!("{{{}}}", fields.join(","))
+    };
+    page_request(
+        "POST",
+        &on_tab("/v1/act"),
+        Some(&format!("{{\"actions\":[{step}],\"snapshot\":false}}")),
+    )
+    .map(|s| println!("{s}"))
+}
+
+fn wait_cmd_inner(args: &[String], on_tab: &dyn Fn(&str) -> String) -> Result<(), String> {
     let usage = "usage: cu wait (--text TEXT | --selector CSS | --url PART) [--gone] [--timeout S]  |  cu wait MS";
     let mut fields: Vec<String> = Vec::new();
     let mut it = args.iter();
