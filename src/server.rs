@@ -7464,12 +7464,13 @@ fn plan_collection(
     limits: &TabLimits,
     reserve: usize,
     unleased_idle: Duration,
+    exited_idle: Duration,
 ) -> (Vec<(String, &'static str)>, usize) {
     let mut close: Vec<(String, &'static str)> = Vec::new();
     for page in pages.iter().filter(|p| !p.exempt) {
         let why = match page.holder {
             Holder::Live => None,
-            Holder::Exited if page.idle >= TAB_GC_IDLE => Some("its session exited"),
+            Holder::Exited if page.idle >= exited_idle => Some("its session exited"),
             Holder::Exited => None,
             Holder::Idle => Some("its session was idle past CU_TAB_TTL"),
             Holder::Nobody if page.idle >= unleased_idle => {
@@ -7514,13 +7515,28 @@ pub fn collect_tabs(
     reserve: usize,
     unleased_idle: Option<Duration>,
 ) -> Option<TabGc> {
-    tab_gc(cdp_port, reserve, unleased_idle, true, reserve == 0)
+    tab_gc(
+        cdp_port,
+        reserve,
+        unleased_idle,
+        true,
+        reserve == 0,
+        TAB_GC_IDLE,
+    )
+}
+
+/// Close the tabs of exited sessions idle for `idle` (and whatever else is
+/// due by the TTL and the cap, as [`collect_tabs`]). Returns the ids closed.
+pub fn reap_orphan_tabs(cdp_port: u16, idle: Duration) -> Vec<String> {
+    tab_gc(cdp_port, 0, None, true, false, idle)
+        .map(|r| r.collected.into_iter().map(|(id, _)| id).collect())
+        .unwrap_or_default()
 }
 
 /// What [`collect_tabs`] would find, without closing or freezing anything:
 /// `due` counts the tabs it would close now.
 pub fn tab_gc_stats(cdp_port: u16) -> Option<TabGc> {
-    tab_gc(cdp_port, 0, None, false, false)
+    tab_gc(cdp_port, 0, None, false, false, TAB_GC_IDLE)
 }
 
 fn tab_gc(
@@ -7529,6 +7545,7 @@ fn tab_gc(
     unleased_idle: Option<Duration>,
     act: bool,
     freeze: bool,
+    exited_idle: Duration,
 ) -> Option<TabGc> {
     let limits = tab_limits();
     let discovery = http_get(&format!("127.0.0.1:{cdp_port}"), "/json").ok()?;
@@ -7656,6 +7673,7 @@ fn tab_gc(
         &limits,
         reserve,
         unleased_idle.unwrap_or(limits.ttl),
+        exited_idle,
     );
     let mut report = TabGc {
         over_cap,
