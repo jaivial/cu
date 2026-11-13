@@ -59,6 +59,10 @@ pub enum Form {
     Phone,
     /// An Android tablet: no `Mobile` token, `mobile: false` hints.
     Tablet,
+    /// A desktop browser in a window of this size (`viewport` with
+    /// `mobile: false`): the browser's own User-Agent, a mouse, no
+    /// `mobile` flag. Only the viewport and the screen are overridden.
+    Desktop,
 }
 
 impl Form {
@@ -67,6 +71,7 @@ impl Form {
         match self {
             Form::Phone => "Pixel 8",
             Form::Tablet => "Pixel Tablet",
+            Form::Desktop => "desktop",
         }
     }
 }
@@ -111,14 +116,33 @@ impl Device {
         orientation: Option<&str>,
         scale: Option<f64>,
     ) -> Result<Option<Self>, String> {
+        Self::plan_with(mode, width, height, orientation, scale, None)
+    }
+
+    /// [`Device::plan`] with the `mobile` flag given for `custom`: `true`
+    /// is a phone (touch, Android User-Agent) whatever the width, `false` a
+    /// desktop window of that size ([`Form::Desktop`]); `None` decides by
+    /// the width, as `plan` does.
+    pub fn plan_with(
+        mode: &str,
+        width: Option<u32>,
+        height: Option<u32>,
+        orientation: Option<&str>,
+        scale: Option<f64>,
+        mobile_flag: Option<bool>,
+    ) -> Result<Option<Self>, String> {
         let (mut w, mut h, mobile, form) = match mode {
             "desktop" => return Ok(None),
             "mobile" => (390, 844, true, Form::Phone),
             "tablet" => (820, 1180, true, Form::Tablet),
             "custom" => {
                 let (w, h) = (width.unwrap_or(390), height.unwrap_or(844));
-                let mobile = w < 820;
-                let form = if mobile { Form::Phone } else { Form::Tablet };
+                let mobile = mobile_flag.unwrap_or(w < 820);
+                let form = match (mobile, mobile_flag) {
+                    (true, _) => Form::Phone,
+                    (false, Some(false)) => Form::Desktop,
+                    (false, _) => Form::Tablet,
+                };
                 (w, h, mobile, form)
             }
             _ => return Err("emulate \"mode\" must be mobile, tablet, desktop or custom".into()),
@@ -149,6 +173,7 @@ impl Device {
                 ));
             }
             None if form == Form::Tablet => 2.0,
+            None if form == Form::Desktop => 1.0,
             None => 3.0,
         };
         Ok(Some(Self {
@@ -215,7 +240,7 @@ impl Device {
     pub fn user_agent(&self, engine: &Engine) -> String {
         let mobile = match self.form {
             Form::Phone => "Mobile ",
-            Form::Tablet => "",
+            Form::Tablet | Form::Desktop => "",
         };
         format!(
             "Mozilla/5.0 (Linux; Android {ANDROID}; {}) AppleWebKit/537.36 (KHTML, like Gecko) \
@@ -233,6 +258,7 @@ impl Device {
         let form = match self.form {
             Form::Phone => "Mobile",
             Form::Tablet => "Tablet",
+            Form::Desktop => "Desktop",
         };
         format!(
             "{{\"brands\":{brands},\"fullVersionList\":{full},\"fullVersion\":{},\
@@ -247,6 +273,12 @@ impl Device {
     /// One line for the agent: `390x844 @3x portrait, mobile, touch, Android
     /// Chrome 156 (Pixel 8)`.
     pub fn describe(&self, engine: &Engine) -> String {
+        if self.form == Form::Desktop {
+            return format!(
+                "{}x{} @{}x desktop window: the browser's own User-Agent, mouse input",
+                self.width, self.height, self.scale
+            );
+        }
         format!(
             "{}x{} @{}x {}, {}touch, Android Chrome {} ({})",
             self.width,
@@ -396,6 +428,25 @@ pub fn commands(
     engine: &Engine,
     accept_language: Option<&str>,
 ) -> Vec<(&'static str, String)> {
+    if device.form == Form::Desktop {
+        // Only the window: the touch and User-Agent overrides an earlier
+        // device put on this keeper are taken off.
+        return vec![
+            ("Emulation.clearDeviceMetricsOverride", "{}".to_string()),
+            (
+                "Emulation.setDeviceMetricsOverride",
+                device.metrics_params(),
+            ),
+            (
+                "Emulation.setTouchEmulationEnabled",
+                "{\"enabled\":false}".to_string(),
+            ),
+            (
+                "Emulation.setUserAgentOverride",
+                "{\"userAgent\":\"\"}".to_string(),
+            ),
+        ];
+    }
     vec![
         ("Emulation.clearDeviceMetricsOverride", "{}".to_string()),
         (
@@ -545,7 +596,7 @@ pub fn device(tab: &Tab) -> Option<Device> {
 /// Whether input on `tab` should be a finger rather than a mouse: it is
 /// emulating a touch device.
 pub fn touches(tab: &Tab) -> bool {
-    entry(tab).is_some()
+    device(tab).is_some_and(|d| d.form != Form::Desktop)
 }
 
 /// Before a command on `tab`: if the tab is emulated and the keeper the
@@ -556,6 +607,27 @@ pub fn ensure(tab: &Tab) {
     let Some(slot) = entry(tab) else { return };
     let mut held = slot.lock().unwrap_or_else(|e| e.into_inner());
     if current_keeper(tab).is_some_and(|k| Some(k.generation) == held.generation) {
+        // The keeper is the one the device went on; check the page still
+        // sees it (a cross-process navigation, a capture another tool made
+        // at another size): the screen is the device's whenever the
+        // override is in force. Not on a page a dialog has stopped, where
+        // an evaluation would wait for the dialog.
+        let width = held.device.width;
+        if crate::dialogs::blocked(tab).is_none()
+            && let Ok(reply) = tab.command(
+                "Runtime.evaluate",
+                "{\"expression\":\"screen.width\",\"returnByValue\":true}",
+            )
+            && let Some(seen) = crate::server::json_number(&reply, "value")
+            && seen as u32 != width
+        {
+            eprintln!(
+                "cu: emulation: the page saw a {seen} px screen instead of {width}; the device is put back"
+            );
+            if let Err(error) = put_on(&mut held, tab) {
+                eprintln!("cu: emulation: could not put the device back on the tab: {error}");
+            }
+        }
         return;
     }
     match put_on(&mut held, tab) {
@@ -582,6 +654,36 @@ pub fn forget(tab: &Tab) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(tab);
+}
+
+/// A tab an emulated tab opened (a popup, a `target=_blank` link) is the
+/// same device: on the first command on it, the opener's device goes on it
+/// too, as it would on a real phone, where every page has the phone's
+/// screen.
+pub fn inherit(tab: &Tab) {
+    let Some(target) = tab.target.as_deref() else {
+        return;
+    };
+    if entry(tab).is_some() {
+        return;
+    }
+    let Some(opener) = crate::targets::opener_of(target) else {
+        return;
+    };
+    let Some(device) = device(&Tab {
+        cdp_port: tab.cdp_port,
+        target: Some(opener.clone()),
+    }) else {
+        return;
+    };
+    match apply(tab, device) {
+        Ok(what) => {
+            eprintln!("cu: emulation: popup {target} of {opener} is the same device: {what}")
+        }
+        Err(error) => {
+            eprintln!("cu: emulation: popup {target} could not take its opener's device: {error}")
+        }
+    }
 }
 
 #[cfg(test)]

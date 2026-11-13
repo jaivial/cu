@@ -316,7 +316,7 @@ impl Server {
             "navigate" => vec![Content::Text(readable_navigate(&body))],
             "eval" => vec![Content::Text(readable_eval(&body)?)],
             "wait" => vec![Content::Text(readable_wait(&body))],
-            "tabs" => {
+            "tabs" if !matches!(args.flag("gc"), Ok(Some(true))) => {
                 // This session's tabs, as this process knows them: the page
                 // the daemon gave it and the ones it asked for.
                 let mut mine = lock(&self.opened).clone();
@@ -566,6 +566,18 @@ const TOOLS: &[Tool] = &[
         open_world: true,
     },
     Tool {
+        name: "viewport",
+        title: "Set the viewport",
+        description: "Give this tab a viewport it keeps through every later command (navigate, click, type, act, screenshot, reloads) until `off: true`: e.g. width 375, height 812 for a phone. `mobile` true (the default below 820 px wide) is a whole phone: touch, a mobile User-Agent, clicks become taps; false is a narrow desktop window with the mouse and the browser's own User-Agent. `dpr` is the device pixel ratio. Popups this tab opens get the same viewport. Answers what is in force.",
+        properties: r#""width":{"type":"number","description":"CSS pixels."},"height":{"type":"number","description":"CSS pixels."},"mobile":{"type":"boolean","description":"A phone (touch, mobile User-Agent) or a desktop window; default by width."},"dpr":{"type":"number","description":"Device pixel ratio (default 3 for a phone, 1 for a desktop window)."},"orientation":{"type":"string","enum":["portrait","landscape"]},"off":{"type":"boolean","description":"Back to the browser's own window."}"#,
+        required: &[],
+        target: Target::Page,
+        read_only: false,
+        destructive: false,
+        idempotent: true,
+        open_world: false,
+    },
+    Tool {
         name: "wait",
         title: "Wait for the page",
         description: "Wait until the page shows a text, has an element matching a selector, or is at an address (or, with `gone`, until it no longer does), then answer the snapshot. Returns the moment it is true and fails naming what never came. Use it after an action whose result arrives later, instead of pausing a guessed number of seconds. Give exactly one of `text`, `selector`, `url`; `ms` alone is a plain pause.",
@@ -604,8 +616,8 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "tabs",
         title: "List tabs",
-        description: "Every open tab: id, url, title, opener and `yours` (whether this session opened it). Pass an id as `tab` to any page tool, e.g. to work in a popup a click opened. Tabs that are not yours belong to another agent or to the browser: do not navigate or close them.",
-        properties: "",
+        description: "Every open tab: id, url, title, opener and `yours` (whether this session opened it). Pass an id as `tab` to any page tool, e.g. to work in a popup a click opened. Tabs that are not yours belong to another agent or to the browser: do not navigate or close them. With `gc: true` the daemon collects now instead: tabs of exited sessions and of sessions idle past its TTL, unheld idle tabs, then the oldest down to its cap; a live session's tab is never closed.",
+        properties: r#""gc":{"type":"boolean","description":"Collect stale tabs now and answer what was closed and what is open (counts, live sessions, frozen tabs)."}"#,
         required: &[],
         target: Target::None,
         read_only: true,
@@ -965,7 +977,43 @@ fn url_encode(s: &str) -> String {
 fn plan(name: &str, args: &Args) -> Result<Call, String> {
     match name {
         "status" => Ok(Call::plain("GET", "/v1/status?detail=1", None)),
-        "tabs" => Ok(Call::plain("GET", "/v1/tabs", None)),
+        "tabs" => match args.flag("gc")? {
+            Some(true) => Ok(Call::plain("POST", "/v1/tabs/gc", Some("{}"))),
+            _ => Ok(Call::plain("GET", "/v1/tabs", None)),
+        },
+        "viewport" => {
+            let step = if args.flag("off")? == Some(true) {
+                "{\"do\":\"emulate\",\"mode\":\"desktop\"}".to_string()
+            } else {
+                let width = args
+                    .number("width")?
+                    .ok_or("`width` is required (or `off: true`)")?;
+                let height = args
+                    .number("height")?
+                    .ok_or("`height` is required (or `off: true`)")?;
+                let mut step = format!(
+                    "{{\"do\":\"emulate\",\"mode\":\"custom\",\"width\":{width},\"height\":{height}"
+                );
+                if let Some(mobile) = args.flag("mobile")? {
+                    step.push_str(&format!(",\"mobile\":{mobile}"));
+                }
+                if let Some(dpr) = args.number("dpr")? {
+                    step.push_str(&format!(",\"scale\":{dpr}"));
+                }
+                if let Some(orientation) = args.str("orientation") {
+                    step.push_str(&format!(",\"orientation\":{}", json_string(orientation)));
+                }
+                step.push('}');
+                step
+            };
+            page(
+                args,
+                "POST",
+                "/v1/act",
+                Vec::new(),
+                Some(format!("{{\"actions\":[{step}],\"snapshot\":false}}")),
+            )
+        }
         "inject" => {
             let name = || {
                 args.str("name")

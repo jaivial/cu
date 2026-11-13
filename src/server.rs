@@ -1094,6 +1094,16 @@ fn route_with(
     } else {
         Tab::default_for(state.cdp_port)
     };
+    // The tab is in use: its lease (or unleased record) is renewed, and a
+    // tab the collector froze is thawed before the command reaches it.
+    if page_route && let Some(target) = tab.target.as_deref() {
+        note_tab_use(state.cdp_port, target, session.map(|(owner, _)| owner));
+    }
+    // A popup of an emulated tab opens as the same device (see
+    // `crate::emulation::inherit`).
+    if page_route {
+        crate::emulation::inherit(&tab);
+    }
     // An emulated tab whose keeper connection died (the browser restarted,
     // the socket was cut) gets its device back before the command runs, so
     // no command ever sees the tab as a desktop it was not asked to be.
@@ -1298,6 +1308,33 @@ fn route_with(
                 ),
             }
         }
+        // `cu tabs --stats` / `--gc`: how many tabs are open, held by live
+        // sessions, idle or frozen, and (POST) a collection run now. `idle_s`
+        // lowers the age at which a tab nobody holds is closed, for this run.
+        ("GET", "/v1/tabs/gc") | ("POST", "/v1/tabs/gc") => {
+            let idle = if method == "POST" {
+                json_value(body, "idle_s")
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(|s| Duration::from_secs(s.max(60)))
+            } else {
+                None
+            };
+            let report = if method == "POST" {
+                collect_tabs(state.cdp_port, 0, idle)
+            } else {
+                // A look without closing anything: a run with no TTL reached
+                // would still close; so report from a dry plan instead.
+                tab_gc_stats(state.cdp_port)
+            };
+            match report {
+                Some(report) => ("200 OK", "application/json", report.json()),
+                None => (
+                    "502 Bad Gateway",
+                    "application/json",
+                    "{\"error\":\"the browser did not list its tabs\"}".into(),
+                ),
+            }
+        }
         ("DELETE", p) if p.starts_with("/v1/tabs/") => {
             match close_tab(state.cdp_port, &p["/v1/tabs/".len()..]) {
                 Ok(()) => ("200 OK", "application/json", "{\"closed\":true}".into()),
@@ -1349,7 +1386,13 @@ fn route_with(
             "200 OK",
             "application/json",
             if form_value(query(full_path), "detail") == "1" {
-                crate::diagnostics::status_json()
+                let status = crate::diagnostics::status_json();
+                match tab_gc_stats(state.cdp_port) {
+                    Some(tabs) if status.ends_with('}') => {
+                        format!("{},\"tabs\":{}}}", &status[..status.len() - 1], tabs.json())
+                    }
+                    _ => status,
+                }
             } else {
                 "{\"running\":true,\"browser\":\"chromium\"}".into()
             },
@@ -7013,11 +7056,12 @@ fn process_start(pid: u32) -> Option<u64> {
 
 /// Tabs the CLI created for an invocation, with the session that owns them.
 ///
-/// A tab is never closed out from under a live owner. Once the owner is
-/// gone, the tab is collected after a short grace ([`TAB_GC_IDLE`]) -- a
-/// tab cu cannot tell the owner of (another pid namespace) only after a long
-/// idle ([`TAB_GC_UNKNOWN_IDLE`]). This is what keeps two agents working in
-/// the same daemon from touching each other's pages.
+/// A tab is never closed out from under a live owner: one that used any of
+/// its tabs within `CU_TAB_TTL` (see [`TabLimits`]). Once the owner is gone,
+/// the tab is collected after a short grace ([`TAB_GC_IDLE`]); an owner
+/// still running (or that cu cannot see, in another pid namespace) loses its
+/// tabs once it has been idle for the TTL. This is what keeps two agents
+/// working in the same daemon from touching each other's pages.
 pub struct TabLease {
     pub owner: Owner,
     /// The owner's start time when the lease was made, if the daemon can
@@ -7032,9 +7076,6 @@ pub struct TabLease {
 /// busy. Not zero: an agent may still reach the tab with `--tab ID` right
 /// after the process that opened it ended, and every such use renews it.
 pub const TAB_GC_IDLE: Duration = Duration::from_secs(60);
-/// Idle age after which a tab whose owner cu cannot see (another pid
-/// namespace) is collected.
-pub const TAB_GC_UNKNOWN_IDLE: Duration = Duration::from_secs(10 * 60);
 /// How often the collector looks.
 const TAB_GC_TICK: Duration = Duration::from_secs(10);
 
@@ -7080,8 +7121,9 @@ fn session_tab(
         touch_tab_lease(state.cdp_port, &id);
         return Ok((id, true));
     }
-    // Before another tab is opened, the ones exited sessions left behind go.
-    reap_orphan_tabs(state.cdp_port, TAB_GC_IDLE);
+    // Before another tab is opened, the ones exited and idle sessions left
+    // behind go, and the cap gets room for this one.
+    collect_tabs(state.cdp_port, 1, None);
     // Electron has no `Target.createTarget`: Min opens the tab through its
     // own window UI (see `crate::minbrowser`).
     let id = if crate::minbrowser::active() {
@@ -7191,37 +7233,475 @@ fn lease_owner_alive(lease: &TabLease) -> Option<bool> {
     Some(now.is_some() && (lease.owner_start.is_none() || now == lease.owner_start))
 }
 
-/// Close the tabs of `cdp_port` whose owner has exited and that have been
-/// idle for `idle` (or, owner unknown, for [`TAB_GC_UNKNOWN_IDLE`]); a tab
-/// the browser already closed just leaves the registry. A tab stopped by a
-/// dialog goes too: `Target.closeTarget` does not need the page's
-/// cooperation (measured on Chromium 156 with a `beforeunload` dialog up:
-/// closed at once, and the tabs sharing its renderer answer again).
-/// Returns the ids collected.
-pub fn reap_orphan_tabs(cdp_port: u16, idle: Duration) -> Vec<String> {
-    let stale: Vec<String> = tab_leases()
+/// How the daemon keeps the number of tabs down, from the environment
+/// (read once):
+///
+/// - `CU_TAB_TTL` (default 30 min): a session that has not used any of its
+///   tabs for this long is idle, and its tabs are collected even though its
+///   process still runs (an MCP server outlives the agent that used it: the
+///   client keeps the connection open). A tab nobody leased (opened before
+///   the daemon started, by raw DevTools, a popup of a page nobody owns) is
+///   collected after this long without a cu command or a navigation.
+/// - `CU_TAB_MAX` (default 40, `0` for no cap): above this many pages the
+///   least recently used tabs that are not part of a live session and have
+///   been idle at least [`TAB_CAP_MIN_IDLE`] are closed first.
+/// - `CU_TAB_FREEZE` (default 10 min, `0`/`off` to never): a tab idle this
+///   long is frozen (`Page.setWebLifecycleState`): its timers, polling and
+///   loading stop, so a forgotten dashboard stops talking to its server; the
+///   next command on it thaws it first.
+///
+/// Durations are seconds, or a number with `s`, `m` or `h`.
+#[derive(Clone, Copy, Debug)]
+pub struct TabLimits {
+    pub ttl: Duration,
+    pub max: usize,
+    pub freeze: Option<Duration>,
+}
+
+/// A tab is only closed for the cap after being idle this long, so a page an
+/// agent opened a moment ago over raw DevTools is not taken from under it.
+pub const TAB_CAP_MIN_IDLE: Duration = Duration::from_secs(5 * 60);
+/// The shortest `CU_TAB_TTL` taken: below it a slow agent would lose its page
+/// between two steps.
+const TAB_TTL_MIN: Duration = Duration::from_secs(2 * 60);
+
+/// `1800`, `90s`, `30m`, `2h`; `None` for anything else.
+pub fn parse_span(value: &str) -> Option<Duration> {
+    let v = value.trim().to_ascii_lowercase();
+    let (number, unit) = match v.char_indices().last()? {
+        (i, 's') => (&v[..i], 1),
+        (i, 'm') => (&v[..i], 60),
+        (i, 'h') => (&v[..i], 3600),
+        _ => (v.as_str(), 1),
+    };
+    number
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|n| Duration::from_secs(n * unit))
+}
+
+fn limits_from(ttl: Option<&str>, max: Option<&str>, freeze: Option<&str>) -> TabLimits {
+    let ttl = ttl
+        .and_then(parse_span)
+        .unwrap_or(Duration::from_secs(30 * 60))
+        .max(TAB_TTL_MIN);
+    let max = max
+        .and_then(|m| m.trim().parse::<usize>().ok())
+        .unwrap_or(40);
+    let freeze = match freeze.map(|f| f.trim().to_ascii_lowercase()) {
+        Some(f) if f == "off" || f == "0" => None,
+        Some(f) => Some(parse_span(&f).unwrap_or(Duration::from_secs(10 * 60))),
+        None => Some(Duration::from_secs(10 * 60)),
+    };
+    TabLimits { ttl, max, freeze }
+}
+
+pub fn tab_limits() -> TabLimits {
+    static LIMITS: OnceLock<TabLimits> = OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let var = |k: &str| std::env::var(k).ok();
+        limits_from(
+            var("CU_TAB_TTL").as_deref(),
+            var("CU_TAB_MAX").as_deref(),
+            var("CU_TAB_FREEZE").as_deref(),
+        )
+    })
+}
+
+/// Last use of the page targets nobody holds a lease on: a cu command named
+/// it, or it navigated. First seen counts as a use.
+fn unleased_use() -> &'static Mutex<HashMap<(u16, String), (Instant, String)>> {
+    static USE: OnceLock<Mutex<HashMap<(u16, String), (Instant, String)>>> = OnceLock::new();
+    USE.get_or_init(Default::default)
+}
+
+/// Tabs cu froze, and tabs the browser would not freeze (not tried again).
+#[derive(Default)]
+struct Freezer {
+    frozen: std::collections::HashSet<(u16, String)>,
+    refused: std::collections::HashSet<(u16, String)>,
+}
+
+fn freezer() -> &'static Mutex<Freezer> {
+    static FREEZER: OnceLock<Mutex<Freezer>> = OnceLock::new();
+    FREEZER.get_or_init(Default::default)
+}
+
+static TABS_COLLECTED: AtomicU64 = AtomicU64::new(0);
+
+/// A command is about to run on page `target`: it counts as a use (the lease,
+/// or the unleased record), a tab nobody leased becomes the asking session's,
+/// and a tab cu froze is thawed before the command reaches it.
+pub fn note_tab_use(cdp_port: u16, target: &str, owner: Option<Owner>) {
+    let key = (cdp_port, target.to_string());
+    let leased = {
+        let mut leases = tab_leases().lock().unwrap_or_else(|e| e.into_inner());
+        match leases.get_mut(&key) {
+            Some(lease) => {
+                lease.used = Instant::now();
+                true
+            }
+            None => false,
+        }
+    };
+    if !leased {
+        match owner {
+            // A session that works in a tab nobody holds (one left from before
+            // the daemon started, a popup) takes it: it is collected with the
+            // session instead of by age.
+            Some(owner) if !context_targets(cdp_port).iter().any(|t| t == target) => {
+                register_tab_lease(cdp_port, target, owner);
+                unleased_use()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&key);
+            }
+            _ => {
+                let mut seen = unleased_use().lock().unwrap_or_else(|e| e.into_inner());
+                let url = seen.get(&key).map(|(_, u)| u.clone()).unwrap_or_default();
+                seen.insert(key.clone(), (Instant::now(), url));
+            }
+        }
+    }
+    let thaw = freezer()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .filter(|((port, _), _)| *port == cdp_port)
-        .filter(|(_, lease)| match lease_owner_alive(lease) {
-            Some(false) => lease.used.elapsed() >= idle,
-            Some(true) => false,
-            None => lease.used.elapsed() >= TAB_GC_UNKNOWN_IDLE.max(idle),
+        .frozen
+        .remove(&key);
+    if thaw {
+        let tab = Tab {
+            cdp_port,
+            target: Some(target.to_string()),
+        };
+        match tab.command("Page.setWebLifecycleState", "{\"state\":\"active\"}") {
+            Ok(_) => eprintln!("cu: tab {target} thawed for a command"),
+            Err(e) => eprintln!("cu: could not thaw tab {target}: {e}"),
+        }
+    }
+}
+
+/// What one collection did, and what is open afterwards.
+#[derive(Default, Debug)]
+pub struct TabGc {
+    /// `(tab id, why)` for every tab closed.
+    pub collected: Vec<(String, &'static str)>,
+    pub frozen_now: usize,
+    pub open: usize,
+    pub leased: usize,
+    pub unleased: usize,
+    pub frozen: usize,
+    pub live_sessions: usize,
+    pub idle_sessions: usize,
+    /// Pages above the cap that could not be closed (live sessions' tabs).
+    pub over_cap: usize,
+    /// Tabs this run closed or (a look only) would close.
+    pub due: usize,
+}
+
+impl TabGc {
+    pub fn json(&self) -> String {
+        let limits = tab_limits();
+        format!(
+            "{{\"open\":{},\"leased\":{},\"unleased\":{},\"frozen\":{},\"live_sessions\":{},\
+             \"idle_sessions\":{},\"over_cap\":{},\"max\":{},\"ttl_s\":{},\"freeze_s\":{},\
+             \"collected_total\":{},\"collected\":[{}],\"frozen_now\":{},\"due\":{}}}",
+            self.open,
+            self.leased,
+            self.unleased,
+            self.frozen,
+            self.live_sessions,
+            self.idle_sessions,
+            self.over_cap,
+            limits.max,
+            limits.ttl.as_secs(),
+            limits.freeze.map(|f| f.as_secs()).unwrap_or(0),
+            TABS_COLLECTED.load(Ordering::Relaxed),
+            self.collected
+                .iter()
+                .map(|(id, why)| format!(
+                    "{{\"id\":{},\"why\":{}}}",
+                    json_string(id),
+                    json_string(why)
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
+            self.frozen_now,
+            self.due
+        )
+    }
+}
+
+/// How a page's owner stands, for collection.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Holder {
+    /// Leased to a session that used one of its tabs within the TTL and is
+    /// (or may be) still running: never closed.
+    Live,
+    /// Leased to a session whose process has exited.
+    Exited,
+    /// Leased to a running (or unseen) session idle for the whole TTL.
+    Idle,
+    /// Nobody holds it.
+    Nobody,
+}
+
+/// One page as the collector judges it.
+#[derive(Clone, Debug)]
+struct Judged {
+    id: String,
+    holder: Holder,
+    idle: Duration,
+    /// Never closed by the collector: the default tab, a named context's
+    /// page, a page a person watches, one blank page per window.
+    exempt: bool,
+}
+
+/// What to close and why, from the judged pages alone (no browser): the
+/// TTL rules first, then the cap over what is left.
+fn plan_collection(
+    pages: &[Judged],
+    limits: &TabLimits,
+    reserve: usize,
+    unleased_idle: Duration,
+    exited_idle: Duration,
+) -> (Vec<(String, &'static str)>, usize) {
+    let mut close: Vec<(String, &'static str)> = Vec::new();
+    for page in pages.iter().filter(|p| !p.exempt) {
+        let why = match page.holder {
+            Holder::Live => None,
+            Holder::Exited if page.idle >= exited_idle => Some("its session exited"),
+            Holder::Exited => None,
+            Holder::Idle => Some("its session was idle past CU_TAB_TTL"),
+            Holder::Nobody if page.idle >= unleased_idle => {
+                Some("nobody held it and it was idle past CU_TAB_TTL")
+            }
+            Holder::Nobody => None,
+        };
+        if let Some(why) = why {
+            close.push((page.id.clone(), why));
+        }
+    }
+    let mut left = pages.len() - close.len();
+    let mut over = 0;
+    if limits.max > 0 && left + reserve > limits.max {
+        let mut candidates: Vec<&Judged> = pages
+            .iter()
+            .filter(|p| !p.exempt && p.holder != Holder::Live && p.idle >= TAB_CAP_MIN_IDLE)
+            .filter(|p| !close.iter().any(|(id, _)| id == &p.id))
+            .collect();
+        candidates.sort_by(|a, b| b.idle.cmp(&a.idle));
+        for page in candidates {
+            if left + reserve <= limits.max {
+                break;
+            }
+            close.push((page.id.clone(), "the tab cap CU_TAB_MAX was reached"));
+            left -= 1;
+        }
+        over = (left + reserve).saturating_sub(limits.max);
+    }
+    (close, over)
+}
+
+/// Collect tabs on `cdp_port`: tabs of exited sessions after
+/// [`TAB_GC_IDLE`], of sessions idle for the TTL, unleased tabs idle for the
+/// TTL (or `unleased_idle`, for a manual `cu tabs --gc --idle`), then the
+/// least recently used ones over the cap -- keeping room for `reserve` tabs
+/// about to be opened. A live session's tab is never closed. Tabs idle past
+/// `CU_TAB_FREEZE` are frozen. `None` when the browser did not list its
+/// pages whole: nothing is decided on a partial list.
+pub fn collect_tabs(
+    cdp_port: u16,
+    reserve: usize,
+    unleased_idle: Option<Duration>,
+) -> Option<TabGc> {
+    tab_gc(
+        cdp_port,
+        reserve,
+        unleased_idle,
+        true,
+        reserve == 0,
+        TAB_GC_IDLE,
+    )
+}
+
+/// Close the tabs of exited sessions idle for `idle` (and whatever else is
+/// due by the TTL and the cap, as [`collect_tabs`]). Returns the ids closed.
+pub fn reap_orphan_tabs(cdp_port: u16, idle: Duration) -> Vec<String> {
+    tab_gc(cdp_port, 0, None, true, false, idle)
+        .map(|r| r.collected.into_iter().map(|(id, _)| id).collect())
+        .unwrap_or_default()
+}
+
+/// What [`collect_tabs`] would find, without closing or freezing anything:
+/// `due` counts the tabs it would close now.
+pub fn tab_gc_stats(cdp_port: u16) -> Option<TabGc> {
+    tab_gc(cdp_port, 0, None, false, false, TAB_GC_IDLE)
+}
+
+fn tab_gc(
+    cdp_port: u16,
+    reserve: usize,
+    unleased_idle: Option<Duration>,
+    act: bool,
+    freeze: bool,
+    exited_idle: Duration,
+) -> Option<TabGc> {
+    let limits = tab_limits();
+    let discovery = http_get(&format!("127.0.0.1:{cdp_port}"), "/json").ok()?;
+    let body = discovery.trim();
+    if !(body.starts_with('[') && body.ends_with(']')) {
+        return None;
+    }
+    let pages: Vec<(String, String)> = json_objects(body)
+        .into_iter()
+        .filter(|o| is_page(o))
+        .filter_map(|o| {
+            Some((
+                json_string_value(&o, "id")?,
+                json_string_value(&o, "url").unwrap_or_default(),
+            ))
         })
-        .map(|((_, id), _)| id.clone())
         .collect();
-    let mut collected = Vec::new();
-    for id in stale {
+    let live_ids: Vec<&str> = pages.iter().map(|(id, _)| id.as_str()).collect();
+    // What the browser no longer lists leaves every record.
+    tab_leases()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(port, id), _| *port != cdp_port || live_ids.contains(&id.as_str()));
+    {
+        let mut f = freezer().lock().unwrap_or_else(|e| e.into_inner());
+        f.frozen
+            .retain(|(port, id)| *port != cdp_port || live_ids.contains(&id.as_str()));
+        f.refused
+            .retain(|(port, id)| *port != cdp_port || live_ids.contains(&id.as_str()));
+    }
+    // A tab nobody leased is in use when its URL changes (an agent driving
+    // it over raw DevTools navigates it).
+    {
+        let mut seen = unleased_use().lock().unwrap_or_else(|e| e.into_inner());
+        seen.retain(|(port, id), _| *port != cdp_port || live_ids.contains(&id.as_str()));
+        let leases = tab_leases().lock().unwrap_or_else(|e| e.into_inner());
+        for (id, url) in &pages {
+            let key = (cdp_port, id.clone());
+            if leases.contains_key(&key) {
+                seen.remove(&key);
+                continue;
+            }
+            match seen.get_mut(&key) {
+                Some((used, was)) if was != url => {
+                    *used = Instant::now();
+                    *was = url.clone();
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(key, (Instant::now(), url.clone()));
+                }
+            }
+        }
+    }
+    let exempt_fixed: Vec<String> = {
+        let mut e = context_targets(cdp_port);
+        if let Some(default) =
+            pinned_target(cdp_port).or_else(|| pages.first().map(|(id, _)| id.clone()))
+        {
+            e.push(default);
+        }
+        e
+    };
+    // One blank page per window stays: the parker hides a window behind it.
+    let contexts: HashMap<String, String> = crate::targets::pages()
+        .into_iter()
+        .map(|p| (p.id, p.context))
+        .collect();
+    let mut blank_kept: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let judged: Vec<Judged> = {
+        let leases = tab_leases().lock().unwrap_or_else(|e| e.into_inner());
+        let seen = unleased_use().lock().unwrap_or_else(|e| e.into_inner());
+        // Per owner: running or not, and the latest use of any of its tabs.
+        let mut owners: HashMap<Owner, (Option<bool>, Duration)> = HashMap::new();
+        for ((port, _), lease) in leases.iter() {
+            if *port != cdp_port {
+                continue;
+            }
+            let idle = lease.used.elapsed();
+            let entry = owners
+                .entry(lease.owner)
+                .or_insert_with(|| (lease_owner_alive(lease), idle));
+            entry.1 = entry.1.min(idle);
+            if lease_owner_alive(lease) == Some(true) {
+                entry.0 = Some(true);
+            }
+        }
+        pages
+            .iter()
+            .map(|(id, url)| {
+                let key = (cdp_port, id.clone());
+                let (holder, idle) = match leases.get(&key) {
+                    Some(lease) => {
+                        let idle = lease.used.elapsed();
+                        let (alive, latest) = owners[&lease.owner];
+                        let holder = match lease_owner_alive(lease) {
+                            Some(false) => Holder::Exited,
+                            _ if latest < limits.ttl && alive != Some(false) => Holder::Live,
+                            _ => Holder::Idle,
+                        };
+                        (holder, idle)
+                    }
+                    None => (
+                        Holder::Nobody,
+                        seen.get(&key).map(|(t, _)| t.elapsed()).unwrap_or_default(),
+                    ),
+                };
+                let mut exempt =
+                    exempt_fixed.contains(id) || crate::live_stream::watched(cdp_port, id);
+                if !exempt && holder == Holder::Nobody && url == "about:blank" {
+                    let window = contexts.get(id).cloned().unwrap_or_default();
+                    exempt = blank_kept.insert(window);
+                }
+                Judged {
+                    id: id.clone(),
+                    holder,
+                    idle,
+                    exempt,
+                }
+            })
+            .collect()
+    };
+    let (close, over_cap) = plan_collection(
+        &judged,
+        &limits,
+        reserve,
+        unleased_idle.unwrap_or(limits.ttl),
+        exited_idle,
+    );
+    let mut report = TabGc {
+        over_cap,
+        due: close.len(),
+        ..TabGc::default()
+    };
+    let close = if act { close } else { Vec::new() };
+    // Said once per change, not every tick.
+    static LAST_OVER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if act && LAST_OVER.swap(over_cap, Ordering::Relaxed) != over_cap && over_cap > 0 {
+        eprintln!(
+            "cu: {} pages open, {over_cap} over the cap of {}: the rest are live sessions' tabs or idle under {} s",
+            judged.len() - close.len(),
+            limits.max,
+            TAB_CAP_MIN_IDLE.as_secs()
+        );
+    }
+    for (id, why) in close {
         match close_tab(cdp_port, &id) {
             Ok(()) => {
-                eprintln!("cu: collected tab {id} of an exited session");
-                collected.push(id.clone());
+                eprintln!("cu: collected tab {id}: {why}");
+                TABS_COLLECTED.fetch_add(1, Ordering::Relaxed);
+                report.collected.push((id.clone(), why));
             }
             Err(e) if e.contains("no such tab") => {}
             Err(e) if e.contains("last tab") => {
-                // The browser needs a page; this one stays, unowned.
-                eprintln!("cu: tab {id} of an exited session is the browser's last; left open");
+                eprintln!("cu: tab {id} is the browser's last; left open");
+                continue;
             }
             Err(e) => {
                 eprintln!("cu: could not collect tab {id}: {e}");
@@ -7231,18 +7711,105 @@ pub fn reap_orphan_tabs(cdp_port: u16, idle: Duration) -> Vec<String> {
         tab_leases()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .remove(&(cdp_port, id.clone()));
+        unleased_use()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&(cdp_port, id));
     }
-    collected
+    // Freeze what has been idle long enough and is still open.
+    // Not while a session waits for its new tab, and never a live session's
+    // tab: an agent watching a page for a live update (a counter, a toast)
+    // must see it arrive.
+    if let Some(freeze) = limits.freeze.filter(|_| act && freeze) {
+        for page in judged.iter().filter(|p| {
+            !p.exempt
+                && p.holder != Holder::Live
+                && p.idle >= freeze
+                && !report.collected.iter().any(|(id, _)| id == &p.id)
+        }) {
+            let key = (cdp_port, page.id.clone());
+            {
+                let f = freezer().lock().unwrap_or_else(|e| e.into_inner());
+                if f.frozen.contains(&key) || f.refused.contains(&key) {
+                    continue;
+                }
+            }
+            let tab = Tab {
+                cdp_port,
+                target: Some(page.id.clone()),
+            };
+            // A page a dialog has stopped would hold the command until it
+            // times out; it is closed by age instead.
+            if crate::dialogs::blocked(&tab).is_some() {
+                continue;
+            }
+            let reply = tab.command("Page.setWebLifecycleState", "{\"state\":\"frozen\"}");
+            let mut f = freezer().lock().unwrap_or_else(|e| e.into_inner());
+            match reply {
+                Ok(r) if !r.contains("\"error\":{") => {
+                    f.frozen.insert(key);
+                    report.frozen_now += 1;
+                }
+                Ok(r) => {
+                    eprintln!("cu: tab {} not frozen: {r}", page.id);
+                    f.refused.insert(key);
+                }
+                Err(e) => {
+                    eprintln!("cu: tab {} not frozen: {e}", page.id);
+                    f.refused.insert(key);
+                }
+            }
+        }
+    }
+    let collected: Vec<&str> = report.collected.iter().map(|(id, _)| id.as_str()).collect();
+    let left: Vec<&Judged> = judged
+        .iter()
+        .filter(|p| !collected.contains(&p.id.as_str()))
+        .collect();
+    report.open = left.len();
+    report.leased = left.iter().filter(|p| p.holder != Holder::Nobody).count();
+    report.unleased = left.len() - report.leased;
+    report.frozen = freezer()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .frozen
+        .iter()
+        .filter(|(port, _)| *port == cdp_port)
+        .count();
+    let leases = tab_leases().lock().unwrap_or_else(|e| e.into_inner());
+    let mut live = std::collections::HashSet::new();
+    let mut idle = std::collections::HashSet::new();
+    for page in &left {
+        if let Some(lease) = leases.get(&(cdp_port, page.id.clone())) {
+            match page.holder {
+                Holder::Live => live.insert(lease.owner),
+                _ => idle.insert(lease.owner),
+            };
+        }
+    }
+    report.live_sessions = live.len();
+    report.idle_sessions = idle.difference(&live).count();
+    Some(report)
 }
 
-/// The daemon's background collector: every few seconds, close the tabs of
-/// sessions that have exited (see [`reap_orphan_tabs`]).
+/// The daemon's background collector: every few seconds, run
+/// [`collect_tabs`].
 pub fn spawn_tab_gc(cdp_port: u16) {
+    let limits = tab_limits();
+    eprintln!(
+        "cu: tabs: sessions idle {} s are collected, at most {} pages{}",
+        limits.ttl.as_secs(),
+        limits.max,
+        limits
+            .freeze
+            .map(|f| format!(", idle tabs frozen after {} s", f.as_secs()))
+            .unwrap_or_default()
+    );
     thread::spawn(move || {
         loop {
             thread::sleep(TAB_GC_TICK);
-            reap_orphan_tabs(cdp_port, TAB_GC_IDLE);
+            collect_tabs(cdp_port, 0, None);
         }
     });
 }
